@@ -432,6 +432,50 @@ body {
   font-size: 14px;
   color: var(--text-muted);
 }
+
+/* Reasoning panel — live activity log */
+.reasoning {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+}
+.reasoning-line {
+  padding: 2px 0;
+  line-height: 1.4;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.reasoning-line .r-icon { flex-shrink: 0; }
+.reasoning-line .r-text { color: var(--text-dim); }
+.reasoning-line.r-tool { color: #4a8abf; }
+.reasoning-line.r-tool-done-ok { color: #4a9a5a; }
+.reasoning-line.r-tool-done-fail { color: #9a4a4a; }
+.reasoning-line.r-plan { color: var(--text-muted); }
+
+/* Collapsible reasoning toggle on completed turns */
+.reasoning-toggle {
+  font-size: 11px;
+  color: var(--text-dim);
+  cursor: pointer;
+  margin-top: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  user-select: none;
+}
+.reasoning-toggle:hover { color: var(--text-muted); }
+.reasoning-full {
+  display: none;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+  white-space: pre-wrap;
+}
 .dots span {
   display: inline-block;
   width: 5px; height: 5px;
@@ -647,6 +691,7 @@ async function send() {
 
   addUserTurn(text);
   const thinkEl = addThinkingTurn();
+  const thinkContent = thinkEl.querySelector('.ai-content');
 
   try {
     const body = { request: text };
@@ -665,6 +710,27 @@ async function send() {
     let currentEventType = null;
     let answerEl = null;
     let fullAnswer = '';
+    let reasoningLines = [];   // collected during run
+    let reasoningEl = null;    // live panel inside thinkEl
+
+    function getOrCreateReasoning() {
+      if (!reasoningEl) {
+        reasoningEl = document.createElement('div');
+        reasoningEl.className = 'reasoning';
+        thinkContent.appendChild(reasoningEl);
+      }
+      return reasoningEl;
+    }
+
+    function addReasoningLine(cls, icon, text) {
+      const line = `<span class="r-icon">${icon}</span><span class="r-text">${esc(text)}</span>`;
+      reasoningLines.push({ cls, icon, text });
+      const div = document.createElement('div');
+      div.className = `reasoning-line ${cls}`;
+      div.innerHTML = line;
+      getOrCreateReasoning().appendChild(div);
+      scrollBottom();
+    }
 
     while (true) {
       const { done, value } = await reader.read();
@@ -682,32 +748,90 @@ async function send() {
           try { data = JSON.parse(line.slice(6)); } catch (_) { continue; }
 
           if (currentEventType === 'status') {
-            const thinkContent = thinkEl.querySelector('.ai-content');
-            if (thinkContent) {
-              thinkContent.innerHTML = `<div class="thinking"><div class="dots"><span></span><span></span><span></span></div>${esc(phaseLabel(data.phase))}</div>`;
+            const statusText = phaseLabel(data.phase);
+            // Update the main thinking label
+            const dotsHtml = '<div class="dots"><span></span><span></span><span></span></div>';
+            const firstChild = thinkContent.firstChild;
+            if (firstChild && firstChild.className === 'thinking') {
+              firstChild.innerHTML = dotsHtml + esc(statusText);
+            } else {
+              const thinkDiv = document.createElement('div');
+              thinkDiv.className = 'thinking';
+              thinkDiv.innerHTML = dotsHtml + esc(statusText);
+              thinkContent.insertBefore(thinkDiv, thinkContent.firstChild);
             }
+          } else if (currentEventType === 'plan') {
+            const steps = data.steps || [];
+            const risk = data.risk || 0;
+            const riskLabel = risk <= 3 ? '🟢' : risk <= 7 ? '🟡' : '🔴';
+            addReasoningLine('r-plan', '📋', `Plan: ${steps.length} step${steps.length !== 1 ? 's' : ''} ${riskLabel}`);
+            steps.forEach((s, i) => {
+              addReasoningLine('r-plan', `  ${i+1}.`, s);
+            });
+          } else if (currentEventType === 'tool_call') {
+            addReasoningLine('r-tool', '🔧', `${data.tool}: ${data.action}`);
+          } else if (currentEventType === 'tool_done') {
+            const cls = data.success ? 'r-tool-done-ok' : 'r-tool-done-fail';
+            const icon = data.success ? '✅' : '❌';
+            addReasoningLine(cls, icon, `${data.tool} ${data.success ? 'done' : 'failed'}`);
           } else if (currentEventType === 'token') {
             if (!answerEl) {
-              thinkEl.remove();
-              const div = document.createElement('div');
-              div.className = 'turn ai';
-              div.innerHTML = '<div class="ai-label">aihomeserver</div><div class="ai-content streaming-content"></div>';
-              msgsEl.appendChild(div);
-              answerEl = div.querySelector('.streaming-content');
+              // Move thinkEl content: remove thinking spinner, keep reasoning as collapsed
+              thinkContent.innerHTML = '';
+              const div2 = document.createElement('div');
+              div2.className = 'streaming-content';
+              thinkContent.appendChild(div2);
+              answerEl = div2;
+              // Add reasoning toggle if we have lines
+              if (reasoningLines.length > 0) {
+                const uid = 'r' + Date.now();
+                const toggle = document.createElement('span');
+                toggle.className = 'reasoning-toggle';
+                toggle.innerHTML = `<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3l3 3 3-3"/></svg> Show reasoning`;
+                toggle.onclick = () => {
+                  const panel = document.getElementById(uid);
+                  const open = panel.style.display === 'block';
+                  panel.style.display = open ? 'none' : 'block';
+                  toggle.querySelector('path').setAttribute('d', open ? 'M2 3l3 3 3-3' : 'M2 7l3-3 3 3');
+                };
+                const panel = document.createElement('div');
+                panel.className = 'reasoning-full';
+                panel.id = uid;
+                panel.textContent = reasoningLines.map(l => `${l.icon} ${l.text}`).join('\n');
+                thinkContent.appendChild(toggle);
+                thinkContent.appendChild(panel);
+              }
             }
             fullAnswer += data.text;
             answerEl.textContent = fullAnswer;
             scrollBottom();
           } else if (currentEventType === 'done') {
             if (!answerEl) {
-              thinkEl.remove();
-              const div = document.createElement('div');
-              div.className = 'turn ai';
-              div.innerHTML = `<div class="ai-label">aihomeserver</div><div class="ai-content">${renderMarkdown(data.answer)}</div>`;
-              msgsEl.appendChild(div);
+              thinkContent.innerHTML = '';
+              const div2 = document.createElement('div');
+              div2.innerHTML = renderMarkdown(data.answer);
+              thinkContent.appendChild(div2);
             } else {
-              // Render the final streamed content as markdown
-              answerEl.innerHTML = renderMarkdown(fullAnswer);
+              answerEl.innerHTML = renderMarkdown(fullAnswer || data.answer);
+            }
+            // Add reasoning toggle to final turn
+            if (reasoningLines.length > 0 && !thinkContent.querySelector('.reasoning-toggle')) {
+              const uid = 'r' + Date.now();
+              const toggle = document.createElement('span');
+              toggle.className = 'reasoning-toggle';
+              toggle.innerHTML = `<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3l3 3 3-3"/></svg> Show reasoning`;
+              toggle.onclick = () => {
+                const panel = document.getElementById(uid);
+                const open = panel.style.display === 'block';
+                panel.style.display = open ? 'none' : 'block';
+                toggle.querySelector('path').setAttribute('d', open ? 'M2 3l3 3 3-3' : 'M2 7l3-3 3 3');
+              };
+              const panel = document.createElement('div');
+              panel.className = 'reasoning-full';
+              panel.id = uid;
+              panel.textContent = reasoningLines.map(l => `${l.icon} ${l.text}`).join('\n');
+              thinkContent.appendChild(toggle);
+              thinkContent.appendChild(panel);
             }
             currentSessionId = data.session_id;
             setTimeout(refreshSessions, 500);

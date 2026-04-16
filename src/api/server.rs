@@ -481,6 +481,9 @@ async fn run_stream(
             SseEvent::Token { .. } => "token",
             SseEvent::Done { .. } => "done",
             SseEvent::Error { .. } => "error",
+            SseEvent::Plan { .. } => "plan",
+            SseEvent::ToolCall { .. } => "tool_call",
+            SseEvent::ToolDone { .. } => "tool_done",
         };
         let data = serde_json::to_string(&event).unwrap_or_default();
         Ok::<Event, Infallible>(Event::default().event(event_type).data(data))
@@ -514,6 +517,11 @@ fn extract_answer(artifacts: &HashMap<String, serde_json::Value>) -> String {
                 if let Some(stdout) = obj.get("stdout").and_then(|s| s.as_str()) {
                     if !stdout.trim().is_empty() {
                         return stdout.trim().to_string();
+                    }
+                }
+                if let Some(body) = obj.get("body").and_then(|s| s.as_str()) {
+                    if !body.trim().is_empty() {
+                        return body.trim().to_string();
                     }
                 }
             }

@@ -36,6 +36,13 @@ USE "shell" only when explicitly asked to run a command or script.
 USE "git" only when explicitly asked about git history, status, or commits.
   {"action":"status"} / {"action":"log","n":10} / {"action":"commit","message":"msg"}
 
+USE "http_fetch" when asked to fetch, visit, retrieve, or analyze a URL or website.
+  params: {"url":"https://example.com"}
+  ALWAYS plan TWO steps: step 1 fetches (tool_binding="http_fetch"), step 2 analyzes with LLM (tool_binding=null).
+  The second step action should reference the fetch result: "Analyze the fetched page content and answer the user's question"
+  The second step output_key must be "answer".
+  risk_score for fetch-only tasks: 2
+
 NEVER invent tools. NEVER use "clarity", "summarization", "search", or any other tool name.
 NEVER ask for clarification — always plan to answer to the best of your ability.
 
@@ -67,6 +74,21 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
                 }),
             );
             state.current_plan = Some(plan);
+            if let Some(plan) = &state.current_plan {
+                if let Some(tx) = &state.sse_tx {
+                    let steps: Vec<String> = plan.steps.iter().map(|s| {
+                        if let Some(tool) = &s.tool_binding {
+                            format!("[{}] {}", tool, s.action)
+                        } else {
+                            s.action.clone()
+                        }
+                    }).collect();
+                    let _ = tx.send(crate::state::SseEvent::Plan {
+                        steps,
+                        risk: plan.risk_score,
+                    });
+                }
+            }
         }
         Err(e) => {
             state.log_meta(

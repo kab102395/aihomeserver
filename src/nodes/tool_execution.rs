@@ -51,6 +51,14 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
         return Ok(state);
     }
 
+    if let Some(tx) = &state.sse_tx {
+        let _ = tx.send(crate::state::SseEvent::ToolCall {
+            step: state.current_step,
+            tool: tool_name.clone(),
+            action: step.action.clone(),
+        });
+    }
+
     let result = tools.execute(&tool_name, tool_params).await;
     let tool_output_key = format!("{output_key}_result");
 
@@ -76,6 +84,15 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
     }
 
     state.apply_tool_result(&result, &tool_output_key);
+
+    if let Some(tx) = &state.sse_tx {
+        let _ = tx.send(crate::state::SseEvent::ToolDone {
+            step: state.current_step,
+            tool: tool_name.clone(),
+            success: result.success,
+        });
+    }
+
     Ok(state)
 }
 

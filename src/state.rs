@@ -230,6 +230,23 @@ pub enum SseEvent {
     Token { text: String },
     Done { task_id: String, session_id: String, success: bool, answer: String },
     Error { message: String },
+    /// Emitted after planner finishes — tells UI what steps are planned
+    Plan {
+        steps: Vec<String>,   // human-readable step descriptions
+        risk: u8,
+    },
+    /// Emitted before a tool executes
+    ToolCall {
+        step: usize,
+        tool: String,
+        action: String,
+    },
+    /// Emitted after a tool returns
+    ToolDone {
+        step: usize,
+        tool: String,
+        success: bool,
+    },
 }
 
 // ==================== ROUTING ====================
