@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use uuid::Uuid;
 
 // ==================== TOOL RESULT ====================
@@ -168,6 +169,10 @@ pub struct SystemState {
     /// SSE sender — present only during a streaming request. Skipped in serialization.
     #[serde(skip)]
     pub sse_tx: Option<tokio::sync::mpsc::UnboundedSender<SseEvent>>,
+    /// Approval gate store — shared with the HTTP server so approve/reject endpoints can
+    /// resolve a pending oneshot. Only set on streaming requests; None for non-streaming.
+    #[serde(skip)]
+    pub gate_store: Option<Arc<tokio::sync::RwLock<HashMap<Uuid, tokio::sync::oneshot::Sender<bool>>>>>,
 }
 
 impl SystemState {
@@ -190,6 +195,7 @@ impl SystemState {
             termination_met: false,
             failure_taxonomy: Vec::new(),
             sse_tx: None,
+            gate_store: None,
         }
     }
 
@@ -248,6 +254,14 @@ pub enum SseEvent {
         step: usize,
         tool: String,
         success: bool,
+    },
+    /// Emitted when a high-risk step is about to execute — UI shows approve/reject modal
+    NeedsApproval {
+        task_id: String,
+        step: usize,
+        action: String,
+        tool: Option<String>,
+        risk: u8,
     },
 }
 

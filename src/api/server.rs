@@ -35,6 +35,7 @@ pub enum TaskStatusPayload {
 }
 
 pub type TaskStore = Arc<RwLock<HashMap<Uuid, TaskStatusPayload>>>;
+pub type ApprovalGates = Arc<RwLock<HashMap<Uuid, tokio::sync::oneshot::Sender<bool>>>>;
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
@@ -45,6 +46,10 @@ pub struct AppState {
     pub conversations: Arc<ConversationStore>,
     pub semantic: Arc<SemanticMemory>,
     pub task_store: TaskStore,
+    /// Pending human-approval gates keyed by task_id.
+    /// The orchestrator inserts a oneshot::Sender here before awaiting approval;
+    /// the approve/reject endpoints take it and send true/false.
+    pub approval_gates: ApprovalGates,
 }
 
 // ── Request / response types ──────────────────────────────────────────────────
@@ -77,6 +82,8 @@ pub fn router(state: AppState) -> Router {
         .route("/run", post(run_task))
         .route("/run/stream", post(run_stream))
         .route("/task/:id/status", get(get_task_status))
+        .route("/task/:id/approve", post(approve_task))
+        .route("/task/:id/reject", post(reject_task))
         .route("/task/:id", get(get_task))
         .route("/history", get(get_history))
         // Session management
@@ -389,6 +396,7 @@ async fn run_stream(
     initial.conversation_history = history;
     initial.semantic_context = semantic_examples;
     initial.sse_tx = Some(sse_tx.clone());
+    initial.gate_store = Some(app.approval_gates.clone());
     if let Some(max) = req.max_steps { initial.max_steps = max; }
 
     let task_id = initial.task_id;
@@ -484,12 +492,49 @@ async fn run_stream(
             SseEvent::Plan { .. } => "plan",
             SseEvent::ToolCall { .. } => "tool_call",
             SseEvent::ToolDone { .. } => "tool_done",
+            SseEvent::NeedsApproval { .. } => "needs_approval",
         };
         let data = serde_json::to_string(&event).unwrap_or_default();
         Ok::<Event, Infallible>(Event::default().event(event_type).data(data))
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// POST /task/:id/approve — resolve a pending high-risk gate (approved).
+async fn approve_task(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let task_id = match id.parse::<Uuid>() {
+        Ok(u) => u,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let mut gates = app.approval_gates.write().await;
+    if let Some(tx) = gates.remove(&task_id) {
+        let _ = tx.send(true);
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "No pending approval for this task").into_response()
+    }
+}
+
+/// POST /task/:id/reject — resolve a pending high-risk gate (rejected).
+async fn reject_task(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let task_id = match id.parse::<Uuid>() {
+        Ok(u) => u,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let mut gates = app.approval_gates.write().await;
+    if let Some(tx) = gates.remove(&task_id) {
+        let _ = tx.send(false);
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "No pending approval for this task").into_response()
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -54,6 +54,47 @@ impl Orchestrator {
                 }
 
                 OrchestratorNode::Executor => {
+                    // ── High-risk human gate ──────────────────────────────────
+                    if RiskLevel::from_score(state.risk_score()) == RiskLevel::High {
+                        if let (Some(gate_store), Some(sse_tx)) =
+                            (state.gate_store.as_ref(), state.sse_tx.as_ref())
+                        {
+                            let (action, tool) = state
+                                .current_plan
+                                .as_ref()
+                                .and_then(|p| p.steps.get(state.current_step))
+                                .map(|s| (s.action.clone(), s.tool_binding.clone()))
+                                .unwrap_or_else(|| ("Unknown action".into(), None));
+
+                            let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+                            {
+                                let mut store = gate_store.write().await;
+                                store.insert(state.task_id, tx);
+                            }
+                            let _ = sse_tx.send(crate::state::SseEvent::NeedsApproval {
+                                task_id: state.task_id.to_string(),
+                                step: state.current_step + 1,
+                                action,
+                                tool,
+                                risk: state.risk_score(),
+                            });
+
+                            match rx.await {
+                                Ok(true) => {
+                                    // Approved — continue to executor
+                                    state.log("gate", "High-risk action approved by user");
+                                }
+                                _ => {
+                                    // Rejected or channel dropped
+                                    state.log("gate", "High-risk action rejected by user");
+                                    state.termination_met = false;
+                                    state = finalization::run(state).await?;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // ─────────────────────────────────────────────────────────
                     state = executor::run(state, &self.llm).await?;
                     if state.termination_met {
                         OrchestratorNode::Finalization

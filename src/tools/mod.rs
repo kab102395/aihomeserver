@@ -2,6 +2,7 @@ pub mod filesystem;
 pub mod git;
 pub mod http_fetch;
 pub mod shell;
+pub mod web_search;
 
 use async_trait::async_trait;
 use serde_json::Value;

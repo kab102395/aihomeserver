@@ -574,6 +574,66 @@ body {
 /* Scrollbar for history */
 #history-list::-webkit-scrollbar { width: 4px; }
 #history-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* ── Approval modal ── */
+.approval-modal {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.approval-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  max-width: 440px;
+  width: 90%;
+}
+.approval-card h3 { font-size: 16px; margin-bottom: 8px; color: var(--text); }
+.approval-card .risk-badge {
+  display: inline-block;
+  background: rgba(200,60,60,0.15);
+  color: #c83c3c;
+  border: 1px solid rgba(200,60,60,0.3);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 12px;
+  margin-bottom: 12px;
+}
+.approval-card .action-desc {
+  font-size: 13px;
+  color: var(--text-muted);
+  background: var(--surface2);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 16px;
+  font-family: monospace;
+}
+.approval-btns { display: flex; gap: 10px; justify-content: flex-end; }
+.btn-approve {
+  background: #2a5c2a;
+  color: #7fcc7f;
+  border: 1px solid #3a7c3a;
+  border-radius: 6px;
+  padding: 8px 18px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.btn-approve:hover { background: #336633; }
+.btn-reject {
+  background: var(--surface2);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 18px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.btn-reject:hover { background: var(--surface); color: var(--text); }
 </style>
 </head>
 <body>
@@ -774,6 +834,8 @@ async function send() {
             const cls = data.success ? 'r-tool-done-ok' : 'r-tool-done-fail';
             const icon = data.success ? '✅' : '❌';
             addReasoningLine(cls, icon, `${data.tool} ${data.success ? 'done' : 'failed'}`);
+          } else if (currentEventType === 'needs_approval') {
+            showApprovalModal(data);
           } else if (currentEventType === 'token') {
             if (!answerEl) {
               // Move thinkEl content: remove thinking spinner, keep reasoning as collapsed
@@ -1213,6 +1275,35 @@ async function loadSession(sessionId, firstMessage) {
       el.classList.toggle('active', el.dataset.sid === sessionId);
     });
   } catch (_) {}
+}
+
+// ── Approval modal ────────────────────────────────────────────
+function showApprovalModal(data) {
+  const existing = document.getElementById('approval-modal');
+  if (existing) existing.remove();
+
+  const toolStr = data.tool ? ` via ${data.tool}` : '';
+  const modal = document.createElement('div');
+  modal.className = 'approval-modal';
+  modal.id = 'approval-modal';
+  modal.innerHTML = `
+    <div class="approval-card">
+      <h3>⚠️ High-Risk Action — Approval Required</h3>
+      <div class="risk-badge">Risk ${data.risk}/10</div>
+      <div class="action-desc">Step ${data.step}${esc(toolStr)}: ${esc(data.action)}</div>
+      <div class="approval-btns">
+        <button class="btn-reject" onclick="handleApproval('${data.task_id}', false)">Reject</button>
+        <button class="btn-approve" onclick="handleApproval('${data.task_id}', true)">Approve</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+}
+
+async function handleApproval(taskId, approved) {
+  const modal = document.getElementById('approval-modal');
+  if (modal) modal.remove();
+  const endpoint = approved ? 'approve' : 'reject';
+  await fetch(`/task/${taskId}/${endpoint}`, { method: 'POST' });
 }
 
 // ── Init ──────────────────────────────────────────────────────

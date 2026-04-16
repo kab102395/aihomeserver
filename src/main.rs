@@ -15,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 use std::collections::HashMap;
 
 use crate::{
-    api::server::{AppState, TaskStore, router},
+    api::server::{AppState, ApprovalGates, TaskStore, router},
     llm::ollama::OllamaClient,
     memory::{
         conversation::ConversationStore,
@@ -28,6 +28,7 @@ use crate::{
         git::GitTool,
         http_fetch::HttpFetchTool,
         shell::ShellTool,
+        web_search::WebSearchTool,
         ToolRegistry,
     },
 };
@@ -61,6 +62,7 @@ async fn main() -> Result<()> {
     tools.register(ShellTool);
     tools.register(GitTool::new("."));
     tools.register(HttpFetchTool::new());
+    tools.register(WebSearchTool::new());
 
     info!("Registered tools: {:?}", tools.list());
 
@@ -83,10 +85,13 @@ async fn main() -> Result<()> {
     // ── In-memory task status store ───────────────────────────────────────────
     let task_store: TaskStore = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
+    // ── Human-approval gate store ─────────────────────────────────────────────
+    let approval_gates: ApprovalGates = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
     info!("Memory ready (episodic.db)");
 
     // ── HTTP API ──────────────────────────────────────────────────────────────
-    let app_state = AppState { orchestrator, memory, conversations, semantic, task_store };
+    let app_state = AppState { orchestrator, memory, conversations, semantic, task_store, approval_gates };
     let app = router(app_state);
 
     let addr = "0.0.0.0:8080";

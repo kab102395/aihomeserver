@@ -43,7 +43,13 @@ USE "http_fetch" when asked to fetch, visit, retrieve, or analyze a URL or websi
   The second step output_key must be "answer".
   risk_score for fetch-only tasks: 2
 
-NEVER invent tools. NEVER use "clarity", "summarization", "search", or any other tool name.
+USE "web_search" when asked to search the web, find information about a topic, research something, or when you need to discover relevant URLs before fetching.
+  params: {"query": "search terms here"}
+  Returns top 5 results with title, url, and snippet.
+  After searching, you can use http_fetch on specific URLs for more detail.
+  risk_score for search tasks: 1
+
+NEVER invent tools. NEVER use "clarity", "summarization", or any other tool name not listed above.
 NEVER ask for clarification — always plan to answer to the best of your ability.
 
 risk_score: 0-3 low (Q&A, reads), 4-7 standard (file writes, shell), 8-10 high (destructive ops, git push)
