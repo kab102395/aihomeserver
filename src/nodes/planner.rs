@@ -79,7 +79,18 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
 }
 
 fn build_context(state: &SystemState) -> String {
-    let mut ctx = format!("User request: {}\n", state.user_request);
+    let mut ctx = String::new();
+
+    // Inject conversation history so the planner understands multi-turn context
+    if !state.conversation_history.is_empty() {
+        ctx.push_str("Conversation history (oldest → newest):\n");
+        for turn in &state.conversation_history {
+            ctx.push_str(&format!("{}: {}\n", turn.role.to_uppercase(), turn.content));
+        }
+        ctx.push('\n');
+    }
+
+    ctx.push_str(&format!("Current user request: {}\n", state.user_request));
 
     if !state.failure_taxonomy.is_empty() {
         ctx.push_str(&format!(

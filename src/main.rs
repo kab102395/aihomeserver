@@ -12,10 +12,12 @@ use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use std::collections::HashMap;
+
 use crate::{
-    api::server::{AppState, router},
+    api::server::{AppState, TaskStore, router},
     llm::ollama::OllamaClient,
-    memory::episodic::EpisodicMemory,
+    memory::{conversation::ConversationStore, episodic::EpisodicMemory},
     orchestrator::Orchestrator,
     tools::{
         filesystem::FilesystemTool,
@@ -64,13 +66,26 @@ async fn main() -> Result<()> {
         EpisodicMemory::new("episodic.db").await?,
     ));
 
-    info!("Episodic memory ready (episodic.db)");
+    // ── Conversation memory (same db file, separate tables) ──────────────────
+    let conversations = Arc::new(ConversationStore::new("episodic.db").await?);
+
+    // ── In-memory task status store ───────────────────────────────────────────
+    let task_store: TaskStore = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+    info!("Memory ready (episodic.db)");
 
     // ── HTTP API ──────────────────────────────────────────────────────────────
-    // POST /run     — submit a task
-    // GET  /history — last 50 completed tasks
-    // GET  /health  — liveness check
-    let app_state = AppState { orchestrator, memory };
+    // POST /run                    — start task in background, returns task_id immediately
+    // GET  /task/:id/status        — poll for task completion
+    // GET  /task/:id               — load a completed task record
+    // GET  /sessions               — active sessions for sidebar
+    // GET  /sessions/archived      — archived sessions
+    // GET  /session/:id            — load all turns
+    // POST /session/:id/archive    — archive a session
+    // POST /session/:id/unarchive  — restore from archive
+    // DELETE /session/:id          — hard delete (session + turns + tasks)
+    // GET  /health                 — liveness check
+    let app_state = AppState { orchestrator, memory, conversations, task_store };
     let app = router(app_state);
 
     let addr = "0.0.0.0:8080";
