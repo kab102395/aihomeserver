@@ -76,7 +76,9 @@ pub struct PlannerOutput {
     pub risk_score: u8,
     pub expected_outputs: Vec<String>,
     pub completion_criteria: Vec<String>,
-    pub dependencies: HashMap<String, Vec<String>>,
+    /// Dependency map — shape varies by model output, never used at runtime.
+    #[serde(default)]
+    pub dependencies: serde_json::Value,
 }
 
 // ==================== CRITIC REVIEW ====================
