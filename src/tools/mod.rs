@@ -34,6 +34,14 @@ impl ToolRegistry {
         self.tools.insert(name, Arc::new(tool));
     }
 
+    /// Register a tool under an additional alias name.
+    /// Useful when LLMs use alternate names (e.g. "run_command" for "shell").
+    pub fn alias(&mut self, alias: &str, canonical: &str) {
+        if let Some(tool) = self.tools.get(canonical).cloned() {
+            self.tools.insert(alias.to_string(), tool);
+        }
+    }
+
     pub async fn execute(&self, name: &str, params: Value) -> ToolResult {
         match self.tools.get(name) {
             Some(tool) => tool.execute(params).await,

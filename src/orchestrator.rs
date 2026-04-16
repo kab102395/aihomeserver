@@ -62,9 +62,13 @@ impl Orchestrator {
                             let (action, tool) = state
                                 .current_plan
                                 .as_ref()
-                                .and_then(|p| p.steps.get(state.current_step))
+                                .and_then(|p| {
+                                    // current_step is pre-increment; fall back to first step
+                                    p.steps.get(state.current_step)
+                                        .or_else(|| p.steps.first())
+                                })
                                 .map(|s| (s.action.clone(), s.tool_binding.clone()))
-                                .unwrap_or_else(|| ("Unknown action".into(), None));
+                                .unwrap_or_else(|| ("Execute planned action".into(), None));
 
                             let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
                             {

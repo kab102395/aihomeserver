@@ -64,6 +64,13 @@ async fn main() -> Result<()> {
     tools.register(HttpFetchTool::new());
     tools.register(WebSearchTool::new());
 
+    // Aliases for alternate names LLMs tend to use
+    tools.alias("run_command", "shell");
+    tools.alias("bash", "shell");
+    tools.alias("execute_command", "shell");
+    tools.alias("fetch", "http_fetch");
+    tools.alias("search", "web_search");
+
     info!("Registered tools: {:?}", tools.list());
 
     // ── Orchestrator ──────────────────────────────────────────────────────────

@@ -13,7 +13,7 @@ impl WebSearchTool {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
-                .user_agent("Mozilla/5.0 (compatible; aihomeserver/0.1)")
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                 .build()
                 .expect("HTTP client"),
         }
@@ -36,10 +36,11 @@ impl Tool for WebSearchTool {
             _ => format!("%{:02X}", c as u32),
         }).collect();
 
-        let url = format!("https://lite.duckduckgo.com/lite/?q={encoded}");
+        let url = format!("https://www.bing.com/search?q={encoded}&setlang=en");
 
         let html = match self.client.get(&url)
             .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Accept", "text/html,application/xhtml+xml")
             .send().await
         {
             Ok(r) => match r.text().await {
@@ -49,59 +50,80 @@ impl Tool for WebSearchTool {
             Err(e) => return ToolResult::err(ErrorType::Tool, "fetch_error", &e.to_string()),
         };
 
-        let results = extract_results(&html);
+        let results = extract_bing_results(&html);
+        if results.is_empty() {
+            return ToolResult::err(ErrorType::Tool, "no_results", "No search results found");
+        }
         ToolResult::ok(json!({ "query": query, "results": results }), None)
     }
 }
 
-/// Extract search results from DuckDuckGo lite HTML.
-/// Returns up to 5 results as [{title, url, snippet}].
-fn extract_results(html: &str) -> Vec<serde_json::Value> {
-    let mut results: Vec<serde_json::Value> = Vec::new();
+/// Extract up to 5 results from Bing's HTML.
+/// Each result is in <li class="b_algo">, title in <h2><a href="...">,
+/// snippet in <div class="b_caption"><p>...</p></div>.
+fn extract_bing_results(html: &str) -> Vec<serde_json::Value> {
+    let mut results = Vec::new();
     let mut pos = 0;
 
     while results.len() < 5 {
-        // Find next result link
-        let tag = "class=\"result-link\"";
-        let Some(start) = html[pos..].find(tag) else { break };
-        let abs = pos + start;
+        // Find next result block
+        let marker = "class=\"b_algo\"";
+        let Some(rel) = html[pos..].find(marker) else { break };
+        let block_start = pos + rel;
 
-        // Look backward for the opening <a to get href
-        let tag_open = html[..abs].rfind('<').unwrap_or(0);
-        let tag_src_end = (abs + tag.len() + 100).min(html.len());
-        let tag_src = &html[tag_open..tag_src_end];
+        // Find end of this block (start of next b_algo or end of results)
+        let block_end = html[block_start + marker.len()..]
+            .find("class=\"b_algo\"")
+            .map(|r| block_start + marker.len() + r)
+            .unwrap_or(html.len().min(block_start + 4000));
 
-        let href = extract_attr(tag_src, "href").unwrap_or_default();
+        let block = &html[block_start..block_end];
+        pos = block_start + marker.len();
 
-        // Title = text between > and </a>
-        let after_tag = &html[abs..];
-        let title = after_tag.find('>').map(|i| {
-            let rest = &after_tag[i + 1..];
-            rest.find("</a>").map(|j| strip_tags(&rest[..j])).unwrap_or_default()
-        }).unwrap_or_default();
+        // Extract href and title from <h2><a href="...">TITLE</a></h2>
+        let (href, title) = extract_h2_link(block);
+        if href.is_empty() || title.is_empty() { continue; }
 
-        // Snippet follows in the next result-snippet td
-        let snippet_tag = "class=\"result-snippet\"";
-        let snippet = html[abs..].find(snippet_tag).map(|si| {
-            let after = &html[abs + si..];
-            after.find('>').map(|i| {
-                let rest = &after[i + 1..];
-                rest.find("</td>").map(|j| strip_tags(&rest[..j])).unwrap_or_default()
-            }).unwrap_or_default()
-        }).unwrap_or_default();
+        // Skip Bing's own internal links
+        if href.starts_with("https://www.bing.com") { continue; }
 
-        pos = abs + tag.len();
+        // Extract snippet from b_caption <p>
+        let snippet = extract_caption(block);
 
-        if !href.is_empty() && !title.trim().is_empty() {
-            results.push(json!({
-                "title": title.trim(),
-                "url": href,
-                "snippet": snippet.trim(),
-            }));
-        }
+        results.push(json!({
+            "title": title.trim(),
+            "url": href,
+            "snippet": snippet.trim(),
+        }));
     }
 
     results
+}
+
+fn extract_h2_link(block: &str) -> (String, String) {
+    let Some(h2_pos) = block.find("<h2>") else { return (String::new(), String::new()) };
+    let h2_block = &block[h2_pos..];
+    let Some(a_pos) = h2_block.find("<a ") else { return (String::new(), String::new()) };
+    let a_block = &h2_block[a_pos..];
+
+    let href = extract_attr(a_block, "href").unwrap_or_default();
+    let title = a_block.find('>').map(|i| {
+        let rest = &a_block[i + 1..];
+        rest.find("</a>").map(|j| strip_tags(&rest[..j])).unwrap_or_default()
+    }).unwrap_or_default();
+
+    (href, title)
+}
+
+fn extract_caption(block: &str) -> String {
+    let Some(cap_pos) = block.find("b_caption") else { return String::new() };
+    let after = &block[cap_pos..];
+    let Some(p_pos) = after.find("<p") else { return String::new() };
+    let p_block = &after[p_pos..];
+    p_block.find('>').map(|i| {
+        let rest = &p_block[i + 1..];
+        rest.find("</p>").map(|j| strip_tags(&rest[..j])).unwrap_or_default()
+    }).unwrap_or_default()
 }
 
 fn extract_attr(tag: &str, attr: &str) -> Option<String> {
@@ -122,11 +144,13 @@ fn strip_tags(s: &str) -> String {
             _ => {}
         }
     }
-    // Decode basic HTML entities
     out.replace("&amp;", "&")
        .replace("&lt;", "<")
        .replace("&gt;", ">")
        .replace("&quot;", "\"")
        .replace("&#39;", "'")
        .replace("&nbsp;", " ")
+       .split_whitespace()
+       .collect::<Vec<_>>()
+       .join(" ")
 }
