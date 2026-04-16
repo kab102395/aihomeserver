@@ -1,10 +1,13 @@
 use axum::{
     extract::{Path, State},
     http::{StatusCode, header},
-    response::IntoResponse,
+    response::{sse::{Event, KeepAlive, Sse}, IntoResponse},
     routing::{delete, get, post},
     Json, Router,
 };
+use std::convert::Infallible;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::StreamExt as TokioStreamExt;
 use super::ui::CHAT_HTML;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
@@ -72,6 +75,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(chat_ui))
         // Task execution
         .route("/run", post(run_task))
+        .route("/run/stream", post(run_stream))
         .route("/task/:id/status", get(get_task_status))
         .route("/task/:id", get(get_task))
         .route("/history", get(get_history))
@@ -354,6 +358,135 @@ async fn health() -> impl IntoResponse {
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// POST /run/stream — start a task and stream SSE events back immediately.
+async fn run_stream(
+    State(app): State<AppState>,
+    Json(req): Json<RunRequest>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    use crate::state::SseEvent;
+    use tokio::sync::mpsc;
+
+    let (sse_tx, sse_rx) = mpsc::unbounded_channel::<SseEvent>();
+
+    // Session setup (fire-and-forget defaults on error)
+    let session_id = app.conversations
+        .get_or_create_session(req.session_id).await
+        .unwrap_or_else(|_| uuid::Uuid::new_v4());
+
+    let history = app.conversations
+        .get_recent_turns(&session_id, 10).await
+        .unwrap_or_default();
+
+    let semantic_examples = match app.orchestrator.llm.embed(&req.request).await {
+        Ok(v) => app.semantic.query(&v, 3, 0.65).await,
+        Err(_) => vec![],
+    };
+
+    let mut initial = crate::state::SystemState::new(req.request.clone());
+    initial.session_id = Some(session_id);
+    initial.conversation_history = history;
+    initial.semantic_context = semantic_examples;
+    initial.sse_tx = Some(sse_tx.clone());
+    if let Some(max) = req.max_steps { initial.max_steps = max; }
+
+    let task_id = initial.task_id;
+    {
+        let mut store = app.task_store.write().await;
+        store.insert(task_id, TaskStatusPayload::Running);
+    }
+
+    let app2 = app.clone();
+    let request_text = req.request.clone();
+    tokio::spawn(async move {
+        let start = std::time::Instant::now();
+        let result = app2.orchestrator.run(initial).await;
+
+        match result {
+            Ok(final_state) => {
+                let duration_ms = start.elapsed().as_millis() as i64;
+                let answer = extract_answer(&final_state.artifacts);
+                let success = final_state.termination_met;
+
+                let _ = app2.conversations.add_turn(&session_id, "user", &request_text).await;
+                let _ = app2.conversations.add_turn(&session_id, "assistant", &answer).await;
+
+                let record = TaskRecord {
+                    task_id: final_state.task_id,
+                    session_id: final_state.session_id,
+                    user_request: final_state.user_request.clone(),
+                    plan_json: final_state.current_plan.as_ref()
+                        .and_then(|p| serde_json::to_string(p).ok()),
+                    artifacts_json: serde_json::to_string(&final_state.artifacts)
+                        .unwrap_or_else(|_| "{}".into()),
+                    critic_scores: final_state.critic_history.iter().map(|r| r.score).collect(),
+                    failure_count: final_state.failure_count,
+                    repair_cycles: final_state.repair_cycle,
+                    duration_ms,
+                    success,
+                    created_at: chrono::Utc::now(),
+                };
+                if let Ok(mem) = app2.memory.try_lock() {
+                    let _ = mem.save(&record).await;
+                }
+
+                if success {
+                    let summary = answer.chars().take(500).collect::<String>();
+                    if let Ok(embedding) = app2.orchestrator.llm.embed(&request_text).await {
+                        let _ = app2.semantic.store(
+                            &final_state.task_id,
+                            final_state.session_id.as_ref(),
+                            &request_text,
+                            &summary,
+                            embedding,
+                        ).await;
+                    }
+                }
+
+                let response = RunResponse {
+                    task_id: final_state.task_id.to_string(),
+                    session_id: session_id.to_string(),
+                    success,
+                    artifacts: serde_json::to_value(&final_state.artifacts).unwrap_or_default(),
+                    steps_taken: final_state.current_step,
+                    failure_count: final_state.failure_count,
+                    repair_cycles: final_state.repair_cycle,
+                    event_log: final_state.event_log,
+                };
+                {
+                    let mut store = app2.task_store.write().await;
+                    store.insert(task_id, TaskStatusPayload::Done { response });
+                }
+
+                let _ = sse_tx.send(SseEvent::Done {
+                    task_id: task_id.to_string(),
+                    session_id: session_id.to_string(),
+                    success,
+                    answer,
+                });
+            }
+            Err(e) => {
+                tracing::error!("Stream orchestrator error: {e}");
+                let mut store = app2.task_store.write().await;
+                store.insert(task_id, TaskStatusPayload::Failed { error: e.to_string() });
+                let _ = sse_tx.send(SseEvent::Error { message: e.to_string() });
+            }
+        }
+    });
+
+    let stream = UnboundedReceiverStream::new(sse_rx).map(|event| {
+        let event_type = match &event {
+            SseEvent::Status { .. } => "status",
+            SseEvent::Token { .. } => "token",
+            SseEvent::Done { .. } => "done",
+            SseEvent::Error { .. } => "error",
+        };
+        let data = serde_json::to_string(&event).unwrap_or_default();
+        Ok::<Event, Infallible>(Event::default().event(event_type).data(data))
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -94,22 +94,36 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
         Message::user(user_prompt),
     ];
 
-    match llm.chat(messages, ModelRole::Fast, has_tool).await {
-        Ok(output) => {
-            let output_key = step
-                .output_key
-                .clone()
-                .unwrap_or_else(|| format!("step_{}", state.current_step));
-            state
-                .artifacts
-                .insert(output_key, serde_json::Value::String(output));
+    let output = if !has_tool {
+        if let Some(sse_tx) = &state.sse_tx {
+            // Stream tokens live
+            let (tok_tx, mut tok_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let sse_tx2 = sse_tx.clone();
+            tokio::spawn(async move {
+                while let Some(tok) = tok_rx.recv().await {
+                    let _ = sse_tx2.send(crate::state::SseEvent::Token { text: tok });
+                }
+            });
+            // emit step status
+            let _ = sse_tx.send(crate::state::SseEvent::Status {
+                phase: format!("executing_step_{}", state.current_step),
+            });
+            llm.chat_stream(messages, ModelRole::Fast, &tok_tx).await.ok()
+        } else {
+            llm.chat(messages, ModelRole::Fast, false).await.ok()
         }
-        Err(e) => {
-            state.log_meta(
-                "executor_error",
-                "LLM call failed",
-                serde_json::json!({ "error": e.to_string() }),
-            );
+    } else {
+        llm.chat(messages, ModelRole::Fast, true).await.ok()
+    };
+
+    match output {
+        Some(out) => {
+            let output_key = step.output_key.clone()
+                .unwrap_or_else(|| format!("step_{}", state.current_step));
+            state.artifacts.insert(output_key, serde_json::Value::String(out));
+        }
+        None => {
+            state.log_meta("executor_error", "LLM call failed", serde_json::json!({}));
             state.failure_count += 1;
         }
     }

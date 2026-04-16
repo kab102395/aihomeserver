@@ -45,6 +45,9 @@ Pure JSON only. No explanations."#;
 
 pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemState> {
     state.log("planner", "Generating plan");
+    if let Some(tx) = &state.sse_tx {
+        let _ = tx.send(crate::state::SseEvent::Status { phase: "planning".into() });
+    }
 
     let context = build_context(&state);
     let messages = vec![

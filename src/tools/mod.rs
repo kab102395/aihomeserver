@@ -1,5 +1,6 @@
 pub mod filesystem;
 pub mod git;
+pub mod http_fetch;
 pub mod shell;
 
 use async_trait::async_trait;

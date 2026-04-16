@@ -26,6 +26,7 @@ use crate::{
     tools::{
         filesystem::FilesystemTool,
         git::GitTool,
+        http_fetch::HttpFetchTool,
         shell::ShellTool,
         ToolRegistry,
     },
@@ -59,6 +60,7 @@ async fn main() -> Result<()> {
     tools.register(FilesystemTool::new("./workspace")?);
     tools.register(ShellTool);
     tools.register(GitTool::new("."));
+    tools.register(HttpFetchTool::new());
 
     info!("Registered tools: {:?}", tools.list());
 

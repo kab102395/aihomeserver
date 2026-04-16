@@ -52,6 +52,12 @@ struct ChatResponse {
     message: Message,
 }
 
+#[derive(Deserialize)]
+struct StreamChunk {
+    message: Message,
+    done: bool,
+}
+
 impl OllamaClient {
     pub fn new(base_url: &str, fast_model: &str, critic_model: &str) -> Self {
         Self {
@@ -101,6 +107,50 @@ impl OllamaClient {
             .await?;
 
         Ok(resp.message.content)
+    }
+
+    /// Stream tokens from Ollama. Sends each token string to `token_tx`.
+    /// Returns the full accumulated response text when done.
+    pub async fn chat_stream(
+        &self,
+        messages: Vec<Message>,
+        role: ModelRole,
+        token_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Result<String> {
+        use futures::StreamExt;
+
+        let model = self.model_name(role).to_string();
+        let req = ChatRequest { model, messages, stream: true, format: None };
+
+        let response = self.client
+            .post(format!("{}/api/chat", self.base_url))
+            .json(&req)
+            .send().await?
+            .error_for_status()?;
+
+        let mut byte_stream = response.bytes_stream();
+        let mut line_buf = String::new();
+        let mut accumulated = String::new();
+
+        while let Some(chunk) = byte_stream.next().await {
+            let chunk = chunk?;
+            line_buf.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(pos) = line_buf.find('\n') {
+                let line = line_buf[..pos].trim().to_string();
+                line_buf = line_buf[pos + 1..].to_string();
+                if line.is_empty() { continue; }
+                if let Ok(parsed) = serde_json::from_str::<StreamChunk>(&line) {
+                    let token = parsed.message.content.clone();
+                    if !token.is_empty() {
+                        accumulated.push_str(&token);
+                        let _ = token_tx.send(token);
+                    }
+                    if parsed.done { break; }
+                }
+            }
+        }
+        Ok(accumulated)
     }
 
     /// Chat and parse the response as JSON into type T.

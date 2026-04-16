@@ -163,6 +163,9 @@ pub struct SystemState {
     pub max_steps: usize,
     pub termination_met: bool,
     pub failure_taxonomy: Vec<FailureTaxonomy>,
+    /// SSE sender — present only during a streaming request. Skipped in serialization.
+    #[serde(skip)]
+    pub sse_tx: Option<tokio::sync::mpsc::UnboundedSender<SseEvent>>,
 }
 
 impl SystemState {
@@ -184,6 +187,7 @@ impl SystemState {
             max_steps: 20,
             termination_met: false,
             failure_taxonomy: Vec::new(),
+            sse_tx: None,
         }
     }
 
@@ -215,6 +219,17 @@ impl SystemState {
             }
         }
     }
+}
+
+// ==================== SSE EVENTS ====================
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SseEvent {
+    Status { phase: String },
+    Token { text: String },
+    Done { task_id: String, session_id: String, success: bool, answer: String },
+    Error { message: String },
 }
 
 // ==================== ROUTING ====================

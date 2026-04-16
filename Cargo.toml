@@ -15,8 +15,12 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["json"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
-# HTTP client (Ollama)
-reqwest = { version = "0.12", features = ["json"] }
+# HTTP client (Ollama + http_fetch tool)
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Streaming support
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

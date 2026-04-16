@@ -626,6 +626,13 @@ function newChat() {
 }
 
 // ── Send ──────────────────────────────────────────────────────
+function phaseLabel(phase) {
+  if (phase === 'planning') return '🧠 Planning...';
+  if (phase.startsWith('executing')) return '⚙️ Executing...';
+  if (phase === 'critic') return '🔍 Reviewing...';
+  return '💭 Thinking...';
+}
+
 async function send() {
   const text = inputEl.value.trim();
   if (!text || busy) return;
@@ -645,22 +652,77 @@ async function send() {
     const body = { request: text };
     if (currentSessionId) body.session_id = currentSessionId;
 
-    const res = await fetch('/run', {
+    const response = await fetch('/run/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error(`Server error ${res.status}`);
-    const data = await res.json();
+    if (!response.ok) throw new Error(`Server error ${response.status}`);
 
-    currentSessionId = data.session_id;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let currentEventType = null;
+    let answerEl = null;
+    let fullAnswer = '';
 
-    // Poll for completion — request runs in the background
-    await pollTask(data.task_id, thinkEl);
-    refreshSessions();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (line.startsWith('event: ')) {
+          currentEventType = line.slice(7).trim();
+        } else if (line.startsWith('data: ')) {
+          let data;
+          try { data = JSON.parse(line.slice(6)); } catch (_) { continue; }
+
+          if (currentEventType === 'status') {
+            const thinkContent = thinkEl.querySelector('.ai-content');
+            if (thinkContent) {
+              thinkContent.innerHTML = `<div class="thinking"><div class="dots"><span></span><span></span><span></span></div>${esc(phaseLabel(data.phase))}</div>`;
+            }
+          } else if (currentEventType === 'token') {
+            if (!answerEl) {
+              thinkEl.remove();
+              const div = document.createElement('div');
+              div.className = 'turn ai';
+              div.innerHTML = '<div class="ai-label">aihomeserver</div><div class="ai-content streaming-content"></div>';
+              msgsEl.appendChild(div);
+              answerEl = div.querySelector('.streaming-content');
+            }
+            fullAnswer += data.text;
+            answerEl.textContent = fullAnswer;
+            scrollBottom();
+          } else if (currentEventType === 'done') {
+            if (!answerEl) {
+              thinkEl.remove();
+              const div = document.createElement('div');
+              div.className = 'turn ai';
+              div.innerHTML = `<div class="ai-label">aihomeserver</div><div class="ai-content">${renderMarkdown(data.answer)}</div>`;
+              msgsEl.appendChild(div);
+            } else {
+              // Render the final streamed content as markdown
+              answerEl.innerHTML = renderMarkdown(fullAnswer);
+            }
+            currentSessionId = data.session_id;
+            setTimeout(refreshSessions, 500);
+            scrollBottom();
+          } else if (currentEventType === 'error') {
+            thinkEl.remove();
+            addErrorTurn(data.message || 'Unknown error');
+          }
+          currentEventType = null;
+        }
+      }
+    }
   } catch (err) {
     thinkEl.remove();
-    addErrorTurn(String(err));
+    addErrorTurn('Connection error: ' + err.message);
   }
   busy = false;
   sendBtn.disabled = !inputEl.value.trim();
