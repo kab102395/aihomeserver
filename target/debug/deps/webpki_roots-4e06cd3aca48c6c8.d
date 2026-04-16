@@ -1,7 +1,0 @@
-C:\Users\kab10\aihomeserver\.claude\worktrees\gifted-leakey\target\debug\deps\webpki_roots-4e06cd3aca48c6c8.d: C:\Users\kab10\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\webpki-roots-0.25.4\src\lib.rs
-
-C:\Users\kab10\aihomeserver\.claude\worktrees\gifted-leakey\target\debug\deps\libwebpki_roots-4e06cd3aca48c6c8.rlib: C:\Users\kab10\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\webpki-roots-0.25.4\src\lib.rs
-
-C:\Users\kab10\aihomeserver\.claude\worktrees\gifted-leakey\target\debug\deps\libwebpki_roots-4e06cd3aca48c6c8.rmeta: C:\Users\kab10\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\webpki-roots-0.25.4\src\lib.rs
-
-C:\Users\kab10\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\webpki-roots-0.25.4\src\lib.rs:

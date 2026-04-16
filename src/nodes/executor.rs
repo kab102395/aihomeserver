@@ -55,15 +55,43 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
     let has_tool = step.tool_binding.is_some();
     let system_prompt = if has_tool { SYSTEM_PROMPT_TOOL } else { SYSTEM_PROMPT_LLM };
 
-    let messages = vec![
-        Message::system(system_prompt),
-        Message::user(format!(
-            "Step ID: {}\nAction: {}\nInput params: {}\nAvailable artifacts: {}",
+    // Build a conversation history block so the model has full context
+    let history_block = if !state.conversation_history.is_empty() {
+        let lines: Vec<String> = state
+            .conversation_history
+            .iter()
+            .map(|t| format!("{}: {}", t.role.to_uppercase(), t.content))
+            .collect();
+        format!("Prior conversation:\n{}\n\n", lines.join("\n"))
+    } else {
+        String::new()
+    };
+
+    let user_prompt = if has_tool {
+        format!(
+            "{}User request: {}\n\nStep ID: {}\nAction: {}\nInput params: {}\nAvailable artifacts: {}",
+            history_block,
+            state.user_request,
             step.step_id,
             step.action,
             step.input_params,
             artifact_context,
-        )),
+        )
+    } else {
+        // For LLM-only steps, lead with history + question so the model sees everything
+        format!(
+            "{}User request: {}\n\nStep ID: {}\nAction: {}\nAvailable artifacts: {}",
+            history_block,
+            state.user_request,
+            step.step_id,
+            step.action,
+            artifact_context,
+        )
+    };
+
+    let messages = vec![
+        Message::system(system_prompt),
+        Message::user(user_prompt),
     ];
 
     match llm.chat(messages, ModelRole::Fast, has_tool).await {

@@ -110,6 +110,15 @@ pub enum FailureTaxonomy {
     PermissionError,
 }
 
+// ==================== CONVERSATION ====================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurn {
+    pub role: String,    // "user" or "assistant"
+    pub content: String,
+    pub timestamp: chrono::DateTime<Utc>,
+}
+
 // ==================== EVENT LOG ====================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,7 +135,10 @@ pub struct LogEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemState {
     pub task_id: Uuid,
+    pub session_id: Option<Uuid>,
     pub user_request: String,
+    /// Last N turns from this session — injected into planner + executor prompts.
+    pub conversation_history: Vec<ConversationTurn>,
     pub current_plan: Option<PlannerOutput>,
     pub artifacts: HashMap<String, serde_json::Value>,
     pub checkpoints: Vec<serde_json::Value>,
@@ -145,7 +157,9 @@ impl SystemState {
     pub fn new(user_request: impl Into<String>) -> Self {
         Self {
             task_id: Uuid::new_v4(),
+            session_id: None,
             user_request: user_request.into(),
+            conversation_history: Vec::new(),
             current_plan: None,
             artifacts: HashMap::new(),
             checkpoints: Vec::new(),

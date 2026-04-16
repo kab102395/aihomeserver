@@ -43,7 +43,16 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  transition: width 0.2s ease, min-width 0.2s ease;
+  flex-shrink: 0;
 }
+#sidebar.collapsed {
+  width: 0;
+  min-width: 0;
+  border-right: none;
+}
+#sidebar.collapsed > * { display: none; }
+
 #sidebar-header {
   padding: 16px 14px 10px;
   display: flex;
@@ -55,6 +64,30 @@ body {
   font-weight: 600;
   color: var(--text);
   flex: 1;
+}
+
+/* Toggle button lives in the top bar */
+#sidebar-toggle {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: color 0.15s, background 0.15s;
+}
+#sidebar-toggle:hover { background: var(--surface2); color: var(--text); }
+#sidebar-toggle svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; }
+
+/* Responsive: start collapsed below 700px */
+@media (max-width: 700px) {
+  #sidebar { position: absolute; left: 0; top: 0; height: 100%; z-index: 100; }
+  #sidebar.collapsed { width: 0; min-width: 0; }
+  #sidebar:not(.collapsed) { box-shadow: 4px 0 20px rgba(0,0,0,0.5); }
 }
 #new-chat {
   background: none;
@@ -81,20 +114,19 @@ body {
   padding: 4px 8px;
 }
 .history-item {
-  padding: 7px 8px;
+  padding: 6px 8px;
   border-radius: 6px;
   font-size: 13px;
   color: var(--text-muted);
   cursor: pointer;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   transition: all 0.1s;
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
 }
 .history-item:hover { background: var(--surface2); color: var(--text); }
+.history-item.active { background: var(--surface2); color: var(--text); }
 .history-item .dot {
   width: 6px; height: 6px;
   border-radius: 50%;
@@ -102,7 +134,55 @@ body {
   background: var(--text-dim);
 }
 .history-item .dot.ok { background: #4a9a5a; }
-.history-item .dot.fail { background: #9a4a4a; }
+.history-item .dot.archived { background: #5a5a8a; }
+.history-item .item-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+/* Action buttons — shown on hover */
+.item-actions {
+  display: none;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.history-item:hover .item-actions { display: flex; }
+.item-btn {
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  transition: all 0.1s;
+}
+.item-btn:hover { background: var(--surface); color: var(--text); }
+.item-btn.danger:hover { color: #c05050; }
+.item-btn svg { width: 13px; height: 13px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+
+/* Archived section */
+.sidebar-divider {
+  padding: 8px 14px 4px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+.sidebar-divider:hover { color: var(--text-muted); }
+.sidebar-divider .chevron { transition: transform 0.2s; }
+.sidebar-divider.open .chevron { transform: rotate(90deg); }
+#archived-list { padding: 0 8px 4px; }
+
 #sidebar-footer {
   padding: 12px 14px;
   border-top: 1px solid var(--border);
@@ -462,6 +542,11 @@ body {
   </div>
   <div id="sidebar-section">Recent</div>
   <div id="history-list"></div>
+  <div class="sidebar-divider" id="archived-toggle" onclick="toggleArchived()">
+    <svg class="chevron" viewBox="0 0 10 10" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 2l4 3-4 3"/></svg>
+    Archived
+  </div>
+  <div id="archived-list" style="display:none"></div>
   <div id="sidebar-footer">
     <div style="color:var(--text-muted);font-size:12px">Models</div>
     <div class="model-tag">qwen2.5:14b · fast</div>
@@ -472,6 +557,9 @@ body {
 <!-- Main -->
 <div id="main">
   <div id="top-bar">
+    <button id="sidebar-toggle" onclick="toggleSidebar()" title="Toggle sidebar">
+      <svg viewBox="0 0 18 18"><line x1="2" y1="4" x2="16" y2="4"/><line x1="2" y1="9" x2="16" y2="9"/><line x1="2" y1="14" x2="16" y2="14"/></svg>
+    </button>
     <span class="title" id="top-title">New conversation</span>
     <span class="status-pill" id="status-pill">● online</span>
   </div>
@@ -505,6 +593,11 @@ const msgsEl = document.getElementById('messages');
 const inputEl = document.getElementById('input');
 const sendBtn = document.getElementById('send-btn');
 let busy = false;
+let currentSessionId = null;  // tracks the active session across turns
+
+function toggleSidebar() {
+  document.getElementById('sidebar').classList.toggle('collapsed');
+}
 
 // ── Input handling ────────────────────────────────────────────
 inputEl.addEventListener('input', () => {
@@ -521,12 +614,14 @@ function useSuggestion(el) {
   inputEl.focus();
 }
 function newChat() {
+  currentSessionId = null;
   msgsEl.innerHTML = '';
   const w = document.createElement('div');
   w.className = 'welcome'; w.id = 'welcome';
-  w.innerHTML = `<h2>What can I help you with?</h2><p>Ask anything, generate code, write to files, run shell commands,<br>or query your git history. All local, all yours.</p><div class="suggestion-row"><div class="suggestion" onclick="useSuggestion(this)">Explain a concept</div><div class="suggestion" onclick="useSuggestion(this)">Write a Python script</div><div class="suggestion" onclick="useSuggestion(this)">List files in workspace</div><div class="suggestion" onclick="useSuggestion(this)">Show git log</div></div>`;
+  w.innerHTML = `<h2>What can I help you with?</h2><p>Ask anything, generate code, write to files, run shell commands,<br>or query your git history. All local, all yours.</p><div class="suggestion-row"><div class="suggestion" onclick="useSuggestion(this)">Explain a concept</div><div class="suggestion" onclick="useSuggestion(this)">Write a Rust function</div><div class="suggestion" onclick="useSuggestion(this)">List files in workspace</div><div class="suggestion" onclick="useSuggestion(this)">Show git log</div></div>`;
   msgsEl.appendChild(w);
   document.getElementById('top-title').textContent = 'New conversation';
+  document.querySelectorAll('.history-item').forEach(el => el.classList.remove('active'));
   inputEl.focus();
 }
 
@@ -547,16 +642,22 @@ async function send() {
   const thinkEl = addThinkingTurn();
 
   try {
+    const body = { request: text };
+    if (currentSessionId) body.session_id = currentSessionId;
+
     const res = await fetch('/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ request: text }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error(`Server error ${res.status}`);
     const data = await res.json();
-    thinkEl.remove();
-    addAiTurn(data);
-    refreshHistory();
+
+    currentSessionId = data.session_id;
+
+    // Poll for completion — request runs in the background
+    await pollTask(data.task_id, thinkEl);
+    refreshSessions();
   } catch (err) {
     thinkEl.remove();
     addErrorTurn(String(err));
@@ -564,6 +665,32 @@ async function send() {
   busy = false;
   sendBtn.disabled = !inputEl.value.trim();
   inputEl.focus();
+}
+
+async function pollTask(taskId, thinkEl) {
+  while (true) {
+    await new Promise(r => setTimeout(r, 1000));
+    let status;
+    try {
+      const res = await fetch(`/task/${taskId}/status`);
+      status = await res.json();
+    } catch (_) {
+      thinkEl.remove();
+      addErrorTurn('Lost connection while waiting for response.');
+      return;
+    }
+    if (status.status === 'done') {
+      thinkEl.remove();
+      addAiTurn(status.response);
+      return;
+    }
+    if (status.status === 'failed') {
+      thinkEl.remove();
+      addErrorTurn(status.error || 'Task failed.');
+      return;
+    }
+    // still running — keep polling
+  }
 }
 
 // ── Turn builders ─────────────────────────────────────────────
@@ -788,20 +915,117 @@ function scrollBottom() {
   msgsEl.scrollTop = msgsEl.scrollHeight;
 }
 
-// ── History sidebar ───────────────────────────────────────────
-async function refreshHistory() {
+// ── Session sidebar ───────────────────────────────────────────
+const ICON_ARCHIVE = `<svg viewBox="0 0 16 16"><rect x="1" y="3" width="14" height="3" rx="1"/><path d="M2 6v7a1 1 0 001 1h10a1 1 0 001-1V6"/><path d="M6 10h4"/></svg>`;
+const ICON_RESTORE = `<svg viewBox="0 0 16 16"><polyline points="1 4 1 1 4 1"/><path d="M1 1l4 4"/><path d="M15 8A7 7 0 113 4.3"/></svg>`;
+const ICON_TRASH   = `<svg viewBox="0 0 16 16"><polyline points="2 4 14 4"/><path d="M5 4V2h6v2"/><path d="M3 4l1 10a1 1 0 001 1h6a1 1 0 001-1l1-10"/><line x1="6" y1="7" x2="6" y2="11"/><line x1="10" y1="7" x2="10" y2="11"/></svg>`;
+
+function makeSessionItem(s, archived) {
+  const item = document.createElement('div');
+  item.className = 'history-item' + (s.session_id === currentSessionId ? ' active' : '');
+  item.dataset.sid = s.session_id;
+  const preview = s.first_message
+    ? s.first_message.slice(0, 32) + (s.first_message.length > 32 ? '…' : '')
+    : 'Empty session';
+  item.title = s.first_message || '';
+
+  const archiveBtn = `<button class="item-btn" title="${archived ? 'Restore' : 'Archive'}" onclick="event.stopPropagation();${archived ? 'doUnarchive' : 'doArchive'}('${s.session_id}')">${archived ? ICON_RESTORE : ICON_ARCHIVE}</button>`;
+  const deleteBtn  = `<button class="item-btn danger" title="Delete permanently" onclick="event.stopPropagation();doDelete('${s.session_id}')">${ICON_TRASH}</button>`;
+
+  item.innerHTML = `
+    <span class="dot ${archived ? 'archived' : 'ok'}"></span>
+    <span class="item-label">${esc(preview)}</span>
+    <span class="item-actions">${archiveBtn}${deleteBtn}</span>`;
+  item.onclick = () => loadSession(s.session_id, s.first_message);
+  return item;
+}
+
+async function refreshSessions() {
   try {
-    const res = await fetch('/history');
-    const records = await res.json();
+    const res = await fetch('/sessions');
+    const sessions = await res.json();
     const list = document.getElementById('history-list');
     list.innerHTML = '';
-    for (const r of records.slice(0, 30)) {
-      const item = document.createElement('div');
-      item.className = 'history-item';
-      const preview = r.user_request.slice(0, 38) + (r.user_request.length > 38 ? '…' : '');
-      item.innerHTML = `<span class="dot ${r.success ? 'ok' : 'fail'}"></span>${esc(preview)}`;
-      list.appendChild(item);
+    for (const s of sessions.slice(0, 40)) {
+      list.appendChild(makeSessionItem(s, false));
     }
+  } catch (_) {}
+  // also refresh archived if panel is open
+  if (document.getElementById('archived-toggle').classList.contains('open')) {
+    refreshArchived();
+  }
+}
+
+async function refreshArchived() {
+  try {
+    const res = await fetch('/sessions/archived');
+    const sessions = await res.json();
+    const list = document.getElementById('archived-list');
+    list.innerHTML = '';
+    for (const s of sessions.slice(0, 40)) {
+      list.appendChild(makeSessionItem(s, true));
+    }
+    if (sessions.length === 0) {
+      list.innerHTML = '<div style="padding:6px 8px;font-size:12px;color:var(--text-dim)">Nothing archived</div>';
+    }
+  } catch (_) {}
+}
+
+function toggleArchived() {
+  const toggle = document.getElementById('archived-toggle');
+  const list = document.getElementById('archived-list');
+  const open = toggle.classList.toggle('open');
+  list.style.display = open ? 'block' : 'none';
+  if (open) refreshArchived();
+}
+
+async function doArchive(sessionId) {
+  await fetch(`/session/${sessionId}/archive`, { method: 'POST' });
+  if (currentSessionId === sessionId) newChat();
+  refreshSessions();
+}
+
+async function doUnarchive(sessionId) {
+  await fetch(`/session/${sessionId}/unarchive`, { method: 'POST' });
+  refreshSessions();
+}
+
+async function doDelete(sessionId) {
+  if (!confirm('Permanently delete this conversation? This cannot be undone.')) return;
+  await fetch(`/session/${sessionId}`, { method: 'DELETE' });
+  if (currentSessionId === sessionId) newChat();
+  refreshSessions();
+}
+
+async function loadSession(sessionId, firstMessage) {
+  if (busy) return;
+  try {
+    const res = await fetch(`/session/${sessionId}`);
+    if (!res.ok) return;
+    const turns = await res.json();
+
+    currentSessionId = sessionId;
+    msgsEl.innerHTML = '';
+
+    const label = (firstMessage || 'Session').slice(0, 50);
+    document.getElementById('top-title').textContent =
+      label + (label.length >= 50 ? '…' : '');
+
+    for (const turn of turns) {
+      if (turn.role === 'user') {
+        addUserTurn(turn.content);
+      } else {
+        const div = document.createElement('div');
+        div.className = 'turn ai';
+        div.innerHTML = `<div class="ai-label">aihomeserver</div><div class="ai-content">${renderMarkdown(turn.content)}</div>`;
+        msgsEl.appendChild(div);
+      }
+    }
+
+    scrollBottom();
+    document.querySelectorAll('.history-item').forEach(el => {
+      el.classList.toggle('active', el.dataset.sid === sessionId);
+    });
   } catch (_) {}
 }
 
@@ -813,7 +1037,11 @@ fetch('/health').then(r => r.json()).then(d => {
   p.textContent = '● offline';
   p.style.cssText = 'background:#2a1a1a;color:#9a5a5a;border-color:#4a2a2a';
 });
-refreshHistory();
+// Collapse sidebar by default on narrow screens
+if (window.innerWidth <= 700) {
+  document.getElementById('sidebar').classList.add('collapsed');
+}
+refreshSessions();
 inputEl.focus();
 </script>
 </body>
