@@ -122,14 +122,22 @@ impl Orchestrator {
     }
 
     fn route_from_critic(&self, state: &SystemState) -> OrchestratorNode {
-        // Passed — done
-        if state.termination_met {
-            return OrchestratorNode::Finalization;
+        let passed = state
+            .critic_history
+            .last()
+            .map(|r| r.overall_pass)
+            .unwrap_or(false);
+
+        if passed {
+            // If executor already flagged all steps done, finalize.
+            // Otherwise loop back to execute the next step.
+            if state.termination_met {
+                return OrchestratorNode::Finalization;
+            }
+            return OrchestratorNode::Executor;
         }
 
-        // High-risk tasks: human gate before destructive actions.
-        // TODO: wire this to the API's /approve endpoint.
-        // For now, log and continue to repair — the API layer will handle pausing.
+        // Critic failed — escalate or repair.
         if RiskLevel::from_score(state.risk_score()) == RiskLevel::High {
             warn!(
                 task_id = %state.task_id,

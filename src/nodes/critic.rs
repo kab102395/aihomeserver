@@ -57,7 +57,8 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
             recommendations: vec![],
             timestamp: Utc::now(),
         });
-        state.termination_met = true;
+        // NOTE: do NOT set termination_met here — the orchestrator checks
+        // whether all plan steps are done after routing back to Executor.
         return Ok(state);
     }
 
@@ -127,9 +128,8 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
         }),
     );
 
-    if review.overall_pass {
-        state.termination_met = true;
-    }
+    // NOTE: do NOT set termination_met here — the orchestrator routes back to
+    // Executor which will set it once all plan steps are exhausted.
 
     state.critic_history.push(review);
     Ok(state)
