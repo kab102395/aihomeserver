@@ -16,7 +16,7 @@ axum = { version = "0.7", features = ["json"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # HTTP client (Ollama + http_fetch tool)
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "gzip", "brotli", "deflate"] }
 
 # Streaming support
 tokio-stream = { version = "0.1", features = ["sync"] }
