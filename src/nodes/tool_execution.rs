@@ -41,6 +41,16 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
         serde_json::json!({ "step_id": step.step_id }),
     );
 
+    // If tool doesn't exist in registry, treat as a planner error — skip without failure
+    if !tools.has(&tool_name) {
+        state.log_meta(
+            "tool_skip",
+            &format!("Unknown tool '{tool_name}' — treating as LLM-only step"),
+            serde_json::json!({ "step_id": step.step_id }),
+        );
+        return Ok(state);
+    }
+
     let result = tools.execute(&tool_name, tool_params).await;
     let tool_output_key = format!("{output_key}_result");
 

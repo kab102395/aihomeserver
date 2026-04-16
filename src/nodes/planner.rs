@@ -4,41 +4,44 @@ use crate::{
     state::{PlannerOutput, SystemState},
 };
 
-const SYSTEM_PROMPT: &str = r#"You are a task planner. Decompose the user request into structured steps.
+const SYSTEM_PROMPT: &str = r#"You are a task planner. Your job is to decide whether a request needs tool use or can be answered directly by an LLM.
 
-Output ONLY valid JSON — no prose, no markdown fences, no explanations:
+Output ONLY valid JSON:
 {
-  "steps": [
-    {
-      "step_id": "1",
-      "action": "concise description",
-      "tool_binding": "filesystem",
-      "input_params": {"action": "write", "path": "hello.txt", "content": "Hello!"},
-      "output_key": "write_result",
-      "expected_output": null
-    }
-  ],
-  "tools_required": ["filesystem"],
-  "risk_score": 3,
-  "expected_outputs": ["write_result"],
-  "completion_criteria": ["hello.txt written successfully"],
+  "steps": [...],
+  "tools_required": [],
+  "risk_score": 0,
+  "expected_outputs": ["answer"],
+  "completion_criteria": ["question answered"],
   "dependencies": {}
 }
 
-STRICT RULES:
-- tool_binding must be EXACTLY ONE of: "filesystem", "shell", "git", or null
-- Never combine tools with | or ,
-- null means an LLM-only step with no tool call
-- input_params must include ALL required params for the tool:
-    filesystem write:  {"action":"write","path":"filename.txt","content":"..."}
-    filesystem read:   {"action":"read","path":"filename.txt"}
-    filesystem list:   {"action":"list","path":"."}
-    shell:             {"command":"the command","timeout_secs":30}
-    git status:        {"action":"status"}
-    git log:           {"action":"log","n":10}
-    git commit:        {"action":"commit","message":"msg"}
-- risk_score: 0-3 low (no critic), 4-7 standard (fast critic), 8-10 high (deep critic + human gate)
-- Pure JSON only. No explanations."#;
+DECISION RULES — choose the right tool_binding:
+
+USE null (LLM-only, no tool) for:
+  - Questions, explanations, analysis, summaries, comparisons
+  - Writing essays, emails, stories, plans
+  - Code generation (output is just text)
+  - Anything that is purely informational
+  Example: {"step_id":"1","action":"Answer the question thoroughly","tool_binding":null,"input_params":{},"output_key":"answer","expected_output":null}
+
+USE "filesystem" only when explicitly asked to READ or WRITE a file on disk.
+  write: {"action":"write","path":"file.txt","content":"..."}
+  read:  {"action":"read","path":"file.txt"}
+  list:  {"action":"list","path":"."}
+
+USE "shell" only when explicitly asked to run a command or script.
+  {"command":"the command","timeout_secs":30}
+
+USE "git" only when explicitly asked about git history, status, or commits.
+  {"action":"status"} / {"action":"log","n":10} / {"action":"commit","message":"msg"}
+
+NEVER invent tools. NEVER use "clarity", "summarization", "search", or any other tool name.
+NEVER ask for clarification — always plan to answer to the best of your ability.
+
+risk_score: 0-3 low (Q&A, reads), 4-7 standard (file writes, shell), 8-10 high (destructive ops, git push)
+
+Pure JSON only. No explanations."#;
 
 pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemState> {
     state.log("planner", "Generating plan");
