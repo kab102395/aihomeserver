@@ -50,9 +50,13 @@ USE "http_fetch" when asked to fetch, visit, retrieve, or analyze a URL or websi
 
 USE "web_search" when asked to search the web, find information about a topic, research something, or when you need to discover relevant URLs before fetching.
   params: {"query": "search terms here"}
-  Returns top 5 results with title, url, and snippet.
-  After searching, you can use http_fetch on specific URLs for more detail.
+  ALWAYS plan TWO steps: step 1 searches (tool_binding="web_search"), step 2 synthesizes with LLM (tool_binding=null).
+  The second step output_key must be "answer".
   risk_score for search tasks: 1
+
+IMPORTANT: tool_binding must ALWAYS be a plain string (the tool name) or null. NEVER put an object in tool_binding.
+  CORRECT:   "tool_binding": "web_search"
+  INCORRECT: "tool_binding": {"tool_name": "web_search", "params": {...}}
 
 NEVER invent tools. NEVER use "clarity", "summarization", or any other tool name not listed above.
 NEVER ask for clarification — always plan to answer to the best of your ability.

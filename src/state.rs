@@ -63,10 +63,34 @@ impl ToolResult {
 pub struct StepDefinition {
     pub step_id: String,
     pub action: String,
+    /// LLMs sometimes emit the tool as a plain string ("web_search") and sometimes
+    /// as an object ({"tool_name":"web_search","params":{...}}). We normalise to
+    /// Option<String> via a custom deserializer so both forms work.
+    #[serde(default, deserialize_with = "deserialize_tool_binding")]
     pub tool_binding: Option<String>,
     pub input_params: serde_json::Value,
     pub output_key: Option<String>,
     pub expected_output: Option<serde_json::Value>,
+}
+
+fn deserialize_tool_binding<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: serde_json::Value = serde::Deserialize::deserialize(de)?;
+    match v {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => Ok(if s.is_empty() { None } else { Some(s) }),
+        serde_json::Value::Object(map) => {
+            // {"tool_name":"web_search",...} or {"tool":"web_search",...}
+            let name = map.get("tool_name")
+                .or_else(|| map.get("tool"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            Ok(name)
+        }
+        _ => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
