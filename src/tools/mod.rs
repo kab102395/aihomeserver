@@ -1,0 +1,55 @@
+pub mod filesystem;
+pub mod git;
+pub mod shell;
+
+use async_trait::async_trait;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::state::{ErrorType, ToolResult};
+
+/// Every tool must implement this contract.
+/// The mandatory output schema (success/error_type/error_code/trace/output/checkpoint)
+/// is enforced by returning ToolResult from every execution path.
+#[async_trait]
+pub trait Tool: Send + Sync {
+    fn name(&self) -> &str;
+    async fn execute(&self, params: Value) -> ToolResult;
+}
+
+pub struct ToolRegistry {
+    tools: HashMap<String, Arc<dyn Tool>>,
+}
+
+impl ToolRegistry {
+    pub fn new() -> Self {
+        Self { tools: HashMap::new() }
+    }
+
+    pub fn register<T: Tool + 'static>(&mut self, tool: T) {
+        let name = tool.name().to_string();
+        self.tools.insert(name, Arc::new(tool));
+    }
+
+    pub async fn execute(&self, name: &str, params: Value) -> ToolResult {
+        match self.tools.get(name) {
+            Some(tool) => tool.execute(params).await,
+            None => ToolResult::err(
+                ErrorType::Tool,
+                "tool_not_found",
+                &format!("No tool registered: {name}"),
+            ),
+        }
+    }
+
+    pub fn list(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.tools.keys().map(|s| s.as_str()).collect();
+        names.sort();
+        names
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+}
