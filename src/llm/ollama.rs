@@ -113,4 +113,31 @@ impl OllamaClient {
         serde_json::from_str(&raw)
             .map_err(|e| anyhow!("JSON parse error: {e}\nRaw response:\n{raw}"))
     }
+
+    /// Generate a text embedding using nomic-embed-text.
+    /// Returns a 768-dimensional vector. Fails gracefully — callers should
+    /// log and continue rather than hard-failing if embeddings are unavailable.
+    pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        #[derive(Serialize)]
+        struct EmbedRequest<'a> {
+            model: &'static str,
+            prompt: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct EmbedResponse {
+            embedding: Vec<f32>,
+        }
+
+        let resp = self
+            .client
+            .post(format!("{}/api/embeddings", self.base_url))
+            .json(&EmbedRequest { model: "nomic-embed-text", prompt: text })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<EmbedResponse>()
+            .await?;
+
+        Ok(resp.embedding)
+    }
 }

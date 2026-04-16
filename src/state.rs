@@ -130,6 +130,16 @@ pub struct LogEvent {
     pub metadata: serde_json::Value,
 }
 
+// ==================== SEMANTIC CONTEXT ====================
+
+/// A retrieved past task injected as a few-shot example into the planner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticExample {
+    pub user_request: String,
+    pub answer_summary: String,
+    pub similarity: f32,
+}
+
 // ==================== SYSTEM STATE ====================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +149,8 @@ pub struct SystemState {
     pub user_request: String,
     /// Last N turns from this session — injected into planner + executor prompts.
     pub conversation_history: Vec<ConversationTurn>,
+    /// Top-k similar past tasks retrieved from semantic memory.
+    pub semantic_context: Vec<SemanticExample>,
     pub current_plan: Option<PlannerOutput>,
     pub artifacts: HashMap<String, serde_json::Value>,
     pub checkpoints: Vec<serde_json::Value>,
@@ -160,6 +172,7 @@ impl SystemState {
             session_id: None,
             user_request: user_request.into(),
             conversation_history: Vec::new(),
+            semantic_context: Vec::new(),
             current_plan: None,
             artifacts: HashMap::new(),
             checkpoints: Vec::new(),

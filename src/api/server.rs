@@ -15,6 +15,7 @@ use crate::{
     memory::{
         conversation::ConversationStore,
         episodic::{EpisodicMemory, TaskRecord},
+        semantic::SemanticMemory,
     },
     orchestrator::Orchestrator,
     state::SystemState,
@@ -39,6 +40,7 @@ pub struct AppState {
     pub orchestrator: Arc<Orchestrator>,
     pub memory: Arc<Mutex<EpisodicMemory>>,
     pub conversations: Arc<ConversationStore>,
+    pub semantic: Arc<SemanticMemory>,
     pub task_store: TaskStore,
 }
 
@@ -115,10 +117,20 @@ async fn run_task(
         .await
         .unwrap_or_default();
 
+    // Retrieve semantically similar past tasks as few-shot context
+    let semantic_examples = match app.orchestrator.llm.embed(&req.request).await {
+        Ok(query_vec) => app.semantic.query(&query_vec, 3, 0.65).await,
+        Err(e) => {
+            tracing::warn!("Semantic embed failed (nomic-embed-text available?): {e}");
+            vec![]
+        }
+    };
+
     // Build initial state
     let mut initial = SystemState::new(req.request.clone());
     initial.session_id = Some(session_id);
     initial.conversation_history = history;
+    initial.semantic_context = semantic_examples;
     if let Some(max) = req.max_steps {
         initial.max_steps = max;
     }
@@ -175,6 +187,23 @@ async fn run_task(
 
                 if let Ok(mem) = app2.memory.try_lock() {
                     let _ = mem.save(&record).await;
+                }
+
+                // Embed and store in semantic memory (only successful tasks)
+                if final_state.termination_met {
+                    let summary = answer.chars().take(500).collect::<String>();
+                    match app2.orchestrator.llm.embed(&request_text).await {
+                        Ok(embedding) => {
+                            let _ = app2.semantic.store(
+                                &final_state.task_id,
+                                final_state.session_id.as_ref(),
+                                &request_text,
+                                &summary,
+                                embedding,
+                            ).await;
+                        }
+                        Err(e) => tracing::warn!("Semantic store failed: {e}"),
+                    }
                 }
 
                 let response = RunResponse {
@@ -305,10 +334,13 @@ async fn delete_session(
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid session id").into_response(),
     };
 
-    // Delete linked task records first
+    // Delete linked task records
     if let Ok(mem) = app.memory.try_lock() {
         let _ = mem.delete_by_session(&session_id).await;
     }
+
+    // Delete semantic embeddings
+    let _ = app.semantic.delete_by_session(&session_id).await;
 
     // Delete session + all turns
     match app.conversations.delete_session(&session_id).await {

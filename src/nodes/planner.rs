@@ -92,6 +92,19 @@ fn build_context(state: &SystemState) -> String {
 
     ctx.push_str(&format!("Current user request: {}\n", state.user_request));
 
+    // Inject similar past tasks as few-shot examples
+    if !state.semantic_context.is_empty() {
+        ctx.push_str("\nSimilar past tasks you handled successfully (use as reference):\n");
+        for ex in &state.semantic_context {
+            ctx.push_str(&format!(
+                "---\nRequest: {}\nHow it was handled: {}\n",
+                ex.user_request,
+                ex.answer_summary.chars().take(400).collect::<String>(),
+            ));
+        }
+        ctx.push_str("---\n");
+    }
+
     if !state.failure_taxonomy.is_empty() {
         ctx.push_str(&format!(
             "\nPrevious failures (use to avoid repeating mistakes): {:?}\nRepair cycles exhausted: {}\n",
