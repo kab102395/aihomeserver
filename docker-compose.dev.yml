@@ -1,0 +1,29 @@
+services:
+  # Dev/test runner: binds the repo into the container and runs `cargo run`.
+  # This gives the AI a consistent Linux environment with cargo/rg/git available
+  # and full visibility into your project tree at /workspace.
+  aihomeserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: aihomeserver-dev
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ai_data:/data
+      - ./:/workspace:rw
+    environment:
+      DATA_DIR: /data
+      PORT: "3000"
+      WORKSPACE: "/workspace"
+      OLLAMA_URL: "http://host.docker.internal:11434"
+      SEARCH_URL: "http://searxng:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - searxng
+
+volumes:
+  ai_data:
+

@@ -1,0 +1,76 @@
+# SearXNG settings for aihomeserver Docker deployment
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "aihomeserver search"
+
+server:
+  base_url: "http://searxng:8080"
+  secret_key: "change_me_to_a_long_random_secret_string_1234567890"
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  ban_time_on_fail: 5
+  max_ban_time_on_fail: 120
+
+outgoing:
+  request_timeout: 10.0
+  max_request_timeout: 20.0
+  useragent_suffix: ""
+  pool_connections: 10
+  pool_maxsize: 20
+
+formats:
+  - html
+  - json
+
+ui:
+  static_use_hash: false
+  default_theme: simple
+  query_in_title: false
+
+# Only engines that reliably work from a server/Docker IP.
+# Google and Bing block datacenter IPs aggressively — excluded.
+engines:
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+
+  - name: brave
+    engine: brave
+    shortcut: brave
+    disabled: false
+
+  - name: qwant
+    engine: qwant
+    shortcut: qw
+    disabled: false
+
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    disabled: false
+
+  - name: startpage
+    engine: startpage
+    shortcut: sp
+    disabled: false
+
+  # Mojeek — independent index, doesn't block server/Docker IPs
+  - name: mojeek
+    engine: mojeek
+    shortcut: mj
+    disabled: false
+
+  # Marginalia — indie text-focused search, very accessible from server IPs
+  - name: marginalia
+    engine: marginalia
+    shortcut: mg
+    disabled: false

@@ -1,0 +1,50 @@
+services:
+  # ── aihomeserver ─────────────────────────────────────────────────────────────
+  aihomeserver:
+    build: .
+    container_name: aihomeserver
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ai_data:/data
+      - ai_workspace:/data/workspace
+    environment:
+      DATA_DIR: /data
+      PORT: "3000"
+      # Workspace root for filesystem/shell tools (matches mounted volume below)
+      WORKSPACE: "/data/workspace"
+      # Point at your Ollama instance.
+      # If Ollama runs on the Docker host machine use host.docker.internal:
+      OLLAMA_URL: "http://host.docker.internal:11434"
+      # Route web searches through the SearXNG container (no port exposed)
+      SEARCH_URL: "http://searxng:8080"
+    extra_hosts:
+      # Lets containers reach the host machine by name (works on Linux too)
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - searxng
+
+  # ── SearXNG (self-hosted search) ─────────────────────────────────────────────
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    # Not exposed on host — only reachable by aihomeserver inside the Docker network
+    expose:
+      - "8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      SEARXNG_BASE_URL: "http://searxng:8080"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+
+volumes:
+  ai_data:
+  ai_workspace:
