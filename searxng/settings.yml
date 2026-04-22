@@ -18,6 +18,9 @@ search:
   default_lang: "en"
   ban_time_on_fail: 5
   max_ban_time_on_fail: 120
+  formats:
+    - html
+    - json
 
 outgoing:
   request_timeout: 10.0
@@ -25,10 +28,6 @@ outgoing:
   useragent_suffix: ""
   pool_connections: 10
   pool_maxsize: 20
-
-formats:
-  - html
-  - json
 
 ui:
   static_use_hash: false
