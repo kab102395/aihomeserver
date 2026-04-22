@@ -1,0 +1,30 @@
+# Rust
+/target/
+
+# Runtime data (local-only)
+/workspace/
+/data/
+config.json
+
+# Local databases / caches
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Local agent / IDE tooling
+/.claude/
+/.claire/
+/.sixth/
+/.vscode/
+/.git-rewrite/
+.env
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Personal scratch
+/plans between grok and chat gpt
