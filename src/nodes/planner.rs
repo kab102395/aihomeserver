@@ -4,6 +4,17 @@ use crate::{
     state::{PlannerOutput, SystemState},
 };
 
+fn in_container() -> bool {
+    if std::path::Path::new("/.dockerenv").exists() {
+        return true;
+    }
+    if let Ok(cgroup) = std::fs::read_to_string("/proc/1/cgroup") {
+        let c = cgroup.to_lowercase();
+        return c.contains("docker") || c.contains("containerd") || c.contains("kubepods");
+    }
+    false
+}
+
 const SYSTEM_PROMPT: &str = r#"You are the planning brain of aihomeserver — a local AI assistant running on Kyle's home server.
 You have full access to the local machine: filesystem, shell, git, and the web.
 You remember past conversations and learn from previous tasks via semantic memory.
@@ -21,38 +32,168 @@ Output ONLY valid JSON:
   "dependencies": {}
 }
 
+Each entry in "steps" must be an object:
+{
+  "step_id": "1",
+  "action": "what to do",
+  "tool_binding": "tool_name" | null,
+  "input_params": {},
+  "output_key": "artifact_key",
+  "expected_output": null,
+  "output_format": null | "json",
+  "requires_facts": false
+}
+
+🚨 RULE #1 — SEARCH BEFORE CODE OR GUIDES (ABSOLUTE, NO EXCEPTIONS):
+  If the request asks you to write code, a guide, a script, or an analysis about ANY of:
+    • a game, hero, champion, character, ability, item, mechanic
+    • a specific patch/version number (7.41b, 1.5, v2.3, etc.)
+    • how to play something / strategy / tier list / meta
+    • current prices, rankings, statistics, news, events
+  Then you MUST plan a parallel_search step FIRST. No exceptions. Not even if you think
+  you know the answer. Not even if the knowledge base has an entry. Your training data
+  is stale — hero stats, ability values, item costs, and meta ALL change with every patch.
+  Writing code or giving advice from training data = guaranteed wrong numbers and hallucination.
+
+  CORRECT plan for "write Lua bot scripts for Dota 2 heroes patch 7.41b":
+    Step 1: parallel_search — research all heroes and patch notes
+    Step 2: http_fetch — fetch most reliable URL
+    Step 3: http_fetch — fetch second URL
+    Step 4: LLM — write the code using ONLY the fetched data
+    Step 5: save_knowledge — store what was learned
+
+
+  GROUNDING CONTRACT (MANDATORY FOR PATCH/GAME RESEARCH):
+  - After search/fetch, you MUST create a dedicated fact-table step:
+      tool_binding: null
+      output_key: "facts"
+      output_format: "json"
+    The output must be valid JSON and include source URLs + short evidence snippets.
+    If a fact is missing from artifacts, set it to null/unknown — NEVER guess.
+  - Any later step that generates patch-specific guidance or code MUST set:
+      requires_facts: true
+    The executor will refuse to proceed if the "facts" artifact is missing.
+  - If the user asked for runnable code/scripts, prefer writing files via the filesystem tool
+    (the executor will fill the tool params at execution time based on facts/artifacts).
+
+  WRONG plan (never do this):
+    Step 1: LLM — "write scripts using stored knowledge"   ← THIS IS ALWAYS WRONG FOR GAME DATA
+
+🚨 RULE #2 — EXPLICIT SEARCH REQUESTS:
+  If the user says "please search", "search for", "look it up", "find the latest" — they are
+  explicitly asking you to use a search tool. Always plan parallel_search in this case.
+  Never respond with a 1-2 step plan that skips searching when the user asked to search.
+
 DECISION RULES — choose the right tool_binding:
 
 USE null (LLM-only, no tool) for:
-  - Questions, explanations, analysis, summaries, comparisons
-  - Writing essays, emails, stories, plans
-  - Code generation (output is just text)
-  - Anything that is purely informational
+  - Timeless questions: math, logic, language, historical facts, stable concepts
+  - Writing essays, emails, stories, creative content
+  - Code generation for standard algorithms (not library versions or configs)
+  - Explaining how something works at a conceptual level
+  - ONLY when the answer cannot possibly have changed since 2023
   Example: {"step_id":"1","action":"Answer the question thoroughly","tool_binding":null,"input_params":{},"output_key":"answer","expected_output":null}
 
-USE "filesystem" only when explicitly asked to READ or WRITE a file on disk.
+USE "filesystem" when you need to inspect or modify files in the workspace.
   write: {"action":"write","path":"file.txt","content":"..."}
   read:  {"action":"read","path":"file.txt"}
   list:  {"action":"list","path":"."}
+  find:  {"action":"find","path":".","pattern":"planner"}
+  grep:  {"action":"grep","path":"src","query":"risk_gate_threshold"}
+  NOTE: If the user asks you to "write scripts/code" and the output is longer than ~80 lines,
+  prefer writing files into the workspace (one file per script) via the filesystem tool,
+  then return an "answer" step that points to the created file paths.
 
 USE "shell" only when explicitly asked to run a command or script.
-  {"command":"the command","timeout_secs":30}
+  {"command":"the command","timeout_secs":30,"cwd":"optional"}
+  IMPORTANT: The shell tool runs PowerShell on Windows and sh -lc on Linux/macOS.
+  Use syntax appropriate to the runtime OS shown in the planning context ("Runtime OS: ...").
+  Prefer chaining with semicolons (portable): cmd1 ; cmd2
+  If you must truncate output:
+    - Linux/macOS: ... | head -n 20
+    - Windows:     ... | Select-Object -First 20
 
 USE "git" only when explicitly asked about git history, status, or commits.
   {"action":"status"} / {"action":"log","n":10} / {"action":"commit","message":"msg"}
 
+CODING / PROJECT WORKFLOW (strongly preferred for non-trivial code tasks):
+  - First: inspect the repo using filesystem (list/find/grep/read) before writing anything.
+  - Then: write/modify files with filesystem.write (one logical file per step).
+  - Finally: validate with shell (build/tests) IF the runtime has the toolchain installed.
+    If the toolchain isn't available (e.g. `cargo` missing in a slim runtime container),
+    plan a dev/test docker mode or skip validation and state what would be run.
+
 USE "http_fetch" when asked to fetch, visit, retrieve, or analyze a URL or website.
   params: {"url":"https://example.com"}
-  ALWAYS plan TWO steps: step 1 fetches (tool_binding="http_fetch"), step 2 analyzes with LLM (tool_binding=null).
+  Plan: step 1 fetches (tool_binding="http_fetch"), step 2 analyzes with LLM (tool_binding=null).
   The second step action should reference the fetch result: "Analyze the fetched page content and answer the user's question"
   The second step output_key must be "answer".
   risk_score for fetch-only tasks: 2
 
-USE "web_search" when asked to search the web, find information about a topic, research something, or when you need to discover relevant URLs before fetching.
+USE "web_search" for a single targeted query when one search is clearly sufficient.
   params: {"query": "search terms here"}
-  ALWAYS plan TWO steps: step 1 searches (tool_binding="web_search"), step 2 synthesizes with LLM (tool_binding=null).
-  The second step output_key must be "answer".
-  risk_score for search tasks: 1
+  For SIMPLE lookups (one clear fact): 2 steps — web_search then LLM answer.
+
+USE "parallel_search" for RESEARCH questions — it runs multiple queries simultaneously
+  so 5 searches take the same time as 1. This is the preferred tool for any research task.
+  params: {"queries": ["query1", "query2", "query3", ...]}   (up to 6 queries)
+
+  RESEARCH QUESTION DECOMPOSITION — break the question into its component parts:
+  For "how to play Kez in Dota 2 turbo patch 7.41b" decompose into:
+    - "[hero] Dota 2 hero abilities kit overview"          → core mechanics
+    - "[hero] Dota 2 best item builds [patch]"            → itemization
+    - "[hero] Dota 2 playstyle role laning"               → how to play
+    - "[hero] Dota 2 [patch] changes patch notes"         → what changed
+    - "[hero] Dota 2 turbo mode guide reddit"             → community tips
+    - "[hero] Dota 2 [patch] reddit guide tips"           → recent community knowledge
+  Decompose every distinct aspect of the question into its own query.
+  Always include at least one Reddit-targeted query ("reddit" in the search terms).
+
+  For RESEARCH tasks, plan these steps:
+    1. parallel_search — all decomposed queries in one shot   output_key: "search_result"
+    2. http_fetch — most relevant URL from search results     output_key: "fetch1_result"
+       RELIABLE sources (prefer in this order):
+         old.reddit.com threads  ← best, almost never blocks
+         liquipedia.net
+         dota2.fandom.com/wiki
+         steamcommunity.com/app/570/discussions
+       AVOID: dotabuff.com, stratz.com, anything behind login
+    3. http_fetch — second reliable URL, different type       output_key: "fetch2_result"
+       Mix source types: wiki + Reddit, or guide site + patch notes
+    4. LLM synthesis step — "Using all search results and fetched pages, write a comprehensive
+       detailed answer covering every aspect the user asked about"   output_key: "answer"
+
+  For http_fetch steps set url to "" — the system auto-picks the best URL from search artifacts.
+  Do NOT put a real URL in http_fetch params — the URL resolver handles it automatically.
+  risk_score for research tasks: 1
+
+USE "save_knowledge" after researching a topic to store it permanently for future chats.
+  Always use this as the final step after any research task so the knowledge persists.
+  params: {
+    "topic":   "clear topic name (e.g. 'Kez Dota 2 hero guide')",
+    "summary": "1-3 sentence overview for quick injection into future chats",
+    "content": "full detailed research content",
+    "tags":    ["tag1", "tag2", ...],
+    "sources": ["url1", "url2", ...]
+  }
+  output_key: "knowledge_saved"
+
+  WHEN TO RESEARCH + SAVE vs USE STORED KNOWLEDGE:
+  - If the KNOWLEDGE BASE has a relevant entry AND the request is NOT about patches/versions/meta
+    AND the entry is fresh (<14 days) → USE IT, answer directly (single LLM step).
+  - If the request mentions "latest", a patch number, or asks about current meta/guides →
+    ALWAYS re-research regardless of what's in the knowledge base. Game patches change weekly.
+  - If the entry is stale (>14 days) → re-research and save an updated version.
+  - If no relevant knowledge exists → research it and always save with save_knowledge at the end.
+  - NEVER answer game meta / patch / "how to play" questions from training data alone —
+    even a 2-month-old knowledge entry may be outdated for a live game.
+
+  RESEARCH + SAVE plan pattern (6 steps):
+    1. parallel_search — decomposed queries          output_key: "search_result"
+    2. http_fetch — reliable URL #1                  output_key: "fetch1_result"
+    3. http_fetch — reliable URL #2 (Reddit preferred) output_key: "fetch2_result"
+    4. LLM: "Synthesize into comprehensive answer"   output_key: "answer"
+    5. save_knowledge — persist the research         output_key: "knowledge_saved"
 
 IMPORTANT: tool_binding must ALWAYS be a plain string (the tool name) or null. NEVER put an object in tool_binding.
   CORRECT:   "tool_binding": "web_search"
@@ -77,8 +218,11 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
         Message::user(context),
     ];
 
-    match llm.complete_json::<PlannerOutput>(messages, ModelRole::Fast).await {
-        Ok(plan) => {
+    // think=true: planner reasons through whether to search vs answer directly
+    // before committing to a plan — prevents it from skipping research
+    match llm.complete_json::<PlannerOutput>(messages, ModelRole::Fast, true).await {
+        Ok(mut plan) => {
+            crate::grounding::enforce_grounding_contract(&state.user_request, &state.capabilities, &mut plan);
             state.log_meta(
                 "planner",
                 "Plan ready",
@@ -131,6 +275,37 @@ fn build_context(state: &SystemState) -> String {
     }
 
     ctx.push_str(&format!("Current user request: {}\n", state.user_request));
+    ctx.push_str(&format!("Runtime OS: {}\n", std::env::consts::OS));
+    ctx.push_str(&format!("In container: {}\n", in_container()));
+    ctx.push_str("Shell tool backend: PowerShell on Windows; sh -lc on Linux/macOS.\n");
+    if !state.capabilities.is_null() {
+        ctx.push_str(&format!(
+            "Runtime capabilities (preflight): {}\n",
+            serde_json::to_string(&state.capabilities).unwrap_or_else(|_| "{}".into())
+        ));
+    }
+
+    // Inject knowledge base entries — what the AI already knows about relevant topics
+    if !state.knowledge_context.is_empty() {
+        ctx.push_str("\n=== KNOWLEDGE BASE (pre-researched topics) ===\n");
+        ctx.push_str("You already have stored knowledge on these topics. USE IT instead of re-searching.\n");
+        ctx.push_str("Only re-search if the user explicitly wants fresh/updated info, or if the entry is stale (>14 days).\n\n");
+        for kb in &state.knowledge_context {
+            let stale_note = if kb.age_days >= 14 {
+                format!(" ⚠ STALE ({} days old — consider refreshing)", kb.age_days)
+            } else {
+                format!(" ({}d old, v{})", kb.age_days, kb.version)
+            };
+            ctx.push_str(&format!("TOPIC: {}{}\n", kb.topic, stale_note));
+            ctx.push_str(&format!("TAGS: {}\n", kb.tags));
+            ctx.push_str(&format!("SUMMARY: {}\n", kb.summary));
+            if let Some(content) = &kb.content {
+                ctx.push_str(&format!("FULL CONTENT:\n{}\n", &content.chars().take(2000).collect::<String>()));
+            }
+            ctx.push('\n');
+        }
+        ctx.push_str("=== END KNOWLEDGE BASE ===\n\n");
+    }
 
     // Inject similar past tasks as few-shot examples
     if !state.semantic_context.is_empty() {
@@ -143,6 +318,15 @@ fn build_context(state: &SystemState) -> String {
             ));
         }
         ctx.push_str("---\n");
+    }
+
+    // Inject planning questionnaire answers as hard constraints
+    if !state.planning_answers.is_empty() {
+        ctx.push_str("\nUser's pre-run planning choices (treat as hard constraints):\n");
+        for (qid, answer) in &state.planning_answers {
+            ctx.push_str(&format!("  - {qid}: {answer}\n"));
+        }
+        ctx.push('\n');
     }
 
     if !state.failure_taxonomy.is_empty() {
@@ -163,3 +347,6 @@ fn build_context(state: &SystemState) -> String {
 
     ctx
 }
+
+// Grounding contract enforcement lives in `crate::grounding` so it can be
+// unit-tested and reused by runtime diagnostics.

@@ -118,6 +118,14 @@ impl EpisodicMemory {
         Ok(())
     }
 
+    /// Hard-delete every task record.
+    pub async fn clear_all(&self) -> Result<()> {
+        sqlx::query("DELETE FROM tasks")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Find the most recent successful task matching a keyword in the request.
     pub async fn find_similar(&self, keyword: &str, limit: i64) -> Result<Vec<TaskRecord>> {
         let pattern = format!("%{keyword}%");

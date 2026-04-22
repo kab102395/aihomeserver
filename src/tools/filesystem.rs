@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::state::{ErrorType, ToolResult};
 use super::Tool;
@@ -31,6 +32,52 @@ impl FilesystemTool {
         let mut hasher = DefaultHasher::new();
         data.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
+    }
+
+    fn rel(&self, full: &PathBuf) -> String {
+        full.strip_prefix(&self.base_dir)
+            .unwrap_or(full)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    fn is_probably_text(bytes: &[u8]) -> bool {
+        // NUL byte is a strong signal for binary.
+        !bytes.iter().any(|b| *b == 0)
+    }
+
+    fn walk_files(
+        &self,
+        root: &PathBuf,
+        max_depth: usize,
+        max_files: usize,
+    ) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack: Vec<(PathBuf, usize)> = vec![(root.clone(), 0)];
+
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > max_depth {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                if out.len() >= max_files {
+                    return out;
+                }
+                let path = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                if meta.is_dir() {
+                    stack.push((path, depth + 1));
+                } else if meta.is_file() {
+                    out.push(path);
+                }
+            }
+        }
+
+        out
     }
 }
 
@@ -114,10 +161,11 @@ impl Tool for FilesystemTool {
                 let full = self.resolve(&path);
                 match std::fs::read_dir(&full) {
                     Ok(entries) => {
-                        let files: Vec<String> = entries
+                        let mut files: Vec<String> = entries
                             .filter_map(|e| e.ok())
                             .map(|e| e.file_name().to_string_lossy().to_string())
                             .collect();
+                        files.sort();
                         ToolResult::ok(
                             json!({ "path": full.display().to_string(), "entries": files }),
                             None,
@@ -125,6 +173,142 @@ impl Tool for FilesystemTool {
                     }
                     Err(e) => ToolResult::err(ErrorType::Env, "list_failed", &e.to_string()),
                 }
+            }
+
+            // Find files by name (substring match) under a directory tree.
+            // Params:
+            // - path (required): directory to search within (relative to workspace root)
+            // - pattern (required): substring to match (case-insensitive)
+            // - max_depth (optional, default 6)
+            // - max_files (optional, default 4000)
+            // - max_results (optional, default 200)
+            "find" => {
+                let pattern = match params.get("pattern").and_then(|v| v.as_str()) {
+                    Some(p) if !p.trim().is_empty() => p.to_lowercase(),
+                    _ => return ToolResult::err(ErrorType::Tool, "missing_param", "params.pattern is required"),
+                };
+                let max_depth = params.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(6) as usize;
+                let max_files = params.get("max_files").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
+                let max_results = params.get("max_results").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+
+                let root = self.resolve(&path);
+                if !root.is_dir() {
+                    return ToolResult::err(ErrorType::Tool, "not_a_directory", &root.display().to_string());
+                }
+
+                let start = Instant::now();
+                let files = self.walk_files(&root, max_depth, max_files);
+                let mut matches: Vec<String> = Vec::new();
+                for f in files.iter() {
+                    let rel = self.rel(f);
+                    if rel.to_lowercase().contains(&pattern) {
+                        matches.push(rel);
+                        if matches.len() >= max_results {
+                            break;
+                        }
+                    }
+                }
+                matches.sort();
+
+                ToolResult::ok(
+                    json!({
+                        "root": self.rel(&root),
+                        "pattern": pattern,
+                        "matches": matches,
+                        "files_scanned": files.len(),
+                        "max_depth": max_depth,
+                        "max_files": max_files,
+                        "max_results": max_results,
+                        "duration_ms": start.elapsed().as_millis(),
+                    }),
+                    None,
+                )
+            }
+
+            // Search inside files for a substring (case-insensitive) under a directory tree.
+            // This is a safe, dependency-free alternative to relying on `rg` in the shell tool.
+            // Params:
+            // - path (required): directory to search within
+            // - query (required): substring to search (case-insensitive)
+            // - max_depth (optional, default 6)
+            // - max_files (optional, default 1500)
+            // - max_results (optional, default 200)
+            // - max_bytes_per_file (optional, default 200000)
+            "grep" => {
+                let query_raw = match params.get("query").and_then(|v| v.as_str()) {
+                    Some(q) if !q.trim().is_empty() => q.to_string(),
+                    _ => return ToolResult::err(ErrorType::Tool, "missing_param", "params.query is required"),
+                };
+                let query = query_raw.to_lowercase();
+                let max_depth = params.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(6) as usize;
+                let max_files = params.get("max_files").and_then(|v| v.as_u64()).unwrap_or(1500) as usize;
+                let max_results = params.get("max_results").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+                let max_bytes_per_file = params
+                    .get("max_bytes_per_file")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(200_000) as usize;
+
+                let root = self.resolve(&path);
+                if !root.is_dir() {
+                    return ToolResult::err(ErrorType::Tool, "not_a_directory", &root.display().to_string());
+                }
+
+                let start = Instant::now();
+                let files = self.walk_files(&root, max_depth, max_files);
+
+                let mut matches: Vec<Value> = Vec::new();
+                let mut files_scanned = 0usize;
+                let mut files_skipped = 0usize;
+
+                for f in files.iter() {
+                    if matches.len() >= max_results {
+                        break;
+                    }
+                    let Ok(bytes) = std::fs::read(f) else {
+                        files_skipped += 1;
+                        continue;
+                    };
+                    files_scanned += 1;
+
+                    if bytes.len() > max_bytes_per_file {
+                        files_skipped += 1;
+                        continue;
+                    }
+                    if !Self::is_probably_text(&bytes) {
+                        files_skipped += 1;
+                        continue;
+                    }
+
+                    let text = String::from_utf8_lossy(&bytes);
+                    for (idx, line) in text.lines().enumerate() {
+                        if matches.len() >= max_results {
+                            break;
+                        }
+                        if line.to_lowercase().contains(&query) {
+                            matches.push(json!({
+                                "path": self.rel(f),
+                                "line": idx + 1,
+                                "text": line.trim(),
+                            }));
+                        }
+                    }
+                }
+
+                ToolResult::ok(
+                    json!({
+                        "root": self.rel(&root),
+                        "query": query_raw,
+                        "matches": matches,
+                        "files_scanned": files_scanned,
+                        "files_skipped": files_skipped,
+                        "max_depth": max_depth,
+                        "max_files": max_files,
+                        "max_results": max_results,
+                        "max_bytes_per_file": max_bytes_per_file,
+                        "duration_ms": start.elapsed().as_millis(),
+                    }),
+                    None,
+                )
             }
 
             "delete" => {
@@ -148,5 +332,76 @@ impl Tool for FilesystemTool {
 
             _ => ToolResult::err(ErrorType::Tool, "unsupported_action", &action),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_base() -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("aihomeserver_fs_test_{}", uuid::Uuid::new_v4()));
+        p
+    }
+
+    #[tokio::test]
+    async fn find_finds_files_by_substring() {
+        let base = tmp_base();
+        let tool = FilesystemTool::new(&base).expect("tmp dir created");
+        let _ = tool
+            .execute(json!({
+                "action": "write",
+                "path": "src/main.rs",
+                "content": "fn main() { println!(\"hello\"); }\n"
+            }))
+            .await;
+
+        let r = tool
+            .execute(json!({
+                "action": "find",
+                "path": ".",
+                "pattern": "main.rs"
+            }))
+            .await;
+        assert!(r.success, "find should succeed");
+        let matches = r.output.unwrap().get("matches").cloned().unwrap_or(Value::Null);
+        let arr = matches.as_array().cloned().unwrap_or_default();
+        assert!(
+            arr.iter().any(|v| v.as_str().unwrap_or("").ends_with("src/main.rs")),
+            "expected src/main.rs in matches: {arr:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn grep_finds_text_in_files() {
+        let base = tmp_base();
+        let tool = FilesystemTool::new(&base).expect("tmp dir created");
+        let _ = tool
+            .execute(json!({
+                "action": "write",
+                "path": "notes.txt",
+                "content": "alpha\nneedle here\nomega\n"
+            }))
+            .await;
+
+        let r = tool
+            .execute(json!({
+                "action": "grep",
+                "path": ".",
+                "query": "needle"
+            }))
+            .await;
+        assert!(r.success, "grep should succeed");
+        let out = r.output.unwrap();
+        let hits = out.get("matches").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        assert!(
+            hits.iter().any(|h| h.get("path").and_then(|p| p.as_str()) == Some("notes.txt")),
+            "expected notes.txt hit: {hits:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

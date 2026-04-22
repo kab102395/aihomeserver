@@ -55,7 +55,7 @@ impl Orchestrator {
 
                 OrchestratorNode::Executor => {
                     // ── High-risk human gate ──────────────────────────────────
-                    if RiskLevel::from_score(state.risk_score()) == RiskLevel::High {
+                    if state.risk_score() >= state.risk_gate_threshold && !state.admin_mode {
                         if let (Some(gate_store), Some(sse_tx)) =
                             (state.gate_store.as_ref(), state.sse_tx.as_ref())
                         {
@@ -118,8 +118,30 @@ impl Orchestrator {
                 }
 
                 OrchestratorNode::Repair => {
+                    // Tell the UI we're retrying
+                    let issues = state.critic_history.last()
+                        .map(|r| r.issues.clone())
+                        .unwrap_or_default();
+                    if let Some(tx) = &state.sse_tx {
+                        let _ = tx.send(crate::state::SseEvent::Repair {
+                            cycle: state.repair_cycle + 1,
+                            issues: issues.iter().take(3).cloned().collect(),
+                        });
+                    }
                     state = repair::run(state, &self.llm).await?;
-                    OrchestratorNode::Critic
+
+                    // If we're repairing a tool step, retry the tool execution with the repaired tool call.
+                    let retry_tool = state
+                        .current_plan
+                        .as_ref()
+                        .and_then(|p| p.steps.get(state.current_step.saturating_sub(1)))
+                        .and_then(|s| s.tool_binding.as_ref())
+                        .is_some();
+                    if retry_tool {
+                        OrchestratorNode::ToolExecution
+                    } else {
+                        OrchestratorNode::Critic
+                    }
                 }
 
                 OrchestratorNode::Replan => {
@@ -130,6 +152,11 @@ impl Orchestrator {
                         replan = replan_count,
                         "Triggering replan"
                     );
+                    if let Some(tx) = &state.sse_tx {
+                        let _ = tx.send(crate::state::SseEvent::Replan {
+                            attempt: replan_count,
+                        });
+                    }
                     if replan_count >= MAX_REPLANS {
                         warn!(task_id = %state.task_id, "Max replans reached, forcing finalization");
                         OrchestratorNode::Finalization
@@ -180,6 +207,21 @@ impl Orchestrator {
                 return OrchestratorNode::Finalization;
             }
             return OrchestratorNode::Executor;
+        }
+
+        // Special-case: facts-gate failures should trigger a replan immediately.
+        if state
+            .artifacts
+            .get("facts_gate_result")
+            .and_then(|v| v.get("success"))
+            .and_then(|b| b.as_bool())
+            == Some(false)
+        {
+            warn!(
+                task_id = %state.task_id,
+                "Missing facts gate tripped — replanning"
+            );
+            return OrchestratorNode::Replan;
         }
 
         // Critic failed — escalate or repair.

@@ -44,6 +44,66 @@ Output ONLY valid JSON:
 Be thorough. A false pass here may trigger irreversible production actions."#;
 
 pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemState> {
+    // Deterministic fail: facts gate tripped (grounded research attempted without evidence).
+    if state
+        .artifacts
+        .get("facts_gate_result")
+        .and_then(|v| v.get("success"))
+        .and_then(|b| b.as_bool())
+        == Some(false)
+    {
+        state.critic_history.push(CriticReview {
+            overall_pass: false,
+            score: 0.0,
+            confidence: 1.0,
+            issues: vec![
+                "Missing grounded facts (facts_gate_result). Cannot generate patch-specific output without evidence.".into(),
+            ],
+            recommendations: vec![
+                "Replan: run parallel_search/http_fetch, extract facts JSON, then generate code using facts.".into(),
+            ],
+            timestamp: Utc::now(),
+        });
+        return Ok(state);
+    }
+
+    // If the most recent step was a tool step and that tool failed, fail the critic
+    // deterministically (even on the low-risk path) so the orchestrator can repair/replan.
+    if let Some(plan) = state.current_plan.as_ref() {
+        if state.current_step >= 1 && state.current_step <= plan.steps.len() {
+            let step = &plan.steps[state.current_step - 1];
+            if let Some(tool_name) = step.tool_binding.as_ref() {
+                let output_key = step
+                    .output_key
+                    .clone()
+                    .unwrap_or_else(|| format!("step_{}", state.current_step));
+                let tool_output_key = format!("{output_key}_result");
+                if let Some(val) = state.artifacts.get(&tool_output_key) {
+                    let failed = val
+                        .get("success")
+                        .and_then(|v| v.as_bool())
+                        .map(|b| !b)
+                        .unwrap_or(false);
+                    if failed {
+                        let code = val.get("error_code").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let trace = val.get("trace").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        state.critic_history.push(CriticReview {
+                            overall_pass: false,
+                            score: 0.0,
+                            confidence: 1.0,
+                            issues: vec![format!("Tool '{tool_name}' failed ({code}): {trace}")],
+                            recommendations: vec![
+                                "Retry with different parameters, check networking, or replan.".into(),
+                            ],
+                            timestamp: Utc::now(),
+                        });
+                        return Ok(state);
+                    }
+                }
+            }
+        }
+    }
+
     let risk = RiskLevel::from_score(state.risk_score());
 
     // Low risk path: skip critic entirely, auto-pass
@@ -57,8 +117,6 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
             recommendations: vec![],
             timestamp: Utc::now(),
         });
-        // NOTE: do NOT set termination_met here — the orchestrator checks
-        // whether all plan steps are done after routing back to Executor.
         return Ok(state);
     }
 
@@ -98,7 +156,7 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
         Message::user(context),
     ];
 
-    let review: CriticReview = match llm.complete_json(messages, model_role).await {
+    let review: CriticReview = match llm.complete_json(messages, model_role, false).await {
         Ok(r) => r,
         Err(e) => {
             state.log_meta(
@@ -130,6 +188,15 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
 
     // NOTE: do NOT set termination_met here — the orchestrator routes back to
     // Executor which will set it once all plan steps are exhausted.
+
+    // Emit critic result so the UI can show pass/fail inline
+    if let Some(tx) = &state.sse_tx {
+        let _ = tx.send(crate::state::SseEvent::CriticResult {
+            passed: review.overall_pass,
+            score: review.score,
+            issues: review.issues.clone(),
+        });
+    }
 
     state.critic_history.push(review);
     Ok(state)

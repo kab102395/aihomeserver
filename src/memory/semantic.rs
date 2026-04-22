@@ -163,6 +163,33 @@ impl SemanticMemory {
         cache.retain(|r| r.task_id != tid);
         Ok(())
     }
+
+    /// Return all stored entries (without embeddings) for the memory browser UI.
+    pub async fn list(&self) -> Vec<SemanticListEntry> {
+        let cache = self.cache.read().await;
+        cache.iter().map(|r| SemanticListEntry {
+            task_id:        r.task_id.clone(),
+            user_request:   r.user_request.clone(),
+            answer_summary: r.answer_summary.clone(),
+        }).collect()
+    }
+
+    /// Hard-delete every embedding in both the DB and the in-memory cache.
+    pub async fn clear_all(&self) -> Result<()> {
+        sqlx::query("DELETE FROM embeddings")
+            .execute(&self.pool)
+            .await?;
+        self.cache.write().await.clear();
+        Ok(())
+    }
+}
+
+/// A minimal view of a semantic memory entry, safe to serialize to the UI.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SemanticListEntry {
+    pub task_id:        String,
+    pub user_request:   String,
+    pub answer_summary: String,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

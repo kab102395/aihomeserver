@@ -1,6 +1,8 @@
 pub mod filesystem;
 pub mod git;
 pub mod http_fetch;
+pub mod parallel_search;
+pub mod save_knowledge;
 pub mod shell;
 pub mod web_search;
 
@@ -10,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::state::{ErrorType, ToolResult};
+use crate::metrics::SharedMetrics;
 
 /// Every tool must implement this contract.
 /// The mandatory output schema (success/error_type/error_code/trace/output/checkpoint)
@@ -22,11 +25,16 @@ pub trait Tool: Send + Sync {
 
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    metrics: Option<SharedMetrics>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: HashMap::new() }
+        Self { tools: HashMap::new(), metrics: None }
+    }
+
+    pub fn set_metrics(&mut self, metrics: SharedMetrics) {
+        self.metrics = Some(metrics);
     }
 
     pub fn register<T: Tool + 'static>(&mut self, tool: T) {
@@ -43,14 +51,23 @@ impl ToolRegistry {
     }
 
     pub async fn execute(&self, name: &str, params: Value) -> ToolResult {
-        match self.tools.get(name) {
+        let start = std::time::Instant::now();
+        let result = match self.tools.get(name) {
             Some(tool) => tool.execute(params).await,
             None => ToolResult::err(
                 ErrorType::Tool,
                 "tool_not_found",
                 &format!("No tool registered: {name}"),
             ),
+        };
+
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .record_tool_call(name, result.success, start.elapsed())
+                .await;
         }
+
+        result
     }
 
     pub fn list(&self) -> Vec<&str> {

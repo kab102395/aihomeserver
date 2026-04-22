@@ -2,13 +2,69 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::state::{ErrorType, ToolResult};
+
 use super::Tool;
+
+/// Default working directory for shell commands.
+/// Falls back to the workspace subfolder next to the binary, then the binary's
+/// own directory, then ".".
+fn default_cwd() -> String {
+    // Prefer ./workspace relative to the executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let ws = dir.join("workspace");
+            if ws.is_dir() {
+                return ws.to_string_lossy().into_owned();
+            }
+            return dir.to_string_lossy().into_owned();
+        }
+    }
+    // Fall back to process cwd
+    std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| ".".into())
+}
+
+#[cfg(not(windows))]
+fn looks_like_powershell(command: &str) -> bool {
+    let c = command.to_lowercase();
+    [
+        "get-content",
+        "set-content",
+        "select-object",
+        "get-childitem",
+        "out-file",
+        "format-table",
+        "where-object",
+        "foreach-object",
+        "convertto-json",
+        "$env:",
+    ]
+    .iter()
+    .any(|needle| c.contains(needle))
+}
+
+#[cfg(windows)]
+fn looks_like_posix_shell(command: &str) -> bool {
+    let c = command.to_lowercase();
+    c.contains(" | head ")
+        || c.contains(" | tail ")
+        || c.contains("grep ")
+        || c.contains("rg ")
+        || c.contains("cat ")
+        || c.contains("ls ")
+        || c.contains("&& ")
+        || c.contains("$(")
+        || c.contains('`')
+}
 
 pub struct ShellTool;
 
 #[async_trait]
 impl Tool for ShellTool {
-    fn name(&self) -> &str { "shell" }
+    fn name(&self) -> &str {
+        "shell"
+    }
 
     async fn execute(&self, params: Value) -> ToolResult {
         let command = match params["command"].as_str() {
@@ -17,15 +73,62 @@ impl Tool for ShellTool {
         };
 
         let timeout_secs = params["timeout_secs"].as_u64().unwrap_or(30);
-        let working_dir = params["cwd"].as_str().unwrap_or(".");
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            tokio::process::Command::new("cmd")
-                .args(["/C", &command])
-                .current_dir(working_dir)
-                .output(),
-        )
+        // Use caller-supplied cwd, otherwise pick the server's workspace/root dir.
+        // If the requested cwd doesn't exist (common when a Windows config is
+        // mounted into a Linux container), fall back to a safe default.
+        let cwd_requested = params["cwd"]
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(default_cwd);
+        let cwd = if std::path::Path::new(&cwd_requested).is_dir() {
+            cwd_requested.clone()
+        } else {
+            let fallback = default_cwd();
+            if std::path::Path::new(&fallback).is_dir() {
+                fallback
+            } else {
+                ".".into()
+            }
+        };
+
+        // Fail fast on OS/shell mismatch so the repair loop can correct the command.
+        #[cfg(not(windows))]
+        if looks_like_powershell(&command) {
+            return ToolResult::err(
+                ErrorType::Tool,
+                "shell_syntax_mismatch",
+                "Command looks like PowerShell, but this server is running on a POSIX shell (sh -lc). Use POSIX commands (ls/cat/rg/head) or the filesystem tool.",
+            );
+        }
+        #[cfg(windows)]
+        if looks_like_posix_shell(&command) {
+            return ToolResult::err(
+                ErrorType::Tool,
+                "shell_syntax_mismatch",
+                "Command looks like POSIX shell, but this server is running on Windows PowerShell. Use PowerShell syntax (Get-ChildItem/Get-Content/Select-Object) or the filesystem tool.",
+            );
+        }
+
+        let shell_backend = if cfg!(windows) { "powershell" } else { "sh" };
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+            #[cfg(windows)]
+            let mut cmd = {
+                let mut c = tokio::process::Command::new("powershell");
+                c.args(["-NoProfile", "-NonInteractive", "-Command", &command]);
+                c
+            };
+
+            #[cfg(not(windows))]
+            let mut cmd = {
+                let mut c = tokio::process::Command::new("sh");
+                c.args(["-lc", &command]);
+                c
+            };
+
+            cmd.current_dir(&cwd).output().await
+        })
         .await;
 
         match result {
@@ -45,6 +148,9 @@ impl Tool for ShellTool {
                     "stderr": stderr,
                     "exit_code": exit_code,
                     "command": command,
+                    "cwd": cwd,
+                    "cwd_requested": cwd_requested,
+                    "shell_backend": shell_backend,
                 });
 
                 if exit_code == 0 {
@@ -54,6 +160,9 @@ impl Tool for ShellTool {
                             "type": "shell_exec",
                             "command": command,
                             "exit_code": exit_code,
+                            "cwd": cwd,
+                            "cwd_requested": cwd_requested,
+                            "shell_backend": shell_backend,
                         })),
                     )
                 } else {
@@ -61,7 +170,7 @@ impl Tool for ShellTool {
                         success: false,
                         error_type: ErrorType::Tool,
                         error_code: Some(format!("exit_{exit_code}")),
-                        trace: Some(stderr),
+                        trace: Some(stderr.clone()),
                         output: Some(output),
                         checkpoint: None,
                         observed_state_hash: None,

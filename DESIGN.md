@@ -118,6 +118,29 @@ Tools never panic. Unknown tool names are skipped gracefully (logged, not counte
 
 ---
 
+## Docker Modes (Runtime vs Dev/Test)
+
+There are two supported Docker ways to run the server:
+
+- **Runtime (default)**: built binary on a slim Debian image. Good for always-on use, but it **does not include** developer tools like `cargo`.
+- **Dev/Test (optional)**: runs from source in a Rust image with common CLI tools (`cargo`, `git`, `rg`, `curl`). This is the mode you want if you expect the AI to run build/test commands or search your repo tree.
+
+**Runtime**
+
+```bash
+docker compose up -d --build
+```
+
+**Dev/Test (bind-mounts the repo into the container at `/workspace`)**
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+```
+
+In Dev/Test mode, set `WORKSPACE=/workspace`, so the `filesystem` and `shell` tools can read/search your project tree.
+
+---
+
 ## Conversation Sessions
 
 Each request carries an optional `session_id`. If omitted, a new session is created and its ID is returned in the response. Subsequent requests with the same `session_id` receive the last 10 turns as context.

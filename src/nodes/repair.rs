@@ -1,11 +1,53 @@
 use anyhow::Result;
+
 use crate::{
     llm::ollama::{Message, ModelRole, OllamaClient},
     state::SystemState,
 };
 
-const REPAIR_PROMPT: &str = r#"You are a repair agent. Apply the critic's feedback to fix the execution output.
-Output only the corrected artifact — no explanations, no preamble."#;
+fn in_container() -> bool {
+    if std::path::Path::new("/.dockerenv").exists() {
+        return true;
+    }
+    if let Ok(cgroup) = std::fs::read_to_string("/proc/1/cgroup") {
+        let c = cgroup.to_lowercase();
+        return c.contains("docker") || c.contains("containerd") || c.contains("kubepods");
+    }
+    false
+}
+
+const REPAIR_TEXT_PROMPT: &str = r#"You are a repair agent. Apply the critic's feedback to fix the last step output.
+Output only the corrected content (no explanations, no preamble)."#;
+
+fn repair_tool_prompt() -> String {
+    let os = std::env::consts::OS;
+    let shell_hint = if os == "windows" {
+        "PowerShell syntax"
+    } else {
+        "POSIX sh syntax"
+    };
+
+    format!(
+        r#"You are a repair agent for a tool call.
+Output ONLY valid JSON. No prose, no markdown.
+
+Schema:
+{{ "tool": "tool_name", "params": {{ ... }} }}
+
+Runtime context:
+- runtime_os: {os}
+- shell_syntax: {shell_hint}
+- in_container: {}
+
+Rules:
+- Preserve the tool name exactly as requested.
+- Fix parameters so the tool call succeeds.
+- If the tool is `shell`, use the runtime OS syntax (no PowerShell cmdlets on Linux; no bashisms on Windows).
+- Prefer simple commands and avoid unnecessary pipes.
+"#,
+        in_container()
+    )
+}
 
 pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemState> {
     state.repair_cycle += 1;
@@ -23,21 +65,94 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
         }
     };
 
+    let Some(plan) = state.current_plan.as_ref() else {
+        state.log("repair_error", "No plan available during repair");
+        return Ok(state);
+    };
+    if state.current_step == 0 || state.current_step > plan.steps.len() {
+        state.log("repair_error", "Invalid current_step during repair");
+        return Ok(state);
+    }
+
+    let step = &plan.steps[state.current_step - 1];
+    let output_key = step
+        .output_key
+        .clone()
+        .unwrap_or_else(|| format!("step_{}", state.current_step));
+
+    // Tool step: repair by generating a corrected tool call JSON and overwrite output_key.
+    if let Some(tool_name) = step.tool_binding.as_ref() {
+        let tool_output_key = format!("{output_key}_result");
+        let last_tool_result = state
+            .artifacts
+            .get(&tool_output_key)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let prior_tool_call = state
+            .artifacts
+            .get(&output_key)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        let messages = vec![
+            Message::system(repair_tool_prompt()),
+            Message::user(format!(
+                "Tool: {tool_name}\nStep: {}\nOutput key: {output_key}\n\nIssues:\n{}\n\nRecommendations:\n{}\n\nPrior tool call (may be JSON string):\n{}\n\nLast tool result:\n{}\n\nAll artifacts:\n{}",
+                step.action,
+                last_review.issues.join("\n"),
+                last_review.recommendations.join("\n"),
+                serde_json::to_string_pretty(&prior_tool_call).unwrap_or_default(),
+                serde_json::to_string_pretty(&last_tool_result).unwrap_or_default(),
+                serde_json::to_string_pretty(&state.artifacts).unwrap_or_default(),
+            )),
+        ];
+
+        match llm
+            .complete_json::<serde_json::Value>(messages, ModelRole::Fast, true)
+            .await
+        {
+            Ok(v) => {
+                state.log_meta(
+                    "repair",
+                    "Repaired tool call",
+                    serde_json::json!({ "output_key": output_key, "tool": tool_name }),
+                );
+                state.artifacts.insert(output_key, v);
+            }
+            Err(e) => {
+                state.log_meta(
+                    "repair_error",
+                    "Repair tool-call generation failed",
+                    serde_json::json!({ "error": e.to_string() }),
+                );
+                state.failure_count += 1;
+            }
+        }
+
+        return Ok(state);
+    }
+
+    // LLM-only step: repair by regenerating corrected text and overwrite output_key.
     let messages = vec![
-        Message::system(REPAIR_PROMPT),
+        Message::system(REPAIR_TEXT_PROMPT),
         Message::user(format!(
-            "Issues identified:\n{}\n\nRecommendations:\n{}\n\nCurrent artifacts:\n{}",
+            "Step: {}\nOutput key: {output_key}\n\nIssues:\n{}\n\nRecommendations:\n{}\n\nCurrent artifacts:\n{}",
+            step.action,
             last_review.issues.join("\n"),
             last_review.recommendations.join("\n"),
             serde_json::to_string_pretty(&state.artifacts).unwrap_or_default(),
         )),
     ];
 
-    match llm.chat(messages, ModelRole::Fast, false).await {
+    match llm.chat(messages, ModelRole::Fast, false, false).await {
         Ok(repaired) => {
-            let key = format!("repair_cycle_{}", state.repair_cycle);
-            state.log_meta("repair", "Repair applied", serde_json::json!({ "key": key }));
-            state.artifacts.insert(key, serde_json::Value::String(repaired));
+            state.log_meta(
+                "repair",
+                "Repaired text artifact",
+                serde_json::json!({ "output_key": output_key }),
+            );
+            state.artifacts
+                .insert(output_key, serde_json::Value::String(repaired));
         }
         Err(e) => {
             state.log_meta(
@@ -51,3 +166,4 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
 
     Ok(state)
 }
+

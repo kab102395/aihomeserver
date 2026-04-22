@@ -12,7 +12,7 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["full"] }
 
 # HTTP server
-axum = { version = "0.7", features = ["json"] }
+axum = { version = "0.7", features = ["json", "multipart"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # HTTP client (Ollama + http_fetch tool)
@@ -21,6 +21,7 @@ reqwest = { version = "0.12", features = ["json", "stream", "gzip", "brotli", "d
 # Streaming support
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
