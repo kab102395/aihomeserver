@@ -1,9 +1,28 @@
-use anyhow::Result;
+//! Planner node.
+//!
+//! Responsibility:
+//! - Turn `SystemState.user_request` (+ injected context like conversation history, knowledge, and
+//!   semantic examples) into a structured `PlannerOutput` JSON plan.
+//! - Choose whether tools are required and set an initial `risk_score`.
+//!
+//! Why a dedicated planner node:
+//! - It isolates prompt design and plan schema enforcement from execution logic.
+//! - It makes the agent loop explainable: “planning” is a distinct, inspectable phase.
+
 use crate::{
     llm::ollama::{Message, ModelRole, OllamaClient},
     state::{PlannerOutput, SystemState},
 };
+use anyhow::Result;
+use chrono::{Local, Utc};
 
+/// Best-effort container detection used to tune model choices/defaults.
+///
+/// This is intentionally heuristic; failure here should not break planning.
+/// Best-effort container detection used to tune planner behavior/prompts.
+///
+/// Connection:
+/// - Helps the planner avoid generating commands that assume host tools exist when running in Docker.
 fn in_container() -> bool {
     if std::path::Path::new("/.dockerenv").exists() {
         return true;
@@ -178,6 +197,36 @@ USE "save_knowledge" after researching a topic to store it permanently for futur
   }
   output_key: "knowledge_saved"
 
+TEXTBOOK / CURRICULUM MODE:
+  If the user asks to "learn" something in depth (e.g. "learn Rust", "deep dive all sources",
+  "make a textbook"), plan a curriculum-style research run that results in MULTIPLE KB chapters.
+  Pattern:
+    1. parallel_search — official docs + authoritative tutorials (output_key: "search_result")
+    2. http_fetch — 2–4 high-quality sources, diverse domains (output_key: "fetch1_result", "fetch2_result", ...)
+    3. LLM-only synthesis — produce a structured "book" as JSON (output_key: "kb_textbook", output_format: "json"):
+       {
+         "book_title": "...",
+         "chapters": [
+           { "topic": "Book Title — Ch 01: ...", "summary": "...", "content": "Markdown...", "tags": "comma,tags", "sources": ["url", ...] }
+         ]
+       }
+    4. save_knowledge — save all chapters at once using params: { "chapters": [...] } (output_key: "knowledge_saved")
+  Keep chapter count reasonable (6–14) so it fits in context windows. Prefer official docs for languages/frameworks.
+
+AUTO-KB MODE (configurable; see runtime capabilities):
+  The runtime may set:
+    - capabilities.auto_kb_mode: "off" | "research" | "always"
+    - capabilities.auto_kb_min_chars: number
+
+  If auto_kb_mode is "always":
+    - For most non-trivial user requests, plan to save the final synthesized answer into the KB.
+    - Add a final `save_knowledge` step with output_key "knowledge_saved".
+    - Only do this when the answer is expected to be substantial (>= auto_kb_min_chars).
+    - NEVER save secrets or sensitive personal data; if the request includes passwords/keys/tokens, keep auto_kb off.
+
+  If auto_kb_mode is "research":
+    - Only save when the plan includes web research tools (parallel_search/http_fetch) or when explicitly asked to "save" or "learn".
+
   WHEN TO RESEARCH + SAVE vs USE STORED KNOWLEDGE:
   - If the KNOWLEDGE BASE has a relevant entry AND the request is NOT about patches/versions/meta
     AND the entry is fresh (<14 days) → USE IT, answer directly (single LLM step).
@@ -206,23 +255,40 @@ risk_score: 0-3 low (Q&A, reads), 4-7 standard (file writes, shell), 8-10 high (
 
 Pure JSON only. No explanations."#;
 
+/// Generate a `PlannerOutput` plan for the current request and store it in `SystemState`.
 pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemState> {
+    // Planner prompt is a strict JSON contract. The rest of the runtime relies on:
+    // - `steps[*].tool_binding` to decide when to call tools
+    // - `risk_score` to choose critic depth and whether to require human approval
+    // - `requires_facts` to enforce grounded outputs when necessary
     state.log("planner", "Generating plan");
     if let Some(tx) = &state.sse_tx {
-        let _ = tx.send(crate::state::SseEvent::Status { phase: "planning".into() });
+        let _ = tx.send(crate::state::SseEvent::Status {
+            phase: "planning".into(),
+        });
     }
 
     let context = build_context(&state);
-    let messages = vec![
-        Message::system(SYSTEM_PROMPT),
-        Message::user(context),
-    ];
+    let messages = vec![Message::system(SYSTEM_PROMPT), Message::user(context)];
 
     // think=true: planner reasons through whether to search vs answer directly
     // before committing to a plan — prevents it from skipping research
-    match llm.complete_json::<PlannerOutput>(messages, ModelRole::Fast, true).await {
+    match llm
+        .complete_json::<PlannerOutput>(messages, ModelRole::Fast, true)
+        .await
+    {
         Ok(mut plan) => {
-            crate::grounding::enforce_grounding_contract(&state.user_request, &state.capabilities, &mut plan);
+            crate::grounding::enforce_grounding_contract(
+                &state.user_request,
+                &state.capabilities,
+                &mut plan,
+            );
+            crate::grounding::enforce_curriculum_contract(
+                &state.user_request,
+                &state.capabilities,
+                &mut plan,
+            );
+            // Auto-KB saving is handled as a post-task hook in the HTTP layer to keep responses fast.
             state.log_meta(
                 "planner",
                 "Plan ready",
@@ -235,13 +301,17 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
             state.current_plan = Some(plan);
             if let Some(plan) = &state.current_plan {
                 if let Some(tx) = &state.sse_tx {
-                    let steps: Vec<String> = plan.steps.iter().map(|s| {
-                        if let Some(tool) = &s.tool_binding {
-                            format!("[{}] {}", tool, s.action)
-                        } else {
-                            s.action.clone()
-                        }
-                    }).collect();
+                    let steps: Vec<String> = plan
+                        .steps
+                        .iter()
+                        .map(|s| {
+                            if let Some(tool) = &s.tool_binding {
+                                format!("[{}] {}", tool, s.action)
+                            } else {
+                                s.action.clone()
+                            }
+                        })
+                        .collect();
                     let _ = tx.send(crate::state::SseEvent::Plan {
                         steps,
                         risk: plan.risk_score,
@@ -262,6 +332,10 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
     Ok(state)
 }
 
+/// Build the planner input: request + injected context (history, KB, semantic examples, config).
+///
+/// Connection:
+/// - `run()` sends this as the user message alongside `SYSTEM_PROMPT`, and expects strict JSON back.
 fn build_context(state: &SystemState) -> String {
     let mut ctx = String::new();
 
@@ -276,6 +350,12 @@ fn build_context(state: &SystemState) -> String {
 
     ctx.push_str(&format!("Current user request: {}\n", state.user_request));
     ctx.push_str(&format!("Runtime OS: {}\n", std::env::consts::OS));
+    // Make "today" explicit so "latest" requests don't accidentally anchor on old years.
+    ctx.push_str(&format!(
+        "Current date/time: {} (local) | {} (UTC)\n",
+        Local::now().to_rfc3339(),
+        Utc::now().to_rfc3339()
+    ));
     ctx.push_str(&format!("In container: {}\n", in_container()));
     ctx.push_str("Shell tool backend: PowerShell on Windows; sh -lc on Linux/macOS.\n");
     if !state.capabilities.is_null() {
@@ -288,7 +368,9 @@ fn build_context(state: &SystemState) -> String {
     // Inject knowledge base entries — what the AI already knows about relevant topics
     if !state.knowledge_context.is_empty() {
         ctx.push_str("\n=== KNOWLEDGE BASE (pre-researched topics) ===\n");
-        ctx.push_str("You already have stored knowledge on these topics. USE IT instead of re-searching.\n");
+        ctx.push_str(
+            "You already have stored knowledge on these topics. USE IT instead of re-searching.\n",
+        );
         ctx.push_str("Only re-search if the user explicitly wants fresh/updated info, or if the entry is stale (>14 days).\n\n");
         for kb in &state.knowledge_context {
             let stale_note = if kb.age_days >= 14 {
@@ -300,7 +382,10 @@ fn build_context(state: &SystemState) -> String {
             ctx.push_str(&format!("TAGS: {}\n", kb.tags));
             ctx.push_str(&format!("SUMMARY: {}\n", kb.summary));
             if let Some(content) = &kb.content {
-                ctx.push_str(&format!("FULL CONTENT:\n{}\n", &content.chars().take(2000).collect::<String>()));
+                ctx.push_str(&format!(
+                    "FULL CONTENT:\n{}\n",
+                    &content.chars().take(2000).collect::<String>()
+                ));
             }
             ctx.push('\n');
         }

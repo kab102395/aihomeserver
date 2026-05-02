@@ -5,20 +5,31 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::state::{ErrorType, ToolResult};
 use super::Tool;
+use crate::state::{ErrorType, ToolResult};
 
+/// Tool for safe workspace file operations (read/write/list/find/grep/etc.).
+///
+/// Connection:
+/// - The executor prefers using this tool for repo inspection and file edits because it’s
+///   portable (no shell differences) and can enforce path traversal protections.
 pub struct FilesystemTool {
     base_dir: PathBuf,
 }
 
 impl FilesystemTool {
+    /// Create a filesystem tool rooted at `base_dir` (created if missing).
     pub fn new(base_dir: impl Into<PathBuf>) -> std::io::Result<Self> {
         let base_dir = base_dir.into();
         std::fs::create_dir_all(&base_dir)?;
         Ok(Self { base_dir })
     }
 
+    /// Resolve a user-supplied relative path against `base_dir` safely.
+    ///
+    /// Why this exists:
+    /// - Prevents `..` path traversal and absolute-path escapes.
+    /// - Keeps tool operations constrained to the configured workspace root.
     fn resolve(&self, path: &str) -> PathBuf {
         // Prevent path traversal: strip leading / and ..
         let clean: PathBuf = path
@@ -28,12 +39,17 @@ impl FilesystemTool {
         self.base_dir.join(clean)
     }
 
+    /// Compute a small stable hash of bytes for change detection/checkpointing.
+    ///
+    /// Connection:
+    /// - Used in tool outputs to let the runtime/UI detect whether content changed.
     fn hash_bytes(data: &[u8]) -> String {
         let mut hasher = DefaultHasher::new();
         data.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
     }
 
+    /// Convert an absolute path back into a workspace-relative path for UI display.
     fn rel(&self, full: &PathBuf) -> String {
         full.strip_prefix(&self.base_dir)
             .unwrap_or(full)
@@ -41,17 +57,18 @@ impl FilesystemTool {
             .replace('\\', "/")
     }
 
+    /// Best-effort binary detection to avoid returning unreadable blobs as “text”.
     fn is_probably_text(bytes: &[u8]) -> bool {
         // NUL byte is a strong signal for binary.
         !bytes.iter().any(|b| *b == 0)
     }
 
-    fn walk_files(
-        &self,
-        root: &PathBuf,
-        max_depth: usize,
-        max_files: usize,
-    ) -> Vec<PathBuf> {
+    /// Walk files under `root` up to bounds, skipping symlinks.
+    ///
+    /// Why this exists:
+    /// - `find`/`grep` need a file list, but we must cap work to avoid huge traversals.
+    /// - Skipping symlinks prevents cycles and accidental escapes.
+    fn walk_files(&self, root: &PathBuf, max_depth: usize, max_files: usize) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut stack: Vec<(PathBuf, usize)> = vec![(root.clone(), 0)];
 
@@ -59,13 +76,17 @@ impl FilesystemTool {
             if depth > max_depth {
                 continue;
             }
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 if out.len() >= max_files {
                     return out;
                 }
                 let path = entry.path();
-                let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
                 if meta.file_type().is_symlink() {
                     continue;
                 }
@@ -83,13 +104,31 @@ impl FilesystemTool {
 
 #[async_trait]
 impl Tool for FilesystemTool {
-    fn name(&self) -> &str { "filesystem" }
+    /// Canonical tool name used in planner/executor `tool_binding`.
+    fn name(&self) -> &str {
+        "filesystem"
+    }
 
+    /// Execute a filesystem action (read/write/list/find/grep/etc.).
     async fn execute(&self, params: Value) -> ToolResult {
-        let action = params["action"].as_str().unwrap_or("").to_string();
+        let action_raw = params["action"].as_str().unwrap_or("").to_string();
+        // Compatibility: tolerate alternate action names emitted by different planners/models.
+        let action = match action_raw.as_str() {
+            // write synonyms
+            "write_file" | "create_file" | "create" | "touch" => "write".to_string(),
+            // read synonyms
+            "read_file" => "read".to_string(),
+            // list synonyms
+            "ls" => "list".to_string(),
+            // mkdir synonyms
+            "mkdir" | "create_dir" | "create_directory" | "makedir" => "mkdir".to_string(),
+            other => other.to_string(),
+        };
         let path = match params["path"].as_str() {
             Some(p) if !p.is_empty() => p.to_string(),
-            _ => return ToolResult::err(ErrorType::Tool, "missing_path", "params.path is required"),
+            _ => {
+                return ToolResult::err(ErrorType::Tool, "missing_path", "params.path is required")
+            }
         };
 
         match action.as_str() {
@@ -131,6 +170,23 @@ impl Tool for FilesystemTool {
                 )
             }
 
+            "mkdir" => {
+                let full = self.resolve(&path);
+                match std::fs::create_dir_all(&full) {
+                    Ok(_) => ToolResult::ok(
+                        json!({
+                            "path": full.display().to_string(),
+                            "created": true
+                        }),
+                        Some(json!({
+                            "type": "filesystem_mkdir",
+                            "path": full.display().to_string()
+                        })),
+                    ),
+                    Err(e) => ToolResult::err(ErrorType::Env, "mkdir_failed", &e.to_string()),
+                }
+            }
+
             "read" => {
                 let full = self.resolve(&path);
                 match std::fs::read(&full) {
@@ -150,9 +206,11 @@ impl Tool for FilesystemTool {
                             })),
                         )
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        ToolResult::err(ErrorType::Tool, "file_not_found", &full.display().to_string())
-                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => ToolResult::err(
+                        ErrorType::Tool,
+                        "file_not_found",
+                        &full.display().to_string(),
+                    ),
                     Err(e) => ToolResult::err(ErrorType::Env, "read_failed", &e.to_string()),
                 }
             }
@@ -185,15 +243,34 @@ impl Tool for FilesystemTool {
             "find" => {
                 let pattern = match params.get("pattern").and_then(|v| v.as_str()) {
                     Some(p) if !p.trim().is_empty() => p.to_lowercase(),
-                    _ => return ToolResult::err(ErrorType::Tool, "missing_param", "params.pattern is required"),
+                    _ => {
+                        return ToolResult::err(
+                            ErrorType::Tool,
+                            "missing_param",
+                            "params.pattern is required",
+                        )
+                    }
                 };
-                let max_depth = params.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(6) as usize;
-                let max_files = params.get("max_files").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
-                let max_results = params.get("max_results").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+                let max_depth = params
+                    .get("max_depth")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(6) as usize;
+                let max_files = params
+                    .get("max_files")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(4000) as usize;
+                let max_results = params
+                    .get("max_results")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(200) as usize;
 
                 let root = self.resolve(&path);
                 if !root.is_dir() {
-                    return ToolResult::err(ErrorType::Tool, "not_a_directory", &root.display().to_string());
+                    return ToolResult::err(
+                        ErrorType::Tool,
+                        "not_a_directory",
+                        &root.display().to_string(),
+                    );
                 }
 
                 let start = Instant::now();
@@ -237,12 +314,27 @@ impl Tool for FilesystemTool {
             "grep" => {
                 let query_raw = match params.get("query").and_then(|v| v.as_str()) {
                     Some(q) if !q.trim().is_empty() => q.to_string(),
-                    _ => return ToolResult::err(ErrorType::Tool, "missing_param", "params.query is required"),
+                    _ => {
+                        return ToolResult::err(
+                            ErrorType::Tool,
+                            "missing_param",
+                            "params.query is required",
+                        )
+                    }
                 };
                 let query = query_raw.to_lowercase();
-                let max_depth = params.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(6) as usize;
-                let max_files = params.get("max_files").and_then(|v| v.as_u64()).unwrap_or(1500) as usize;
-                let max_results = params.get("max_results").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+                let max_depth = params
+                    .get("max_depth")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(6) as usize;
+                let max_files = params
+                    .get("max_files")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1500) as usize;
+                let max_results = params
+                    .get("max_results")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(200) as usize;
                 let max_bytes_per_file = params
                     .get("max_bytes_per_file")
                     .and_then(|v| v.as_u64())
@@ -250,7 +342,11 @@ impl Tool for FilesystemTool {
 
                 let root = self.resolve(&path);
                 if !root.is_dir() {
-                    return ToolResult::err(ErrorType::Tool, "not_a_directory", &root.display().to_string());
+                    return ToolResult::err(
+                        ErrorType::Tool,
+                        "not_a_directory",
+                        &root.display().to_string(),
+                    );
                 }
 
                 let start = Instant::now();
@@ -314,7 +410,11 @@ impl Tool for FilesystemTool {
             "delete" => {
                 let full = self.resolve(&path);
                 if !full.exists() {
-                    return ToolResult::err(ErrorType::Tool, "file_not_found", &full.display().to_string());
+                    return ToolResult::err(
+                        ErrorType::Tool,
+                        "file_not_found",
+                        &full.display().to_string(),
+                    );
                 }
                 let result = if full.is_dir() {
                     std::fs::remove_dir_all(&full)
@@ -324,7 +424,9 @@ impl Tool for FilesystemTool {
                 match result {
                     Ok(_) => ToolResult::ok(
                         json!({ "deleted": full.display().to_string() }),
-                        Some(json!({ "type": "filesystem_delete", "path": full.display().to_string() })),
+                        Some(
+                            json!({ "type": "filesystem_delete", "path": full.display().to_string() }),
+                        ),
                     ),
                     Err(e) => ToolResult::err(ErrorType::Env, "delete_failed", &e.to_string()),
                 }
@@ -365,10 +467,16 @@ mod tests {
             }))
             .await;
         assert!(r.success, "find should succeed");
-        let matches = r.output.unwrap().get("matches").cloned().unwrap_or(Value::Null);
+        let matches = r
+            .output
+            .unwrap()
+            .get("matches")
+            .cloned()
+            .unwrap_or(Value::Null);
         let arr = matches.as_array().cloned().unwrap_or_default();
         assert!(
-            arr.iter().any(|v| v.as_str().unwrap_or("").ends_with("src/main.rs")),
+            arr.iter()
+                .any(|v| v.as_str().unwrap_or("").ends_with("src/main.rs")),
             "expected src/main.rs in matches: {arr:?}"
         );
 
@@ -396,9 +504,14 @@ mod tests {
             .await;
         assert!(r.success, "grep should succeed");
         let out = r.output.unwrap();
-        let hits = out.get("matches").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let hits = out
+            .get("matches")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         assert!(
-            hits.iter().any(|h| h.get("path").and_then(|p| p.as_str()) == Some("notes.txt")),
+            hits.iter()
+                .any(|h| h.get("path").and_then(|p| p.as_str()) == Some("notes.txt")),
             "expected notes.txt hit: {hits:?}"
         );
 

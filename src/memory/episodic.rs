@@ -1,3 +1,12 @@
+//! Episodic memory (run history).
+//!
+//! Stores one record per run in SQLite: the original request, plan JSON, artifacts JSON,
+//! timings, critic scores, and whether the run succeeded.
+//!
+//! Why “episodic”:
+//! - It enables replay/debugging (“what tools ran, what outputs existed, why did it fail?”).
+//! - It’s also useful for product analytics (latency, repair rates, failure counts).
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -5,6 +14,9 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 /// A completed task record persisted to SQLite.
+///
+/// Most fields are persisted as-is; artifacts are stored as JSON text to avoid migrations
+/// as the artifact schema evolves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub task_id: Uuid,
@@ -20,11 +32,13 @@ pub struct TaskRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// SQLite-backed store for `TaskRecord`s.
 pub struct EpisodicMemory {
     pool: SqlitePool,
 }
 
 impl EpisodicMemory {
+    /// Open (or create) the tasks database and ensure required tables exist.
     pub async fn new(db_path: &str) -> Result<Self> {
         let url = format!("sqlite:{db_path}?mode=rwc");
         let pool = SqlitePool::connect(&url).await?;
@@ -55,6 +69,7 @@ impl EpisodicMemory {
         Ok(Self { pool })
     }
 
+    /// Persist a `TaskRecord` (upsert by `task_id`).
     pub async fn save(&self, record: &TaskRecord) -> Result<()> {
         let critic_scores = serde_json::to_string(&record.critic_scores)?;
         sqlx::query(
@@ -80,17 +95,17 @@ impl EpisodicMemory {
         Ok(())
     }
 
+    /// Fetch most recent `n` task records.
     pub async fn recent(&self, n: i64) -> Result<Vec<TaskRecord>> {
-        let rows = sqlx::query(
-            "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?",
-        )
-        .bind(n)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query("SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?")
+            .bind(n)
+            .fetch_all(&self.pool)
+            .await?;
 
         rows.iter().map(|row| parse_row(row)).collect()
     }
 
+    /// Fetch a single task record by id.
     pub async fn get_by_id(&self, task_id: &str) -> Result<Option<TaskRecord>> {
         let row = sqlx::query("SELECT * FROM tasks WHERE task_id = ?")
             .bind(task_id)
@@ -120,9 +135,7 @@ impl EpisodicMemory {
 
     /// Hard-delete every task record.
     pub async fn clear_all(&self) -> Result<()> {
-        sqlx::query("DELETE FROM tasks")
-            .execute(&self.pool)
-            .await?;
+        sqlx::query("DELETE FROM tasks").execute(&self.pool).await?;
         Ok(())
     }
 
@@ -142,6 +155,10 @@ impl EpisodicMemory {
     }
 }
 
+/// Convert a raw SQL row into a typed `TaskRecord`.
+///
+/// Why this exists:
+/// - Keeps SQLx row parsing in one place so schema changes are easier to manage.
 fn parse_row(row: &sqlx::sqlite::SqliteRow) -> Result<TaskRecord> {
     use sqlx::Row;
     let task_id: String = row.get("task_id");

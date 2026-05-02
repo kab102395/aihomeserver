@@ -1,3 +1,9 @@
+//! Runtime configuration.
+//!
+//! `ServerConfig` is persisted to `config.json` and can be updated at runtime via `POST /settings`.
+//! The config is stored behind an `Arc<RwLock<...>>` so handlers and background runs can read it
+//! concurrently while updates remain atomic.
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -28,6 +34,18 @@ pub struct ServerConfig {
     #[serde(default)]
     pub search_url: String,
 
+    /// Auto-save assistant outputs into the Knowledge Base.
+    /// Values:
+    /// - "off" (default)
+    /// - "research" (only when the plan uses research tools)
+    /// - "always" (for most substantial answers)
+    #[serde(default = "default_auto_kb_mode")]
+    pub auto_kb_mode: String,
+
+    /// Minimum character count before auto-saving to KB (when auto_kb_mode != "off").
+    #[serde(default = "default_auto_kb_min_chars")]
+    pub auto_kb_min_chars: u32,
+
     /// GPU layers to offload to VRAM. 999 = all layers (max GPU use). 0 = CPU only.
     #[serde(default = "default_num_gpu")]
     pub num_gpu: i32,
@@ -36,6 +54,12 @@ pub struct ServerConfig {
     /// 8192 is a good default; 16384 for deep research on large models.
     #[serde(default = "default_num_ctx")]
     pub num_ctx: u32,
+
+    /// Max tokens the model is allowed to generate for a single response.
+    /// Ollama option: `num_predict`.
+    /// If outputs feel "shallow"/cut off, increase this.
+    #[serde(default = "default_num_predict")]
+    pub num_predict: u32,
 
     /// Batch size: tokens processed in parallel during prompt eval.
     /// Higher = GPU works harder before streaming starts. 512 is a good default.
@@ -47,11 +71,32 @@ pub struct ServerConfig {
     pub num_thread: u32,
 }
 
-fn default_num_gpu() -> i32 { 999 }
-fn default_num_ctx() -> u32 { 8192 }
-fn default_num_batch() -> u32 { 1024 }
+/// Default: offload all layers to GPU when possible.
+fn default_num_gpu() -> i32 {
+    999
+}
+/// Default context window used for LLM calls.
+fn default_num_ctx() -> u32 {
+    8192
+}
+/// Default generation token cap for LLM calls.
+fn default_num_predict() -> u32 {
+    2048
+}
+/// Default batch size used by Ollama during prompt evaluation.
+fn default_num_batch() -> u32 {
+    1024
+}
+fn default_auto_kb_mode() -> String {
+    // Fast + high signal default: only save when the run already used research tools.
+    "research".into()
+}
+fn default_auto_kb_min_chars() -> u32 {
+    1800
+}
 
 impl Default for ServerConfig {
+    /// Default config values for a local developer deployment.
     fn default() -> Self {
         // Resolve workspace relative to the binary's directory so it's
         // predictable regardless of where the binary is invoked from.
@@ -69,8 +114,11 @@ impl Default for ServerConfig {
             max_steps: 20,
             risk_gate_threshold: 8,
             search_url: String::new(),
+            auto_kb_mode: default_auto_kb_mode(),
+            auto_kb_min_chars: default_auto_kb_min_chars(),
             num_gpu: 999,
             num_ctx: 8192,
+            num_predict: 2048,
             num_batch: 1024,
             num_thread: 0,
         }

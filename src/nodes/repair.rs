@@ -1,3 +1,14 @@
+//! Repair node.
+//!
+//! Responsibility:
+//! - Take critic feedback and attempt to fix the *last* step’s output/tool call.
+//! - Increment `repair_cycle` and write the repaired result back into artifacts.
+//!
+//! Why repair exists instead of replanning immediately:
+//! - Many failures are “local” (bad JSON, wrong shell syntax, missing param).
+//! - Repair is cheaper/faster than throwing away the plan and starting over.
+//! - A hard limit prevents infinite loops; after N repairs we replan.
+
 use anyhow::Result;
 
 use crate::{
@@ -5,6 +16,7 @@ use crate::{
     state::SystemState,
 };
 
+/// Best-effort container detection used to tune shell syntax guidance for repairs.
 fn in_container() -> bool {
     if std::path::Path::new("/.dockerenv").exists() {
         return true;
@@ -16,9 +28,11 @@ fn in_container() -> bool {
     false
 }
 
+/// Prompt used when the previous step was an LLM-only output.
 const REPAIR_TEXT_PROMPT: &str = r#"You are a repair agent. Apply the critic's feedback to fix the last step output.
 Output only the corrected content (no explanations, no preamble)."#;
 
+/// Prompt used when the previous step was a tool call that needs to be regenerated.
 fn repair_tool_prompt() -> String {
     let os = std::env::consts::OS;
     let shell_hint = if os == "windows" {
@@ -49,6 +63,7 @@ Rules:
     )
 }
 
+/// Attempt to repair the last failed step using the latest critic feedback.
 pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemState> {
     state.repair_cycle += 1;
     state.log_meta(
@@ -151,7 +166,8 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
                 "Repaired text artifact",
                 serde_json::json!({ "output_key": output_key }),
             );
-            state.artifacts
+            state
+                .artifacts
                 .insert(output_key, serde_json::Value::String(repaired));
         }
         Err(e) => {
@@ -166,4 +182,3 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
 
     Ok(state)
 }
-

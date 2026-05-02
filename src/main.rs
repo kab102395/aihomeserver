@@ -1,3 +1,15 @@
+//! Application entry point.
+//!
+//! This binary wires together:
+//! - HTTP server (`axum`) with embedded UIs (`/` and `/learn`)
+//! - the agent runtime (`Orchestrator` + `nodes/*`)
+//! - tools (`tools/*`) as the only side-effect surface area
+//! - persistence (SQLite-backed `memory/*`)
+//! - runtime config (`config.rs`) and metrics (`metrics.rs`)
+//!
+//! If you’re explaining the system, this is the best “start here” file because it
+//! shows dependency injection: what gets constructed and how it’s shared.
+
 mod api;
 mod config;
 mod grounding;
@@ -18,28 +30,65 @@ use tracing_subscriber::EnvFilter;
 use std::collections::HashMap;
 
 use crate::{
-    api::server::{AppState, ApprovalGates, TaskStore, router},
+    api::server::{router, AppState, ApprovalGates, TaskStore},
     config::ServerConfig,
     llm::ollama::OllamaClient,
     memory::{
-        conversation::ConversationStore,
-        episodic::EpisodicMemory,
-        semantic::SemanticMemory,
+        conversation::ConversationStore, episodic::EpisodicMemory, semantic::SemanticMemory,
+        sources::SourceCacheStore,
     },
-    orchestrator::Orchestrator,
     metrics::RuntimeMetrics,
+    orchestrator::Orchestrator,
     tools::{
-        filesystem::FilesystemTool,
-        git::GitTool,
-        http_fetch::HttpFetchTool,
-        parallel_search::ParallelSearchTool,
-        save_knowledge::SaveKnowledgeTool,
-        shell::ShellTool,
-        web_search::WebSearchTool,
-        ToolRegistry,
+        filesystem::FilesystemTool, git::GitTool, http_fetch::HttpFetchTool,
+        parallel_search::ParallelSearchTool, save_knowledge::SaveKnowledgeTool, shell::ShellTool,
+        web_search::WebSearchTool, ToolRegistry,
     },
 };
 
+fn in_container() -> bool {
+    if std::path::Path::new("/.dockerenv").exists() {
+        return true;
+    }
+    if let Ok(cgroup) = std::fs::read_to_string("/proc/1/cgroup") {
+        let c = cgroup.to_lowercase();
+        return c.contains("docker") || c.contains("containerd") || c.contains("kubepods");
+    }
+    false
+}
+
+async fn searxng_healthy(base_url: &str) -> bool {
+    let url = format!(
+        "{}/search?q=aihomeserver%20healthcheck&format=json&categories=general&language=en",
+        base_url.trim_end_matches('/')
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .user_agent("aihomeserver/healthcheck")
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    let v: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    v.get("results").and_then(|x| x.as_array()).is_some()
+}
+
+/// Program entry point.
+///
+/// Connection:
+/// - Loads config, initializes stores/tools/orchestrator, and starts the Axum server.
 #[tokio::main]
 async fn main() -> Result<()> {
     // Logging: RUST_LOG=aihomeserver=debug,info
@@ -71,17 +120,59 @@ async fn main() -> Result<()> {
     let mut cfg = ServerConfig::load(&config_path).await;
 
     // Env-var overrides — useful in Docker Compose without touching config.json
-    if let Ok(url) = std::env::var("OLLAMA_URL")  { cfg.ollama_url  = url; }
-    if let Ok(url) = std::env::var("SEARCH_URL")  { cfg.search_url  = url; }
-    if let Ok(ws)  = std::env::var("WORKSPACE")   { cfg.workspace_path = ws; }
+    if let Ok(url) = std::env::var("OLLAMA_URL") {
+        cfg.ollama_url = url;
+    }
+    if let Ok(url) = std::env::var("SEARCH_URL") {
+        cfg.search_url = url;
+    }
+    if let Ok(ws) = std::env::var("WORKSPACE") {
+        cfg.workspace_path = ws;
+    }
+
+    // If no search URL is configured, prefer a local SearXNG if it's reachable.
+    // This makes grounded research far more reliable than scraping DDG/Bing.
+    if cfg.search_url.trim().is_empty() {
+        let candidates: &[&str] = if in_container() {
+            &["http://searxng:8080", "http://localhost:8080"]
+        } else {
+            &[
+                "http://localhost:8080",
+                "http://127.0.0.1:8080",
+                "http://localhost:8888",
+                "http://127.0.0.1:8888",
+            ]
+        };
+
+        for c in candidates {
+            if searxng_healthy(c).await {
+                cfg.search_url = c.to_string();
+                info!("Auto-detected SearXNG: {}", cfg.search_url);
+                break;
+            }
+        }
+    }
 
     cfg.ensure_workspace().ok();
     info!("Data dir:  {}", data_dir.display());
     info!("Workspace: {}", cfg.workspace_path);
-    info!("Models:    fast={} critic={}", cfg.fast_model, cfg.critic_model);
+    info!(
+        "Models:    fast={} critic={}",
+        cfg.fast_model, cfg.critic_model
+    );
     if !cfg.search_url.is_empty() {
         info!("Search:    {}", cfg.search_url);
     }
+
+    // Repo root for the `/learn` interview-prep site.
+    // Default: current working directory; override with REPO_ROOT if needed.
+    let repo_root = std::env::var("REPO_ROOT")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        });
+    info!("Repo root: {}", repo_root.display());
 
     let config = Arc::new(RwLock::new(cfg.clone()));
 
@@ -96,7 +187,9 @@ async fn main() -> Result<()> {
     tools.register(FilesystemTool::new(&cfg.workspace_path)?);
     tools.register(ShellTool);
     tools.register(GitTool::new(&cfg.workspace_path));
-    tools.register(HttpFetchTool::new());
+    let sources_db_path = data_dir.join("sources.db").to_string_lossy().into_owned();
+    let sources = Arc::new(SourceCacheStore::new(&sources_db_path).await?);
+    tools.register(HttpFetchTool::new(Some(Arc::clone(&sources))));
     tools.register(WebSearchTool::new(Arc::clone(&config)));
     tools.register(ParallelSearchTool::new(Arc::clone(&config)));
 
@@ -124,9 +217,7 @@ async fn main() -> Result<()> {
     let db_path = data_dir.join("episodic.db").to_string_lossy().into_owned();
 
     // ── Episodic memory (SQLite) ──────────────────────────────────────────────
-    let memory = Arc::new(Mutex::new(
-        EpisodicMemory::new(&db_path).await?,
-    ));
+    let memory = Arc::new(Mutex::new(EpisodicMemory::new(&db_path).await?));
 
     // ── Conversation memory ───────────────────────────────────────────────────
     let conversations = Arc::new(ConversationStore::new(&db_path).await?);
@@ -147,7 +238,9 @@ async fn main() -> Result<()> {
         conversations,
         semantic,
         knowledge: knowledge_store,
+        sources,
         task_store,
+        repo_root,
         approval_gates,
         config,
         metrics,

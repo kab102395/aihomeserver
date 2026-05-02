@@ -1,3 +1,12 @@
+//! In-memory runtime metrics.
+//!
+//! This module tracks counters/latencies for:
+//! - tasks (runs)
+//! - tool calls
+//! - eval runs
+//!
+//! It’s intentionally simple (in-memory only) and is exposed over `GET /metrics`.
+
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,6 +22,7 @@ struct LatencyAgg {
 }
 
 impl LatencyAgg {
+    /// Record one latency measurement into the aggregate.
     fn record(&self, duration: Duration) {
         let ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
         self.count.fetch_add(1, Ordering::Relaxed);
@@ -29,11 +39,16 @@ impl LatencyAgg {
         }
     }
 
+    /// Create a serializable snapshot (count/sum/avg/max).
     fn snapshot(&self) -> LatencyAggSnapshot {
         let count = self.count.load(Ordering::Relaxed);
         let sum_ms = self.sum_ms.load(Ordering::Relaxed);
         let max_ms = self.max_ms.load(Ordering::Relaxed);
-        let avg_ms = if count == 0 { 0.0 } else { sum_ms as f64 / count as f64 };
+        let avg_ms = if count == 0 {
+            0.0
+        } else {
+            sum_ms as f64 / count as f64
+        };
         LatencyAggSnapshot {
             count,
             sum_ms,
@@ -88,6 +103,7 @@ struct ToolCountersAgg {
 }
 
 impl ToolCountersAgg {
+    /// Record one tool call into this per-tool aggregate.
     fn record(&mut self, ok: bool, duration: Duration) {
         self.total += 1;
         if ok {
@@ -98,6 +114,7 @@ impl ToolCountersAgg {
         self.latency.record(duration);
     }
 
+    /// Create a serializable snapshot of per-tool counters/latency.
     fn snapshot(&self) -> ToolCounters {
         ToolCounters {
             total: self.total,
@@ -109,6 +126,7 @@ impl ToolCountersAgg {
 }
 
 impl RuntimeMetrics {
+    /// Create a fresh metrics collector (all counters zero).
     pub fn new() -> Self {
         Self {
             started_at: Instant::now(),
@@ -127,10 +145,12 @@ impl RuntimeMetrics {
         }
     }
 
+    /// Increment the “tasks started” counter.
     pub fn record_task_started(&self) {
         self.tasks_started.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a finished task (success/failure + latency).
     pub fn record_task_finished(&self, ok: bool, duration: Duration) {
         if ok {
             self.tasks_completed.fetch_add(1, Ordering::Relaxed);
@@ -140,6 +160,7 @@ impl RuntimeMetrics {
         self.task_latency.record(duration);
     }
 
+    /// Record a tool call (success/failure + latency), grouped by tool name.
     pub async fn record_tool_call(&self, tool: &str, ok: bool, duration: Duration) {
         self.tool_calls_total.fetch_add(1, Ordering::Relaxed);
         if ok {
@@ -150,10 +171,17 @@ impl RuntimeMetrics {
         self.tool_latency.record(duration);
 
         let mut by = self.tool_by_name.lock().await;
-        let entry = by.entry(tool.to_string()).or_insert_with(ToolCountersAgg::default);
+        let entry = by
+            .entry(tool.to_string())
+            .or_insert_with(ToolCountersAgg::default);
         entry.record(ok, duration);
     }
 
+    /// Record a completed eval run (success/failure + latency).
+    ///
+    /// Connection:
+    /// - Called by eval endpoints and deep health checks.
+    /// - Exposed via `GET /metrics` for observability.
     pub fn record_eval_run(&self, ok: bool, duration: Duration) {
         self.eval_runs_total.fetch_add(1, Ordering::Relaxed);
         if !ok {
@@ -162,6 +190,10 @@ impl RuntimeMetrics {
         self.eval_latency.record(duration);
     }
 
+    /// Build a point-in-time snapshot for the metrics endpoint.
+    ///
+    /// Connection:
+    /// - `GET /metrics` calls this to return structured counters/latencies to the UI.
     pub async fn snapshot(&self) -> MetricsSnapshot {
         let tool_by_name = {
             let by = self.tool_by_name.lock().await;
@@ -240,8 +272,10 @@ mod tests {
         m.record_task_started();
         m.record_task_finished(true, Duration::from_millis(12));
 
-        m.record_tool_call("shell", true, Duration::from_millis(5)).await;
-        m.record_tool_call("shell", false, Duration::from_millis(7)).await;
+        m.record_tool_call("shell", true, Duration::from_millis(5))
+            .await;
+        m.record_tool_call("shell", false, Duration::from_millis(7))
+            .await;
         m.record_eval_run(true, Duration::from_millis(3));
 
         let snap = m.snapshot().await;

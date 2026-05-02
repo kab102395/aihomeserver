@@ -2,18 +2,30 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use crate::state::{ErrorType, ToolResult};
 use super::Tool;
+use crate::state::{ErrorType, ToolResult};
 
+/// Tool for running basic git operations in a configured repository directory.
+///
+/// Connection:
+/// - Used when plans explicitly bind to `git` (or when UI endpoints invoke git indirectly).
+/// - Returns structured stdout/stderr so the critic/repair loop can react to failures.
 pub struct GitTool {
     repo_path: PathBuf,
 }
 
 impl GitTool {
+    /// Create a git tool rooted at `repo_path`.
     pub fn new(repo_path: impl Into<PathBuf>) -> Self {
-        Self { repo_path: repo_path.into() }
+        Self {
+            repo_path: repo_path.into(),
+        }
     }
 
+    /// Run the `git` binary with args and capture output.
+    ///
+    /// Why this exists:
+    /// - Centralizes process spawning so all git actions share the same cwd and error shape.
     async fn git(&self, args: &[&str]) -> Result<std::process::Output, std::io::Error> {
         tokio::process::Command::new("git")
             .args(args)
@@ -22,6 +34,10 @@ impl GitTool {
             .await
     }
 
+    /// Convert a `git` process output into a normalized `ToolResult`.
+    ///
+    /// Connection:
+    /// - Tool results are persisted as artifacts and shown in the UI.
     fn to_result(out: std::process::Output, action: &str) -> ToolResult {
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -44,8 +60,12 @@ impl GitTool {
 
 #[async_trait]
 impl Tool for GitTool {
-    fn name(&self) -> &str { "git" }
+    /// Canonical tool name used in planner/executor `tool_binding`.
+    fn name(&self) -> &str {
+        "git"
+    }
 
+    /// Execute a git action (`status`, `diff`, `log`, `add`, `commit`, ...).
     async fn execute(&self, params: Value) -> ToolResult {
         let action = params["action"].as_str().unwrap_or("").to_string();
 
@@ -87,7 +107,13 @@ impl Tool for GitTool {
             "commit" => {
                 let message = match params["message"].as_str() {
                     Some(m) => m.to_string(),
-                    None => return ToolResult::err(ErrorType::Tool, "missing_message", "params.message required for git commit"),
+                    None => {
+                        return ToolResult::err(
+                            ErrorType::Tool,
+                            "missing_message",
+                            "params.message required for git commit",
+                        )
+                    }
                 };
                 match self.git(&["commit", "-m", &message]).await {
                     Ok(out) => {
@@ -104,7 +130,9 @@ impl Tool for GitTool {
                         if exit_code == 0 {
                             ToolResult::ok(
                                 json!({ "stdout": stdout, "sha": sha }),
-                                Some(json!({ "type": "git_commit", "sha": sha, "message": message })),
+                                Some(
+                                    json!({ "type": "git_commit", "sha": sha, "message": message }),
+                                ),
                             )
                         } else {
                             let stderr = String::from_utf8_lossy(&out.stderr).to_string();

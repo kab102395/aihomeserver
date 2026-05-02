@@ -39,9 +39,11 @@ dependencies = [
  "axum",
  "chrono",
  "futures",
+ "hex",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "tokio",
@@ -50,6 +52,7 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

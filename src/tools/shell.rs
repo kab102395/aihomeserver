@@ -26,6 +26,12 @@ fn default_cwd() -> String {
 }
 
 #[cfg(not(windows))]
+/// Heuristic: detect PowerShell-ish commands when running on POSIX.
+///
+/// Connection:
+/// - The executor generates shell commands from LLM output.
+/// - If the model emits PowerShell cmdlets on Linux, we fail fast so the Repair node
+///   can regenerate a correct command instead of executing nonsense.
 fn looks_like_powershell(command: &str) -> bool {
     let c = command.to_lowercase();
     [
@@ -45,6 +51,10 @@ fn looks_like_powershell(command: &str) -> bool {
 }
 
 #[cfg(windows)]
+/// Heuristic: detect POSIX-ish commands when running on Windows PowerShell.
+///
+/// Connection:
+/// - Used to fail fast with a clear error so Repair can switch syntax.
 fn looks_like_posix_shell(command: &str) -> bool {
     let c = command.to_lowercase();
     c.contains(" | head ")
@@ -58,18 +68,31 @@ fn looks_like_posix_shell(command: &str) -> bool {
         || c.contains('`')
 }
 
+/// Tool implementation for running shell commands on the server host.
+///
+/// Safety note:
+/// - The orchestration layer can require human approval for high-risk plans.
+/// - This tool adds an extra guardrail by rejecting obviously wrong shell syntax for the OS.
 pub struct ShellTool;
 
 #[async_trait]
 impl Tool for ShellTool {
+    /// Canonical tool name used in planner/executor `tool_binding`.
     fn name(&self) -> &str {
         "shell"
     }
 
+    /// Execute a command in the server’s shell (PowerShell on Windows, `sh -lc` on POSIX).
     async fn execute(&self, params: Value) -> ToolResult {
         let command = match params["command"].as_str() {
             Some(c) if !c.is_empty() => c.to_string(),
-            _ => return ToolResult::err(ErrorType::Tool, "missing_command", "params.command is required"),
+            _ => {
+                return ToolResult::err(
+                    ErrorType::Tool,
+                    "missing_command",
+                    "params.command is required",
+                )
+            }
         };
 
         let timeout_secs = params["timeout_secs"].as_u64().unwrap_or(30);

@@ -158,6 +158,31 @@ body {
   text-overflow: ellipsis;
   min-width: 0;
 }
+.history-item .sess-badge {
+  font-size: 10px;
+  line-height: 1.2;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  background: rgba(255,255,255,0.03);
+  flex-shrink: 0;
+}
+.history-item .sess-badge.running {
+  color: #d7c88a;
+  border-color: rgba(215,200,138,0.35);
+  background: rgba(215,200,138,0.08);
+}
+.history-item .sess-badge.ok {
+  color: #7fd18e;
+  border-color: rgba(127,209,142,0.35);
+  background: rgba(127,209,142,0.08);
+}
+.history-item .sess-badge.fail {
+  color: #e08a8a;
+  border-color: rgba(224,138,138,0.35);
+  background: rgba(224,138,138,0.08);
+}
 /* Action buttons — shown on hover */
 .item-actions {
   display: none;
@@ -548,6 +573,8 @@ body {
 .kb-entry-full { display:none; margin-top:8px; font-size:11px; color:var(--text-dim);
   background:#111; border-radius:4px; padding:8px; max-height:300px; overflow-y:auto;
   white-space:pre-wrap; line-height:1.5; border:1px solid var(--border); }
+.kb-entry-full a { color: var(--accent); text-decoration: none; }
+.kb-entry-full a:hover { text-decoration: underline; }
 .kb-entry.open .kb-entry-full { display:block; }
 .kb-entry-actions { display:flex; gap:6px; margin-top:6px; }
 .kb-btn { font-size:10px; padding:2px 8px; border-radius:3px; border:1px solid var(--border);
@@ -846,6 +873,41 @@ body {
 #messages::-webkit-scrollbar { width: 6px; }
 #messages::-webkit-scrollbar-track { background: transparent; }
 #messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+#jump-bottom {
+  position: fixed;
+  right: 18px;
+  bottom: 84px;
+  z-index: 900;
+  display: none;
+  background: rgba(30,30,30,0.92);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+}
+#jump-bottom:hover { border-color: var(--text-muted); }
+
+.tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 6px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 1;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  background: #141414;
+}
+.tab-badge.running { color: #caa05a; border-color: rgba(202,160,90,0.35); background: rgba(202,160,90,0.10); }
+.tab-badge.ok      { color: #66b06f; border-color: rgba(102,176,111,0.35); background: rgba(102,176,111,0.10); }
+.tab-badge.fail    { color: #d06a6a; border-color: rgba(208,106,106,0.35); background: rgba(208,106,106,0.10); }
 
 .turn {
   max-width: 720px;
@@ -1921,6 +1983,7 @@ body.admin-active { outline: 2px solid rgba(200,60,60,0.3); }
     <div id="kb-toolbar">
       <input type="text" id="kb-search" placeholder="Filter topics…" oninput="filterKb()" />
       <button class="kb-add-btn" onclick="openKbModal(null)">+ Add</button>
+      <button class="kb-add-btn" style="background:#2a2a2a;color:var(--text-muted);border:1px solid var(--border)" onclick="exportKbAll()">Export</button>
       <button class="tree-refresh-btn" onclick="loadKb()" title="Refresh">↻</button>
     </div>
     <div id="kb-list">
@@ -1955,6 +2018,7 @@ body.admin-active { outline: 2px solid rgba(200,60,60,0.3); }
     <span class="title" id="top-title">New conversation</span>
     <span class="status-pill" id="status-pill">● online</span>
     <button id="search-btn" onclick="openSearch()" title="Search workspace (Ctrl+K)" style="background:none;border:1px solid var(--border);color:var(--text-muted);cursor:pointer;padding:4px 8px;border-radius:6px;font-size:12px;flex-shrink:0;transition:all .15s;display:flex;align-items:center;gap:4px">🔍 Search</button>
+    <a id="learn-btn" href="/learn" title="Interview-mode Learn site" style="text-decoration:none;background:none;border:1px solid var(--border);color:var(--text-muted);cursor:pointer;padding:4px 8px;border-radius:6px;font-size:12px;flex-shrink:0;transition:all .15s;display:flex;align-items:center;gap:4px">📚 Learn</a>
     <button id="export-btn" onclick="exportConversation()" title="Export conversation as Markdown" style="background:none;border:1px solid var(--border);color:var(--text-muted);cursor:pointer;padding:4px 8px;border-radius:6px;font-size:13px;flex-shrink:0;transition:all .15s;line-height:1">⬇</button>
     <button id="settings-toggle" onclick="toggleSettings()" title="Settings">⚙</button>
   </div>
@@ -1971,6 +2035,7 @@ body.admin-active { outline: 2px solid rgba(200,60,60,0.3); }
       </div>
     </div>
   </div>
+  <button id="jump-bottom" onclick="jumpToBottom()">↓ New messages</button>
 
   <div id="input-wrap">
     <div id="context-bar"></div>
@@ -2063,6 +2128,11 @@ body.admin-active { outline: 2px solid rgba(200,60,60,0.3); }
         <div class="field-hint">4096 default (fast) · 8192 for deep research · needs VRAM to match</div>
       </div>
       <div class="settings-field">
+        <label>Max output tokens <span style="color:var(--text-dim)">(num_predict)</span></label>
+        <input type="number" id="cfg-num-predict" min="128" max="16384" step="128" />
+        <div class="field-hint">Hard cap on response length. Raise this if answers feel shallow/cut off.</div>
+      </div>
+      <div class="settings-field">
         <label>Batch size <span style="color:var(--text-dim)">(num_batch)</span></label>
         <input type="number" id="cfg-num-batch" min="64" max="2048" step="64" />
         <div class="field-hint">512 default · higher = GPU processes more tokens per pass (needs VRAM)</div>
@@ -2096,6 +2166,20 @@ body.admin-active { outline: 2px solid rgba(200,60,60,0.3); }
           <span class="settings-range-val" id="cfg-risk-val">8</span>
         </div>
         <div class="field-hint">1 = approve everything · 10 = never ask</div>
+      </div>
+      <div class="settings-field">
+        <label>Auto-save to KB</label>
+        <select id="cfg-auto-kb-mode" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:6px 8px;font-size:12px">
+          <option value="off">Off</option>
+          <option value="research">Research only</option>
+          <option value="always">Always (substantial answers)</option>
+        </select>
+        <div class="field-hint">Saves useful outputs into KB after the answer returns (background).</div>
+      </div>
+      <div class="settings-field">
+        <label>Auto-save min chars</label>
+        <input type="number" id="cfg-auto-kb-min" min="200" max="50000" />
+        <div class="field-hint">Skip auto-save when the content is shorter than this.</div>
       </div>
     </div>
   </div>
@@ -2164,10 +2248,145 @@ body.admin-active { outline: 2px solid rgba(200,60,60,0.3); }
 
 <script>
 const msgsEl = document.getElementById('messages');
+const jumpBottomBtn = document.getElementById('jump-bottom');
+
+let autoScroll = true;
+let activeSidebarTab = 'chat';
+
+function isNearBottom() {
+  const threshold = 90;
+  return (msgsEl.scrollTop + msgsEl.clientHeight) >= (msgsEl.scrollHeight - threshold);
+}
+
+msgsEl.addEventListener('scroll', () => {
+  autoScroll = isNearBottom();
+  if (autoScroll && jumpBottomBtn) jumpBottomBtn.style.display = 'none';
+});
+
+function jumpToBottom() {
+  autoScroll = true;
+  if (jumpBottomBtn) jumpBottomBtn.style.display = 'none';
+  scrollBottom(true);
+}
+
+function setTabBadge(tab, text, cls) {
+  const btn = document.getElementById('tab-btn-' + tab);
+  if (!btn) return;
+  if (!btn.dataset.label) btn.dataset.label = btn.textContent.trim();
+  // Clear
+  if (!text) {
+    btn.innerHTML = esc(btn.dataset.label);
+    return;
+  }
+  const badge = `<span class="tab-badge ${cls||''}">${esc(text)}</span>`;
+  btn.innerHTML = `${esc(btn.dataset.label)}${badge}`;
+}
 const inputEl = document.getElementById('input');
 const sendBtn = document.getElementById('send-btn');
 let busy = false;
 let currentSessionId = null;  // tracks the active session across turns
+
+// Per-session status badges for the sidebar list.
+// key: session_id (string) -> { text, cls }
+const sessionBadges = new Map();
+let activeRunSessionId = null;
+
+function setSessionBadge(sessionId, text, cls) {
+  if (!sessionId) return;
+  if (!text) sessionBadges.delete(sessionId);
+  else sessionBadges.set(sessionId, { text, cls: cls || '' });
+
+  // Update in-place if the item exists; otherwise it will be applied on next refresh.
+  const item = document.querySelector(`.history-item[data-sid="${sessionId}"]`);
+  if (!item) return;
+
+  const existing = item.querySelector('.sess-badge');
+  if (!text) {
+    if (existing) existing.remove();
+    return;
+  }
+
+  const el = existing || document.createElement('span');
+  el.className = `sess-badge ${cls || ''}`.trim();
+  el.textContent = text;
+  if (!existing) {
+    const actions = item.querySelector('.item-actions');
+    if (actions) item.insertBefore(el, actions);
+    else item.appendChild(el);
+  }
+}
+
+// Run persistence + queueing:
+// - Keep receiving stream events even if you navigate away from the running chat.
+// - Re-render the in-progress turn when you come back.
+// - Allow enqueueing messages while another run is busy (runs execute sequentially).
+const runStates = new Map();      // runId -> state
+const sessionActiveRun = new Map(); // sessionId -> runId
+const sendQueue = [];            // FIFO: { session_id, text, answers, ctxPrefix }
+let activeRunId = null;
+
+function ensureRunTurnVisible(runId) {
+  const st = runStates.get(runId);
+  if (!st || !st.session_id) return null;
+  if (currentSessionId !== st.session_id) return null;
+
+  let el = document.querySelector(`.turn.ai[data-run-id="${runId}"]`);
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'turn ai';
+    el.dataset.runId = runId;
+    el.innerHTML = `<div class="ai-label">aihomeserver</div><div class="ai-content"></div>`;
+    msgsEl.appendChild(el);
+  }
+  return el;
+}
+
+function renderRunState(runId) {
+  const st = runStates.get(runId);
+  if (!st) return;
+
+  const el = ensureRunTurnVisible(runId);
+  if (!el) return;
+  const content = el.querySelector('.ai-content');
+  if (!content) return;
+
+  const statusText = st.done
+    ? ((st.success === false || st.error) ? '✗ failed' : '✓ done')
+    : (st.error ? '✗ failed' : phaseLabel(st.phase || 'thinking'));
+  const dotsHtml = st.done || st.error ? '' : '<div class="dots"><span></span><span></span><span></span></div>';
+  const headerHtml = `<div class="thinking">${dotsHtml}${esc(statusText)}</div>`;
+
+  let cotHtml = '';
+  if (st.thinking_text) {
+    const approxTok = Math.round(st.thinking_text.length / 4);
+    cotHtml = `<details class="thinking-details"><summary>🧠 Thought for ~${approxTok} tokens</summary><div class="thinking-trace">${esc(st.thinking_text)}</div></details>`;
+  }
+
+  let reasoningHtml = '';
+  if (st.reasoning_lines && st.reasoning_lines.length > 0) {
+    const uid = `r_${runId}`;
+    reasoningHtml = `
+      <span class="reasoning-toggle" onclick="(function(){const p=document.getElementById('${uid}'); if(!p) return; const open=p.style.display==='block'; p.style.display=open?'none':'block';})()">
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3l3 3 3-3"/></svg> Show reasoning
+      </span>
+      <div class="reasoning-full" id="${uid}" style="display:none">${esc(st.reasoning_lines.join('\n'))}</div>`;
+  }
+
+  const bodyHtml = st.done
+    ? `<div>${renderMarkdown(st.final_answer || '')}</div>`
+    : (st.streaming_started
+        ? `<div class="streaming-content">${esc(st.full_answer || '')}</div>`
+        : '');
+
+  content.innerHTML = headerHtml + cotHtml + bodyHtml + reasoningHtml;
+  scrollBottom();
+}
+
+function maybeShowActiveRunForCurrentSession() {
+  if (!currentSessionId) return;
+  const rid = sessionActiveRun.get(currentSessionId);
+  if (rid) renderRunState(rid);
+}
 
 function toggleSidebar() {
   document.getElementById('sidebar').classList.toggle('collapsed');
@@ -2209,7 +2428,29 @@ function phaseLabel(phase) {
 
 async function send() {
   const text = inputEl.value.trim();
-  if (!text || busy) return;
+  if (!text) return;
+  if (busy && !planMode) {
+    // Queue the request (sequential execution).
+    const prefix = buildContextPrefix();
+    const fullRequest = prefix ? prefix + text : text;
+    const fileNames = Object.values(attachedFiles).map(f => f.name);
+    addUserTurn(text, fileNames);
+    attachedFiles = {};
+    renderContextBar();
+    inputEl.value = '';
+    inputEl.style.height = 'auto';
+
+    const qEl = addThinkingTurn();
+    qEl.dataset.queue = '1';
+    const qContent = qEl.querySelector('.ai-content');
+    if (qContent) {
+      qContent.innerHTML = `<div class="thinking">⏳ Queued…</div><div style="margin-top:6px;color:var(--text-dim);font-size:12px">Will run when the current task finishes.</div>`;
+    }
+
+    sendQueue.push({ session_id: currentSessionId, request: fullRequest, answers: null, queued_el: qEl });
+    if (currentSessionId) setSessionBadge(currentSessionId, '⏳', 'running');
+    return;
+  }
 
   // In plan mode: show questionnaire before sending.
   // Do NOT clear the input yet — restore it if the user cancels.
@@ -2242,11 +2483,39 @@ async function sendWithAnswers(text, answers) {
   renderContextBar();
   const thinkEl = addThinkingTurn();
   const thinkContent = thinkEl.querySelector('.ai-content');
+  setTabBadge('chat', '…', 'running');
+
+  // Track which session is doing work so the user can switch chats while it runs.
+  // For brand new chats, the session_id is assigned server-side; we update once we get `done`.
+  const runSessionAtStart = currentSessionId;
+  activeRunSessionId = runSessionAtStart;
+  if (runSessionAtStart) setSessionBadge(runSessionAtStart, '…', 'running');
+
+  // Persist state so switching chats doesn't visually "wipe" the in-progress run.
+  const runId = 'run_' + Date.now() + '_' + Math.floor(Math.random() * 1e9);
+  activeRunId = runId;
+  thinkEl.dataset.runId = runId;
+  runStates.set(runId, {
+    run_id: runId,
+    session_id: runSessionAtStart,
+    phase: 'planning',
+    success: null,
+    reasoning_lines: [],
+    thinking_text: '',
+    streaming_started: false,
+    full_answer: '',
+    final_answer: '',
+    done: false,
+    error: false,
+  });
+  if (runSessionAtStart) sessionActiveRun.set(runSessionAtStart, runId);
 
   try {
     // Prepend any attached file contents to the request
     const prefix = buildContextPrefix();
     const fullRequest = prefix ? prefix + text : text;
+    const st0 = runStates.get(runId);
+    if (st0) st0.request = fullRequest;
 
     const body = { request: fullRequest };
     if (currentSessionId) body.session_id = currentSessionId;
@@ -2270,6 +2539,7 @@ async function sendWithAnswers(text, answers) {
     let reasoningEl = null;    // live panel inside thinkEl
     let thinkingText = '';     // accumulated qwen3 chain-of-thought text
     let thinkingEl = null;     // live "🧠 Thinking…" indicator element
+    let doneEventReceived = false;
 
     function getOrCreateReasoning() {
       if (!reasoningEl) {
@@ -2283,6 +2553,8 @@ async function sendWithAnswers(text, answers) {
     function addReasoningLine(cls, icon, text) {
       const line = `<span class="r-icon">${icon}</span><span class="r-text">${esc(text)}</span>`;
       reasoningLines.push({ cls, icon, text });
+      const st = runStates.get(runId);
+      if (st) st.reasoning_lines.push(`${icon} ${text}`);
       const div = document.createElement('div');
       div.className = `reasoning-line ${cls}`;
       div.innerHTML = line;
@@ -2307,6 +2579,8 @@ async function sendWithAnswers(text, answers) {
 
           if (currentEventType === 'status') {
             const statusText = phaseLabel(data.phase);
+            const st = runStates.get(runId);
+            if (st) st.phase = data.phase;
             // Update the main thinking label
             const dotsHtml = '<div class="dots"><span></span><span></span><span></span></div>';
             const firstChild = thinkContent.firstChild;
@@ -2318,6 +2592,7 @@ async function sendWithAnswers(text, answers) {
               thinkDiv.innerHTML = dotsHtml + esc(statusText);
               thinkContent.insertBefore(thinkDiv, thinkContent.firstChild);
             }
+            renderRunState(runId);
           } else if (currentEventType === 'plan') {
             const steps = data.steps || [];
             const risk = data.risk || 0;
@@ -2326,6 +2601,7 @@ async function sendWithAnswers(text, answers) {
             steps.forEach((s, i) => {
               addReasoningLine('r-plan', `  ${i+1}.`, s);
             });
+            renderRunState(runId);
           } else if (currentEventType === 'tool_call') {
             addReasoningLine('r-tool', '🔧', `${data.tool}: ${data.action}`);
             // Show URL / query details if present (one line per entry)
@@ -2334,10 +2610,12 @@ async function sendWithAnswers(text, answers) {
                 if (line.trim()) addReasoningLine('r-tool-detail', '  ↳', line.trim());
               });
             }
+            renderRunState(runId);
           } else if (currentEventType === 'tool_done') {
             const cls = data.success ? 'r-tool-done-ok' : 'r-tool-done-fail';
             const icon = data.success ? '✅' : '❌';
             addReasoningLine(cls, icon, `${data.tool} ${data.success ? 'done' : 'failed'}`);
+            renderRunState(runId);
           } else if (currentEventType === 'needs_approval') {
             showApprovalModal(data);
           } else if (currentEventType === 'critic_result') {
@@ -2349,17 +2627,23 @@ async function sendWithAnswers(text, answers) {
                 addReasoningLine('r-critic-fail', '  ↳', issue)
               );
             }
+            renderRunState(runId);
           } else if (currentEventType === 'repair') {
             addReasoningLine('r-repair', '🔧', `Repairing (cycle ${data.cycle})`);
             (data.issues || []).slice(0, 2).forEach(issue =>
               addReasoningLine('r-repair', '  ↳', issue)
             );
+            renderRunState(runId);
           } else if (currentEventType === 'replan') {
             addReasoningLine('r-replan', '🔄', `Replanning from scratch (attempt ${data.attempt})`);
+            renderRunState(runId);
           } else if (currentEventType === 'file_written') {
             addReasoningLine('r-file-written', '💾', `Wrote ${data.path}`);
             // Auto-refresh the editor if this file is currently open
             if (editorCurrentPath === data.path) refreshEditorFile();
+            // Keep the file tree updated as files are created/edited.
+            scheduleFileTreeRefresh();
+            renderRunState(runId);
           } else if (currentEventType === 'terminal_cmd') {
             appendTerminalCmd(data.step, data.command, data.cwd);
           } else if (currentEventType === 'terminal_out') {
@@ -2367,6 +2651,8 @@ async function sendWithAnswers(text, answers) {
           } else if (currentEventType === 'thinking_token') {
             // qwen3 chain-of-thought — accumulate and show live indicator
             thinkingText += data.text;
+            const st = runStates.get(runId);
+            if (st) st.thinking_text = thinkingText;
             if (!thinkingEl) {
               thinkingEl = document.createElement('div');
               thinkingEl.className = 'thinking-live';
@@ -2376,6 +2662,7 @@ async function sendWithAnswers(text, answers) {
             const approxTok = Math.round(thinkingText.length / 4);
             thinkingEl.querySelector('.thinking-count').textContent = ` ~${approxTok} tokens`;
             scrollBottom();
+            renderRunState(runId);
           } else if (currentEventType === 'token') {
             if (!answerEl) {
               // Finalize CoT block — build the collapsed details BEFORE wiping thinkContent
@@ -2418,8 +2705,15 @@ async function sendWithAnswers(text, answers) {
             }
             fullAnswer += data.text;
             answerEl.textContent = fullAnswer;
+            const st = runStates.get(runId);
+            if (st) {
+              st.streaming_started = true;
+              st.full_answer = fullAnswer;
+            }
             scrollBottom();
+            renderRunState(runId);
           } else if (currentEventType === 'done') {
+            doneEventReceived = true;
             if (!answerEl) {
               // Preserve CoT block if present (non-streaming path)
               let savedCoT2 = thinkContent.querySelector('.thinking-details');
@@ -2430,6 +2724,18 @@ async function sendWithAnswers(text, answers) {
               thinkContent.appendChild(div2);
             } else {
               answerEl.innerHTML = renderMarkdown(fullAnswer || data.answer);
+            }
+
+            // Replace the spinner label with a stable completion label.
+            const doneLabel = data.success ? '✓ done' : '✗ failed';
+            const firstChild = thinkContent.firstChild;
+            if (firstChild && firstChild.className === 'thinking') {
+              firstChild.textContent = doneLabel;
+            } else {
+              const doneDiv = document.createElement('div');
+              doneDiv.className = 'thinking';
+              doneDiv.textContent = doneLabel;
+              thinkContent.insertBefore(doneDiv, thinkContent.firstChild);
             }
             // Add reasoning toggle to final turn
             if (reasoningLines.length > 0 && !thinkContent.querySelector('.reasoning-toggle')) {
@@ -2458,27 +2764,236 @@ async function sendWithAnswers(text, answers) {
               thinkContent.appendChild(meta);
             }
 
-            currentSessionId = data.session_id;
+            // The server assigns/returns the definitive session id here.
+            const runSessionId = data.session_id;
+            if (runSessionId) {
+              // Move the running badge (if any) to the new id and mark completion.
+              if (activeRunSessionId && activeRunSessionId !== runSessionId) {
+                setSessionBadge(activeRunSessionId, null);
+              }
+              activeRunSessionId = runSessionId;
+              setSessionBadge(runSessionId, data.success ? '✓' : '✗', data.success ? 'ok' : 'fail');
+            }
+
+            // Only switch the UI's active session if the user hasn't navigated elsewhere mid-run.
+            if (currentSessionId === runSessionAtStart) {
+              currentSessionId = runSessionId;
+            }
+
+            // Persist final run state for when the user returns to this session.
+            const st = runStates.get(runId);
+            if (st) {
+              st.session_id = runSessionId || st.session_id;
+              st.done = true;
+              st.success = data.success;
+              st.error = !data.success;
+              st.final_answer = data.answer || (fullAnswer || '');
+              if (data.failure) {
+                const f = data.failure;
+                const bits = [];
+                bits.push(`Failure: step ${f.step}${f.tool ? ' (' + f.tool + ')' : ''}`);
+                if (f.action) bits.push(`Action: ${f.action}`);
+                if (f.artifact_key) bits.push(`Artifact: ${f.artifact_key}`);
+                if (f.error_code) bits.push(`Error: ${f.error_code}`);
+                if (f.trace) bits.push(`Trace: ${f.trace}`);
+                st.reasoning_lines.push('⚠️ ' + bits.join(' · '));
+              }
+              if (st.session_id) sessionActiveRun.set(st.session_id, runId);
+            }
+            if (runSessionId) setSessionBadge(runSessionId, data.success ? '✓' : '✗', data.success ? 'ok' : 'fail');
+            renderRunState(runId);
+            // Once done, drop the "active run" pointer for this session after a short delay.
+            if (st && st.session_id) {
+              setTimeout(() => {
+                // Keep the state briefly in case the user navigates back immediately.
+                sessionActiveRun.delete(st.session_id);
+                runStates.delete(runId);
+              }, 5000);
+            }
             setTimeout(refreshSessions, 500);
+            setTimeout(loadMemory, 700);
+            setTimeout(loadKb, 900);
             scrollBottom();
             // Desktop notification when tab is not visible
             const notifyText = data.answer ? data.answer.slice(0, 100) : 'Task complete.';
             maybeNotify('aihomeserver', notifyText + (data.answer && data.answer.length > 100 ? '…' : ''));
+
+            if (activeSidebarTab !== 'chat') setTabBadge('chat', '✓', 'ok');
           } else if (currentEventType === 'error') {
             thinkEl.remove();
             addErrorTurn(data.message || 'Unknown error');
+            if (activeSidebarTab !== 'chat') setTabBadge('chat', '✗', 'fail');
+            if (activeRunSessionId) setSessionBadge(activeRunSessionId, '✗', 'fail');
+            const st = runStates.get(runId);
+            if (st) {
+              st.error = true;
+              st.done = true;
+              st.final_answer = data.message || 'Unknown error';
+              renderRunState(runId);
+              if (st.session_id) {
+                setTimeout(() => {
+                  sessionActiveRun.delete(st.session_id);
+                  runStates.delete(runId);
+                }, 5000);
+              }
+            }
           }
           currentEventType = null;
         }
+      }
+
+      if (doneEventReceived) {
+        try { await reader.cancel(); } catch (_) {}
+        break;
       }
     }
   } catch (err) {
     thinkEl.remove();
     addErrorTurn('Connection error: ' + err.message);
+    if (activeSidebarTab !== 'chat') setTabBadge('chat', '✗', 'fail');
+    if (activeRunSessionId) setSessionBadge(activeRunSessionId, '✗', 'fail');
   }
   busy = false;
   sendBtn.disabled = !inputEl.value.trim();
   inputEl.focus();
+  if (activeSidebarTab === 'chat') setTabBadge('chat', null);
+
+  // Drain queued requests (sequential execution).
+  if (sendQueue.length > 0) {
+    setTimeout(() => {
+      if (busy || sendQueue.length === 0) return;
+      const next = sendQueue.shift();
+      if (!next) return;
+      // If the queued placeholder isn't in the DOM anymore (navigated away), drop it.
+      const qEl = (next.queued_el && next.queued_el.isConnected) ? next.queued_el : null;
+      sendQueuedRequest(next.request, next.answers, qEl, next.session_id);
+    }, 0);
+  }
+}
+
+// Internal helper for queued sends where the request already includes any context prefix.
+async function sendQueuedRequest(fullRequest, answers, queuedEl, sessionId) {
+  busy = true;
+  sendBtn.disabled = true;
+
+  // If the queued placeholder is still present, reuse it as the run turn.
+  const thinkEl = queuedEl || addThinkingTurn();
+  if (queuedEl) queuedEl.dataset.queue = '';
+  const thinkContent = thinkEl.querySelector('.ai-content');
+  setTabBadge('chat', '…', 'running');
+
+  const runSessionAtStart = sessionId;
+  activeRunSessionId = runSessionAtStart;
+  if (runSessionAtStart) setSessionBadge(runSessionAtStart, '…', 'running');
+
+  const runId = 'run_' + Date.now() + '_' + Math.floor(Math.random() * 1e9);
+  activeRunId = runId;
+  thinkEl.dataset.runId = runId;
+  runStates.set(runId, {
+    run_id: runId,
+    session_id: runSessionAtStart,
+    phase: 'planning',
+    reasoning_lines: [],
+    thinking_text: '',
+    streaming_started: false,
+    full_answer: '',
+    final_answer: '',
+    done: false,
+    error: false,
+    request: fullRequest,
+  });
+  if (runSessionAtStart) sessionActiveRun.set(runSessionAtStart, runId);
+
+  try {
+    const body = { request: fullRequest };
+    if (sessionId) body.session_id = sessionId;
+    if (adminMode) body.admin = true;
+    if (answers && Object.keys(answers).length > 0) body.answers = answers;
+
+    const response = await fetch('/run/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(`Server error ${response.status}`);
+
+    // Delegate to the same stream reader by calling sendWithAnswers' logic would be nicer,
+    // but keep this minimal: just piggy-back by setting globals and letting the existing
+    // loop continue in this function's scope via copy-paste would be too big here.
+    // Instead, re-run through sendWithAnswers by reconstructing the visible text only.
+    // (Queued sends are best-effort; advanced streaming persistence works for the active run.)
+    // Fall back: if streaming is not supported, the server will still return 'done' soon.
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let currentEventType = null;
+    let doneEventReceived = false;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (line.startsWith('event: ')) currentEventType = line.slice(7).trim();
+        else if (line.startsWith('data: ')) {
+          let data;
+          try { data = JSON.parse(line.slice(6)); } catch (_) { continue; }
+          const st = runStates.get(runId);
+          if (currentEventType === 'status') { if (st) st.phase = data.phase; renderRunState(runId); }
+          else if (currentEventType === 'thinking_token') { if (st) { st.thinking_text = (st.thinking_text||'') + (data.text||''); } renderRunState(runId); }
+          else if (currentEventType === 'token') { if (st) { st.streaming_started = true; st.full_answer = (st.full_answer||'') + (data.text||''); } renderRunState(runId); }
+          else if (currentEventType === 'done') {
+            doneEventReceived = true;
+            const runSessionId = data.session_id;
+            if (st) {
+              st.session_id = runSessionId || st.session_id;
+              st.done = true;
+              st.success = data.success;
+              st.error = !data.success;
+              st.final_answer = data.answer || st.full_answer || '';
+              if (data.failure) {
+                const f = data.failure;
+                const bits = [];
+                bits.push(`Failure: step ${f.step}${f.tool ? ' (' + f.tool + ')' : ''}`);
+                if (f.action) bits.push(`Action: ${f.action}`);
+                if (f.artifact_key) bits.push(`Artifact: ${f.artifact_key}`);
+                if (f.error_code) bits.push(`Error: ${f.error_code}`);
+                if (f.trace) bits.push(`Trace: ${f.trace}`);
+                st.reasoning_lines = st.reasoning_lines || [];
+                st.reasoning_lines.push('⚠️ ' + bits.join(' · '));
+              }
+              if (st.session_id) sessionActiveRun.set(st.session_id, runId);
+            }
+            if (runSessionId) setSessionBadge(runSessionId, data.success ? '✓' : '✗', data.success ? 'ok' : 'fail');
+            renderRunState(runId);
+            setTimeout(refreshSessions, 500);
+            setTimeout(loadMemory, 700);
+            setTimeout(loadKb, 900);
+          } else if (currentEventType === 'error') {
+            if (st) { st.error = true; st.done = true; st.final_answer = data.message || 'Unknown error'; }
+            renderRunState(runId);
+            doneEventReceived = true;
+          }
+          currentEventType = null;
+        }
+      }
+      if (doneEventReceived) {
+        try { await reader.cancel(); } catch (_) {}
+        break;
+      }
+    }
+  } catch (err) {
+    thinkEl.remove();
+    addErrorTurn('Connection error: ' + err.message);
+    if (activeSidebarTab !== 'chat') setTabBadge('chat', '✗', 'fail');
+    if (activeRunSessionId) setSessionBadge(activeRunSessionId, '✗', 'fail');
+  }
+  busy = false;
+  sendBtn.disabled = !inputEl.value.trim();
+  inputEl.focus();
+  if (activeSidebarTab === 'chat') setTabBadge('chat', null);
 }
 
 async function pollTask(taskId, thinkEl) {
@@ -2759,7 +3274,11 @@ function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-function scrollBottom() {
+function scrollBottom(force) {
+  if (!force && !autoScroll) {
+    if (jumpBottomBtn) jumpBottomBtn.style.display = 'block';
+    return;
+  }
   msgsEl.scrollTop = msgsEl.scrollHeight;
 }
 
@@ -2779,10 +3298,13 @@ function makeSessionItem(s, archived) {
 
   const archiveBtn = `<button class="item-btn" title="${archived ? 'Restore' : 'Archive'}" onclick="event.stopPropagation();${archived ? 'doUnarchive' : 'doArchive'}('${s.session_id}')">${archived ? ICON_RESTORE : ICON_ARCHIVE}</button>`;
   const deleteBtn  = `<button class="item-btn danger" title="Delete permanently" onclick="event.stopPropagation();doDelete('${s.session_id}')">${ICON_TRASH}</button>`;
+  const badge = sessionBadges.get(s.session_id);
+  const badgeHtml = badge ? `<span class="sess-badge ${esc(badge.cls)}">${esc(badge.text)}</span>` : '';
 
   item.innerHTML = `
     <span class="dot ${archived ? 'archived' : 'ok'}"></span>
     <span class="item-label">${esc(preview)}</span>
+    ${badgeHtml}
     <span class="item-actions">${archiveBtn}${deleteBtn}</span>`;
   item.onclick = () => loadSession(s.session_id, s.first_message);
   return item;
@@ -2846,7 +3368,6 @@ async function doDelete(sessionId) {
 }
 
 async function loadSession(sessionId, firstMessage) {
-  if (busy) return;
   try {
     const res = await fetch(`/session/${sessionId}`);
     if (!res.ok) return;
@@ -2871,6 +3392,7 @@ async function loadSession(sessionId, firstMessage) {
     }
 
     scrollBottom();
+    maybeShowActiveRunForCurrentSession();
     document.querySelectorAll('.history-item').forEach(el => {
       el.classList.toggle('active', el.dataset.sid === sessionId);
     });
@@ -3148,6 +3670,7 @@ function toggleAdmin() {
 
 // ── Sidebar tabs ──────────────────────────────────────────────
 function showSidebarTab(tab) {
+  activeSidebarTab = tab;
   ['chat','files','git','mem','kb'].forEach(t => {
     document.getElementById('tab-' + t).style.display = tab === t ? 'flex' : 'none';
     document.getElementById('tab-btn-' + t).classList.toggle('active', tab === t);
@@ -3156,6 +3679,7 @@ function showSidebarTab(tab) {
   if (tab === 'git')  loadGitStatus();
   if (tab === 'mem')  loadMemory();
   if (tab === 'kb')   loadKb();
+  if (tab === 'chat') setTabBadge('chat', null);
 }
 
 // ── Sidebar resize ────────────────────────────────────────────
@@ -3206,6 +3730,17 @@ function showSidebarTab(tab) {
 // ── File tree ──────────────────────────────────────────────────
 let fileTreeLoaded = false;
 let fileUploadInit = false;
+let fileTreeRefreshTimer = null;
+
+function scheduleFileTreeRefresh() {
+  // Debounce to avoid hammering the server during multi-file writes.
+  if (!fileTreeLoaded) return;
+  if (fileTreeRefreshTimer) clearTimeout(fileTreeRefreshTimer);
+  fileTreeRefreshTimer = setTimeout(() => {
+    fileTreeRefreshTimer = null;
+    loadFileTree();
+  }, 350);
+}
 
 function openUploadPicker() {
   const input = document.getElementById('upload-input');
@@ -3587,8 +4122,9 @@ function renderKb(entries) {
         </div>
         <div class="kb-entry-meta">${stale ? '⚠ ' : ''}${age} · v${e.version}</div>
       </div>
-      <div class="kb-entry-full">${esc(e.content)}</div>
+      <div class="kb-entry-full" id="kb-full-${e.id}"></div>
       <div class="kb-entry-actions" style="display:none">
+        <button class="kb-btn" onclick="downloadKbEntry('${e.id}')">Download</button>
         <button class="kb-btn refresh-btn" onclick="refreshKbEntry('${e.id}','${esc(e.topic)}')">↻ Refresh</button>
         <button class="kb-btn" onclick="openKbModal('${e.id}')">Edit</button>
         <button class="kb-btn danger" onclick="deleteKbEntry('${e.id}')">Delete</button>
@@ -3602,6 +4138,24 @@ function toggleKbEntry(id) {
   el.classList.toggle('open');
   const actions = el.querySelector('.kb-entry-actions');
   actions.style.display = el.classList.contains('open') ? 'flex' : 'none';
+
+  if (el.classList.contains('open')) {
+    const entry = kbEntries.find(x => x.id === id);
+    const full = document.getElementById('kb-full-' + id);
+    if (entry && full && !full.dataset.rendered) {
+      const contentMd = entry.content || '';
+      let sourcesHtml = '';
+      try {
+        const src = JSON.parse(entry.sources || '[]');
+        if (Array.isArray(src) && src.length) {
+          const links = src.slice(0, 20).map(u => `<li><a href="${esc(u)}" target="_blank" rel="noreferrer">${esc(u)}</a></li>`).join('');
+          sourcesHtml = `<hr style="border:none;border-top:1px solid var(--border);margin:10px 0" /><div style="font-size:11px;color:var(--text-muted);margin-bottom:6px">Sources</div><ul style="margin:0;padding-left:16px;line-height:1.5">${links}</ul>`;
+        }
+      } catch (_) {}
+      full.innerHTML = renderMarkdown(contentMd) + sourcesHtml;
+      full.dataset.rendered = '1';
+    }
+  }
 }
 
 function filterKb() {
@@ -3669,6 +4223,15 @@ async function refreshKbEntry(id, topic) {
   showSidebarTab('chat');
 }
 
+function downloadKbEntry(id) {
+  // Trigger a file download; server returns `Content-Disposition: attachment`.
+  window.open('/knowledge/' + id + '/download', '_blank');
+}
+
+function exportKbAll() {
+  window.open('/knowledge/export', '_blank');
+}
+
 function kbDaysOld(ts) {
   if (!ts) return 0;
   return Math.floor((Date.now() - new Date(ts).getTime()) / 86400000);
@@ -3707,9 +4270,12 @@ async function loadSettings() {
     document.getElementById('cfg-max-steps').value    = cfg.max_steps       || 20;
     document.getElementById('cfg-num-gpu').value      = cfg.num_gpu    ?? 999;
     document.getElementById('cfg-num-ctx').value      = cfg.num_ctx    ?? 4096;
+    document.getElementById('cfg-num-predict').value  = cfg.num_predict ?? 2048;
     document.getElementById('cfg-num-batch').value    = cfg.num_batch  ?? 512;
     document.getElementById('cfg-num-thread').value   = cfg.num_thread ?? 0;
     document.getElementById('cfg-search-url').value   = cfg.search_url      || '';
+    document.getElementById('cfg-auto-kb-mode').value = cfg.auto_kb_mode    || 'off';
+    document.getElementById('cfg-auto-kb-min').value  = cfg.auto_kb_min_chars ?? 1200;
     const threshold = cfg.risk_gate_threshold ?? 8;
     document.getElementById('cfg-risk-threshold').value = threshold;
     document.getElementById('cfg-risk-val').textContent  = threshold;
@@ -3730,9 +4296,12 @@ async function saveSettings() {
     risk_gate_threshold: parseInt(document.getElementById('cfg-risk-threshold').value) || 8,
     num_gpu:         parseInt(document.getElementById('cfg-num-gpu').value)    ?? 999,
     num_ctx:         parseInt(document.getElementById('cfg-num-ctx').value)    ?? 4096,
+    num_predict:     parseInt(document.getElementById('cfg-num-predict').value) ?? 2048,
     num_batch:       parseInt(document.getElementById('cfg-num-batch').value)  ?? 512,
     num_thread:      parseInt(document.getElementById('cfg-num-thread').value) ?? 0,
     search_url:          document.getElementById('cfg-search-url').value.trim(),
+    auto_kb_mode:        document.getElementById('cfg-auto-kb-mode').value,
+    auto_kb_min_chars: parseInt(document.getElementById('cfg-auto-kb-min').value) || 1200,
   };
   try {
     const res = await fetch('/settings', {
@@ -4115,19 +4684,52 @@ function renderMemTasks(tasks) {
     const planText = t.plan_json
       ? (() => { try { return JSON.stringify(JSON.parse(t.plan_json), null, 2); } catch(_){ return t.plan_json; } })()
       : '— no plan recorded —';
+    const detailText =
+      `task_id: ${t.task_id}\n` +
+      `success: ${!!t.success}\n` +
+      `created_at: ${t.created_at || ''}\n` +
+      `duration_ms: ${t.duration_ms}\n` +
+      (t.user_request ? `\nrequest:\n${t.user_request}\n` : '') +
+      `\nplan:\n${planText}`;
 
     item.innerHTML = `
-      <div class="mem-task-header">
+      <div class="mem-task-header" id="${uid}-hdr">
         <span class="mem-task-badge">${badge}</span>
         <span class="mem-task-req" title="${esc(req)}">${esc(req.slice(0,55))}${req.length>55?'…':''}</span>
         <span class="mem-task-time">${age}</span>
         <button class="mem-delete-btn" title="Delete record" onclick="event.stopPropagation();deleteMemTask('${t.task_id}')">×</button>
       </div>
       <div class="mem-task-meta">${meta}</div>
-      <div class="mem-task-detail" id="${uid}">${esc(planText)}</div>`;
+      <div class="mem-task-detail" id="${uid}" onclick="event.stopPropagation()">
+        <div style="display:flex;justify-content:flex-end;margin:-2px 0 6px 0">
+          <button class="kb-btn" style="font-size:10px;padding:2px 8px" onclick="event.stopPropagation();copyMemText('${uid}')">Copy</button>
+        </div>
+        <div>${esc(detailText)}</div>
+      </div>`;
 
-    item.onclick = () => document.getElementById(uid).classList.toggle('open');
+    // Only toggle open/closed when clicking the header, so text selection in the detail
+    // panel doesn't collapse it.
+    const hdr = item.querySelector('#' + uid + '-hdr');
+    if (hdr) hdr.onclick = () => document.getElementById(uid).classList.toggle('open');
     listEl.appendChild(item);
+  }
+}
+
+async function copyMemText(uid) {
+  const el = document.getElementById(uid);
+  if (!el) return;
+  // Copy the raw visible text (plan + request).
+  const text = el.innerText.replace(/^\s*Copy\s*/,'').trim();
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (_) {
+    // Fallback for older browsers
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (_) {}
+    document.body.removeChild(ta);
   }
 }
 

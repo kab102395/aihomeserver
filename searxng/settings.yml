@@ -50,7 +50,7 @@ engines:
   - name: qwant
     engine: qwant
     shortcut: qw
-    disabled: false
+    disabled: true
 
   - name: wikipedia
     engine: wikipedia
@@ -66,7 +66,7 @@ engines:
   - name: mojeek
     engine: mojeek
     shortcut: mj
-    disabled: false
+    disabled: true
 
   # Marginalia — indie text-focused search, very accessible from server IPs
   - name: marginalia

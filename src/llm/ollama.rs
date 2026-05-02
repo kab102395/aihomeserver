@@ -1,3 +1,15 @@
+//! Ollama client implementation.
+//!
+//! This wraps Ollama’s `/api/chat` endpoint and provides:
+//! - OpenAI-style message structs (`Message`)
+//! - model “roles” (`Fast` vs `Critic`) mapped to config-selected model names
+//! - helpers for strict JSON completion (planner/executor outputs)
+//! - optional streaming (used by `POST /run/stream`)
+//!
+//! Why centralize this:
+//! - Prompts and JSON parsing failures are a major source of agent instability.
+//! - Keeping all model I/O in one module makes it easier to debug and evolve.
+
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -26,14 +38,29 @@ pub struct Message {
 }
 
 impl Message {
+    /// Create a system message (instructions/constraints for the model).
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: content.into(), thinking: None }
+        Self {
+            role: "system".into(),
+            content: content.into(),
+            thinking: None,
+        }
     }
+    /// Create a user message (the user’s request or context).
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into(), thinking: None }
+        Self {
+            role: "user".into(),
+            content: content.into(),
+            thinking: None,
+        }
     }
+    /// Create an assistant message (used mainly for few-shot examples).
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: content.into(), thinking: None }
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+            thinking: None,
+        }
     }
 }
 
@@ -49,6 +76,8 @@ struct OllamaOptions {
     num_gpu: i32,
     /// Context window in tokens.
     num_ctx: u32,
+    /// Max tokens to generate for this response (Ollama: `num_predict`).
+    num_predict: u32,
     /// Batch size: how many tokens Ollama processes in parallel during prompt eval.
     /// Higher = GPU works harder during the "thinking" phase before streaming starts.
     /// 512 is a solid default; can go to 1024+ with enough VRAM.
@@ -89,6 +118,10 @@ struct StreamChunk {
 }
 
 impl OllamaClient {
+    /// Create a new client that reads model names and base URL from `ServerConfig` on each call.
+    ///
+    /// Connection:
+    /// - `POST /settings` updates the config at runtime; this design makes changes effective immediately.
     pub fn new(config: Arc<RwLock<ServerConfig>>) -> Self {
         Self {
             client: Client::builder()
@@ -99,25 +132,33 @@ impl OllamaClient {
         }
     }
 
+    /// Pick the configured model name for a given role (fast vs critic).
     async fn model_for(&self, role: ModelRole) -> String {
         let cfg = self.config.read().await;
         match role {
-            ModelRole::Fast   => cfg.fast_model.clone(),
+            ModelRole::Fast => cfg.fast_model.clone(),
             ModelRole::Critic => cfg.critic_model.clone(),
         }
     }
 
+    /// Return the configured Ollama base URL.
     async fn base_url(&self) -> String {
         self.config.read().await.ollama_url.clone()
     }
 
+    /// Build request options from config (ctx size, GPU layers, batch size, etc.).
     async fn options(&self) -> OllamaOptions {
         let cfg = self.config.read().await;
         OllamaOptions {
-            num_gpu:    cfg.num_gpu,
-            num_ctx:    cfg.num_ctx,
-            num_batch:  cfg.num_batch,
-            num_thread: if cfg.num_thread == 0 { None } else { Some(cfg.num_thread) },
+            num_gpu: cfg.num_gpu,
+            num_ctx: cfg.num_ctx,
+            num_predict: cfg.num_predict,
+            num_batch: cfg.num_batch,
+            num_thread: if cfg.num_thread == 0 {
+                None
+            } else {
+                Some(cfg.num_thread)
+            },
         }
     }
 
@@ -131,16 +172,23 @@ impl OllamaClient {
         json_mode: bool,
         think: bool,
     ) -> Result<String> {
-        let model    = self.model_for(role).await;
+        let model = self.model_for(role).await;
         let base_url = self.base_url().await;
-        tracing::debug!("LLM call: model={model} json={json_mode} think={think} msgs={}", messages.len());
+        tracing::debug!(
+            "LLM call: model={model} json={json_mode} think={think} msgs={}",
+            messages.len()
+        );
 
-        let options  = self.options().await;
+        let options = self.options().await;
         let req = ChatRequest {
             model,
             messages,
             stream: false,
-            format: if json_mode { Some("json".to_string()) } else { None },
+            format: if json_mode {
+                Some("json".to_string())
+            } else {
+                None
+            },
             options,
             keep_alive: -1,
             think: if think { Some(true) } else { None },
@@ -174,9 +222,9 @@ impl OllamaClient {
     ) -> Result<String> {
         use futures::StreamExt;
 
-        let model    = self.model_for(role).await;
+        let model = self.model_for(role).await;
         let base_url = self.base_url().await;
-        let options  = self.options().await;
+        let options = self.options().await;
         let req = ChatRequest {
             model,
             messages,
@@ -187,15 +235,18 @@ impl OllamaClient {
             think: if think { Some(true) } else { None },
         };
 
-        let response = self.client
+        let response = self
+            .client
             .post(format!("{base_url}/api/chat"))
             .json(&req)
-            .send().await?
+            .send()
+            .await?
             .error_for_status()?;
 
         let mut byte_stream = response.bytes_stream();
-        let mut line_buf    = String::new();
+        let mut line_buf = String::new();
         let mut accumulated = String::new();
+        let mut done_seen = false;
 
         while let Some(chunk) = byte_stream.next().await {
             let chunk = chunk?;
@@ -204,7 +255,9 @@ impl OllamaClient {
             while let Some(pos) = line_buf.find('\n') {
                 let line = line_buf[..pos].trim().to_string();
                 line_buf = line_buf[pos + 1..].to_string();
-                if line.is_empty() { continue; }
+                if line.is_empty() {
+                    continue;
+                }
                 if let Ok(parsed) = serde_json::from_str::<StreamChunk>(&line) {
                     // Thinking tokens (qwen3 CoT) — forward to thinking channel if present
                     if let Some(thinking) = &parsed.message.thinking {
@@ -220,8 +273,18 @@ impl OllamaClient {
                         accumulated.push_str(&token);
                         let _ = token_tx.send(token);
                     }
-                    if parsed.done { break; }
+                    if parsed.done {
+                        done_seen = true;
+                        break;
+                    }
                 }
+            }
+
+            // Ollama sometimes keeps the HTTP connection open briefly after emitting `done=true`.
+            // If we don't exit here, `bytes_stream.next().await` can block until timeout, making
+            // the UI look "stuck thinking" even though the answer already rendered.
+            if done_seen {
+                break;
             }
         }
         Ok(accumulated)
@@ -231,7 +294,12 @@ impl OllamaClient {
     /// `think = true` enables qwen3 chain-of-thought before producing JSON —
     /// use this for complex decisions (e.g. planning) where reasoning quality matters.
     /// The thinking trace is discarded; only the clean JSON content is returned.
-    pub async fn complete_json<T>(&self, messages: Vec<Message>, role: ModelRole, think: bool) -> Result<T>
+    pub async fn complete_json<T>(
+        &self,
+        messages: Vec<Message>,
+        role: ModelRole,
+        think: bool,
+    ) -> Result<T>
     where
         T: serde::de::DeserializeOwned,
     {
@@ -258,7 +326,10 @@ impl OllamaClient {
         let resp = self
             .client
             .post(format!("{base_url}/api/embeddings"))
-            .json(&EmbedRequest { model: "nomic-embed-text", prompt: text })
+            .json(&EmbedRequest {
+                model: "nomic-embed-text",
+                prompt: text,
+            })
             .send()
             .await?
             .error_for_status()?

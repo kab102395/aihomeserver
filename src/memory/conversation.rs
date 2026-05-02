@@ -1,3 +1,10 @@
+//! Conversation memory (sessions + turns).
+//!
+//! This store exists so the chat UI can:
+//! - keep multi-turn context (“what did we just talk about?”)
+//! - list sessions in the sidebar
+//! - inject the last N turns into planning/execution prompts
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -6,11 +13,13 @@ use uuid::Uuid;
 
 use crate::state::ConversationTurn;
 
+/// SQLite-backed store for sessions and conversation turns.
 pub struct ConversationStore {
     pool: SqlitePool,
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// Lightweight session metadata for UI lists.
 pub struct SessionSummary {
     pub session_id: String,
     pub created_at: DateTime<Utc>,
@@ -21,6 +30,7 @@ pub struct SessionSummary {
 }
 
 impl ConversationStore {
+    /// Open (or create) the conversations database and ensure required tables exist.
     pub async fn new(db_path: &str) -> Result<Self> {
         let url = format!("sqlite:{db_path}?mode=rwc");
         let pool = SqlitePool::connect(&url).await?;
@@ -140,6 +150,11 @@ impl ConversationStore {
         self.list_sessions_filtered(limit, true).await
     }
 
+    /// Internal helper to list sessions by archived flag.
+    ///
+    /// Connection:
+    /// - Both `list_sessions` and `list_archived_sessions` share the same SQL shape;
+    ///   this keeps the filtering logic consistent.
     async fn list_sessions_filtered(
         &self,
         limit: i64,
@@ -165,12 +180,10 @@ impl ConversationStore {
             .map(|row| {
                 let created_at_str: String = row.get("created_at");
                 let last_active_str: String = row.get("last_active");
-                let first_message: Option<String> =
-                    row.try_get("first_message").ok().flatten();
+                let first_message: Option<String> = row.try_get("first_message").ok().flatten();
                 Ok(SessionSummary {
                     session_id: row.get("session_id"),
-                    created_at: DateTime::parse_from_rfc3339(&created_at_str)?
-                        .with_timezone(&Utc),
+                    created_at: DateTime::parse_from_rfc3339(&created_at_str)?.with_timezone(&Utc),
                     last_active: DateTime::parse_from_rfc3339(&last_active_str)?
                         .with_timezone(&Utc),
                     first_message: first_message.unwrap_or_default(),

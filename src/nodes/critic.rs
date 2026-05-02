@@ -1,3 +1,14 @@
+//! Critic node.
+//!
+//! Responsibility:
+//! - Decide whether the most recent execution step “passes” given completion criteria.
+//! - Emit actionable issues/recommendations when something is wrong.
+//! - Enforce deterministic failures for certain safety contracts (e.g. facts/grounding gate).
+//!
+//! Why a critic node:
+//! - Separates “doing” (executor/tool execution) from “checking”.
+//! - Enables repair/replan loops instead of silently producing bad output.
+
 use anyhow::Result;
 use chrono::Utc;
 
@@ -43,7 +54,13 @@ Output ONLY valid JSON:
 
 Be thorough. A false pass here may trigger irreversible production actions."#;
 
+/// Run the critic pass for the current step and append a `CriticReview`.
 pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemState> {
+    // The critic is the system’s “quality gate”.
+    // It can:
+    // - deterministically fail when a contract is violated (e.g. missing grounded facts),
+    // - deterministically fail when the most recent tool call failed,
+    // - or ask the LLM to evaluate output quality (fast/deep depending on risk).
     // Deterministic fail: facts gate tripped (grounded research attempted without evidence).
     if state
         .artifacts
@@ -85,15 +102,23 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
                         .map(|b| !b)
                         .unwrap_or(false);
                     if failed {
-                        let code = val.get("error_code").and_then(|v| v.as_str()).unwrap_or("unknown");
-                        let trace = val.get("trace").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let code = val
+                            .get("error_code")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let trace = val
+                            .get("trace")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         state.critic_history.push(CriticReview {
                             overall_pass: false,
                             score: 0.0,
                             confidence: 1.0,
                             issues: vec![format!("Tool '{tool_name}' failed ({code}): {trace}")],
                             recommendations: vec![
-                                "Retry with different parameters, check networking, or replan.".into(),
+                                "Retry with different parameters, check networking, or replan."
+                                    .into(),
                             ],
                             timestamp: Utc::now(),
                         });
@@ -151,10 +176,7 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
         serde_json::to_string_pretty(&state.artifacts).unwrap_or_default(),
     );
 
-    let messages = vec![
-        Message::system(prompt),
-        Message::user(context),
-    ];
+    let messages = vec![Message::system(prompt), Message::user(context)];
 
     let review: CriticReview = match llm.complete_json(messages, model_role, false).await {
         Ok(r) => r,

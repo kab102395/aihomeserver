@@ -40,6 +40,7 @@ cargo run --release
 
 Open:
 - `http://localhost:3000`
+- `http://localhost:3000/learn` (interview-prep walkthrough + read-only repo browser)
 
 Recommended (keeps your repo clean):
 - Set `DATA_DIR=./data` so `config.json` + DBs don’t land in random build output folders.
@@ -94,9 +95,22 @@ Environment variables override config at startup:
 - `DATA_DIR` (default: binary directory)
 - `WORKSPACE` (filesystem/shell tool root)
 - `OLLAMA_URL` (default `http://localhost:11434`)
-- `SEARCH_URL` (optional; recommended: SearXNG base URL like `http://searxng:8080`)
+- `SEARCH_URL` (optional; recommended: SearXNG base URL like `http://searxng:8080` in Docker or `http://localhost:8888` on host)
+
+If `SEARCH_URL` is not set, aihomeserver will try to auto-detect a local SearXNG instance on common URLs.
 
 You can also update settings live via `POST /settings` in the UI.
+
+---
+
+## Knowledge Base (KB)
+
+- The AI can persist researched material into the KB via the `save_knowledge` tool.
+- KB entries can be downloaded:
+  - `GET /knowledge/:id/download` (single entry as Markdown)
+  - `GET /knowledge/export` (all entries as one Markdown “book”)
+
+For “textbook/curriculum” requests (e.g. “learn Rust in depth”), the planner will generate a multi-chapter book and save chapters into the KB in one pass.
 
 ---
 

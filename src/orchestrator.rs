@@ -9,12 +9,25 @@ use crate::{
     tools::ToolRegistry,
 };
 
+/// The agent runtime: a deterministic loop that routes a `SystemState` through
+/// well-defined “nodes” (planner/executor/tool execution/critic/repair/finalization).
+///
+/// Why an explicit orchestrator:
+/// - Debuggability: each node can log events + write artifacts into `SystemState`.
+/// - Extensibility: adding a node is a localized change.
+/// - Safety: all side effects happen through tools invoked in `tool_execution`.
 pub struct Orchestrator {
+    /// LLM client used by planner/executor/critic/repair nodes.
     pub llm: OllamaClient,
+    /// Shared tool registry (filesystem, shell, http, etc.).
     pub tools: Arc<ToolRegistry>,
 }
 
 impl Orchestrator {
+    /// Construct a new orchestrator with an LLM client and a tool registry.
+    ///
+    /// The tool registry is wrapped in an `Arc` because multiple concurrent runs
+    /// may execute tools at the same time.
     pub fn new(llm: OllamaClient, tools: ToolRegistry) -> Self {
         Self {
             llm,
@@ -22,6 +35,12 @@ impl Orchestrator {
         }
     }
 
+    /// Run the orchestration loop until:
+    /// - the system reaches `Finalization`/`Done`, or
+    /// - `max_steps` is exceeded (forced finalization).
+    ///
+    /// This function returns the final `SystemState` so callers can persist artifacts,
+    /// event logs, and summary answers for replay.
     pub async fn run(&self, initial_state: SystemState) -> Result<SystemState> {
         let mut state = initial_state;
         let mut node = OrchestratorNode::Intake;
@@ -64,8 +83,7 @@ impl Orchestrator {
                                 .as_ref()
                                 .and_then(|p| {
                                     // current_step is pre-increment; fall back to first step
-                                    p.steps.get(state.current_step)
-                                        .or_else(|| p.steps.first())
+                                    p.steps.get(state.current_step).or_else(|| p.steps.first())
                                 })
                                 .map(|s| (s.action.clone(), s.tool_binding.clone()))
                                 .unwrap_or_else(|| ("Execute planned action".into(), None));
@@ -119,7 +137,9 @@ impl Orchestrator {
 
                 OrchestratorNode::Repair => {
                     // Tell the UI we're retrying
-                    let issues = state.critic_history.last()
+                    let issues = state
+                        .critic_history
+                        .last()
                         .map(|r| r.issues.clone())
                         .unwrap_or_default();
                     if let Some(tx) = &state.sse_tx {
@@ -193,6 +213,12 @@ impl Orchestrator {
         Ok(state)
     }
 
+    /// Decide which node to run next after a critic pass.
+    ///
+    /// The critic can:
+    /// - pass: go back to `Executor` (or finalize if already terminated)
+    /// - fail: attempt `Repair` up to a limit, then `Replan`
+    /// - trigger special-case replans (e.g. grounding/facts-gate failures)
     fn route_from_critic(&self, state: &SystemState) -> OrchestratorNode {
         let passed = state
             .critic_history

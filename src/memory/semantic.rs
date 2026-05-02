@@ -1,3 +1,12 @@
+//! Semantic memory (embeddings + similarity).
+//!
+//! This store persists embeddings for past runs and supports “few-shot” retrieval:
+//! given a new request, retrieve similar past tasks and inject them as examples.
+//!
+//! Design choice:
+//! - Embeddings are stored in SQLite but also cached in-memory for fast cosine similarity.
+//! - This is intentionally simple and works well for small personal deployments.
+
 use anyhow::Result;
 use chrono::Utc;
 use sqlx::SqlitePool;
@@ -27,6 +36,7 @@ pub struct SemanticMemory {
 }
 
 impl SemanticMemory {
+    /// Open (or create) the embeddings database and load the in-memory cache.
     pub async fn new(db_path: &str) -> Result<Self> {
         let url = format!("sqlite:{db_path}?mode=rwc");
         let pool = SqlitePool::connect(&url).await?;
@@ -167,11 +177,14 @@ impl SemanticMemory {
     /// Return all stored entries (without embeddings) for the memory browser UI.
     pub async fn list(&self) -> Vec<SemanticListEntry> {
         let cache = self.cache.read().await;
-        cache.iter().map(|r| SemanticListEntry {
-            task_id:        r.task_id.clone(),
-            user_request:   r.user_request.clone(),
-            answer_summary: r.answer_summary.clone(),
-        }).collect()
+        cache
+            .iter()
+            .map(|r| SemanticListEntry {
+                task_id: r.task_id.clone(),
+                user_request: r.user_request.clone(),
+                answer_summary: r.answer_summary.clone(),
+            })
+            .collect()
     }
 
     /// Hard-delete every embedding in both the DB and the in-memory cache.
@@ -187,13 +200,18 @@ impl SemanticMemory {
 /// A minimal view of a semantic memory entry, safe to serialize to the UI.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SemanticListEntry {
-    pub task_id:        String,
-    pub user_request:   String,
+    pub task_id: String,
+    pub user_request: String,
     pub answer_summary: String,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Load all embedding rows from SQLite into memory at startup.
+///
+/// Why this exists:
+/// - For small deployments, in-memory search is simpler than maintaining a vector index.
+/// - Querying SQLite for every similarity calculation would be slow.
 async fn load_all(pool: &SqlitePool) -> Result<Vec<EmbeddingRecord>> {
     use sqlx::Row;
     let rows = sqlx::query(
@@ -221,6 +239,10 @@ async fn load_all(pool: &SqlitePool) -> Result<Vec<EmbeddingRecord>> {
         .collect())
 }
 
+/// Compute cosine similarity between two embedding vectors.
+///
+/// Connection:
+/// - Used by `SemanticMemory::query` to rank past tasks for few-shot injection.
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -235,10 +257,12 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Serialize a `f32` vector into bytes for SQLite BLOB storage.
 fn f32_to_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
+/// Deserialize a SQLite BLOB back into a `f32` vector.
 fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
         .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))

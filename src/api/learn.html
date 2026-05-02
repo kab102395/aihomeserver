@@ -1,0 +1,2162 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>aihomeserver Â· Learn</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    :root {
+      --bg: #111;
+      --surface: #171717;
+      --surface2: #1e1e1e;
+      --border: #2a2a2a;
+      --text: #e8e6e3;
+      --muted: #9a9a9a;
+      --dim: #6a6a6a;
+      --accent: #c97b4b;
+      --accent-soft: rgba(201,123,75,0.15);
+      --danger: #c05050;
+      --ok: #4a9a5a;
+      --radius: 10px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: -apple-system, "Segoe UI", system-ui, sans-serif;
+      --nav-w: 320px;
+    }
+    body {
+      margin: 0;
+      height: 100dvh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      display: flex;
+      overflow: hidden;
+      line-height: 1.55;
+    }
+    a { color: inherit; }
+    button, input { font: inherit; }
+
+    #nav {
+      width: var(--nav-w);
+      min-width: 240px;
+      max-width: 520px;
+      background: #0f0f0f;
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    #navHeader {
+      padding: 14px 14px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    #brandRow {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    #brand {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+    #brandTitle {
+      font-size: 14px;
+      font-weight: 650;
+      letter-spacing: 0.02em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #brandSub {
+      font-size: 12px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .pill {
+      font-size: 12px;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      background: var(--surface);
+      padding: 5px 10px;
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      user-select: none;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s, color 0.15s;
+    }
+    .pill:hover { background: var(--surface2); color: var(--text); border-color: #333; }
+    .pillDot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+    .pillDot.ok { background: var(--ok); }
+    .pillDot.bad { background: var(--danger); }
+
+    #navTabs {
+      display: flex;
+      gap: 8px;
+      padding: 10px 14px 12px;
+    }
+    .tabBtn {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 6px 10px;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: all 0.12s;
+      font-size: 12px;
+    }
+    .tabBtn:hover { background: var(--surface2); color: var(--text); }
+    .tabBtn.active { background: var(--accent-soft); border-color: rgba(201,123,75,0.35); color: var(--text); }
+
+    #navBody {
+      flex: 1;
+      overflow: auto;
+      padding: 10px 10px 14px;
+    }
+    .groupTitle {
+      padding: 10px 8px 6px;
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--dim);
+    }
+    .navItem {
+      padding: 8px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: baseline;
+      transition: background 0.1s, color 0.1s;
+    }
+    .navItem:hover { background: var(--surface2); color: var(--text); }
+    .navItem.active { background: var(--surface2); color: var(--text); border: 1px solid rgba(201,123,75,0.25); }
+    .navItem .hint { font-size: 11px; color: var(--dim); white-space: nowrap; }
+
+    #main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    #topbar {
+      height: 56px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      gap: 12px;
+    }
+    #topbarLeft {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+    #pageTitle {
+      font-weight: 650;
+      font-size: 14px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #topbarRight {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-shrink: 0;
+    }
+    .linkBtn {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 7px 10px;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: all 0.12s;
+      font-size: 12px;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .linkBtn:hover { background: var(--surface2); color: var(--text); }
+    .linkBtn.primary { border-color: rgba(201,123,75,0.35); background: var(--accent-soft); color: var(--text); }
+
+    #content {
+      flex: 1;
+      overflow: auto;
+      padding: 16px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px;
+      margin-bottom: 12px;
+    }
+    .card h2 { margin: 0 0 8px 0; font-size: 15px; }
+    .card h3 { margin: 14px 0 8px 0; font-size: 13px; color: var(--text); }
+    .card p { margin: 8px 0; color: var(--muted); }
+    .card ul { margin: 8px 0 0 18px; color: var(--muted); }
+    .md h1, .md h2, .md h3, .md h4 { color: var(--text); margin: 12px 0 8px; line-height: 1.25; }
+    .md h1 { font-size: 18px; }
+    .md h2 { font-size: 16px; }
+    .md h3 { font-size: 14px; }
+    .md p { color: var(--muted); margin: 8px 0; }
+    .md code {
+      font-family: var(--mono);
+      font-size: 12px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.03);
+      padding: 1px 6px;
+      border-radius: 6px;
+      color: #d8d8d8;
+    }
+    .md pre {
+      font-family: var(--mono);
+      font-size: 12px;
+      background: #0b0b0b;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+      overflow: auto;
+      white-space: pre;
+      color: #d8d8d8;
+      margin: 10px 0;
+    }
+    .md a { color: #d9b39b; text-decoration: underline; text-decoration-color: rgba(201,123,75,0.35); }
+    .md blockquote {
+      margin: 10px 0;
+      border-left: 3px solid rgba(201,123,75,0.35);
+      padding: 8px 10px;
+      background: rgba(255,255,255,0.02);
+      border-radius: 8px;
+      color: var(--muted);
+    }
+    .md hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+    .md .docMeta { display:flex; gap:8px; flex-wrap:wrap; margin: 8px 0 10px; }
+    .kbd {
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 1px 6px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+    }
+    .code {
+      font-family: var(--mono);
+      font-size: 12px;
+      background: #0b0b0b;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+      overflow: auto;
+      white-space: pre;
+      color: #d8d8d8;
+    }
+    .code .ln { display: inline-block; width: 52px; color: #666; user-select: none; }
+    .mutedRow { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+    .tag {
+      font-size: 12px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--muted);
+    }
+    .tag strong { color: var(--text); font-weight: 600; }
+    .split {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    @media (max-width: 1000px) {
+      #nav { width: 280px; }
+      .split { grid-template-columns: 1fr; }
+    }
+
+    /* Browser */
+    #browserTop {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+    .input {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 10px;
+      border-radius: 10px;
+      outline: none;
+      min-width: 240px;
+    }
+    .btn {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 8px 10px;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: all 0.12s;
+      font-size: 12px;
+    }
+    .btn:hover { background: #232323; color: var(--text); }
+    .btn.primary { border-color: rgba(201,123,75,0.35); background: var(--accent-soft); color: var(--text); }
+    .btn.danger:hover { color: var(--danger); }
+    #tree {
+      border: 1px solid var(--border);
+      background: #101010;
+      border-radius: 10px;
+      padding: 10px;
+      overflow: auto;
+      max-height: 44dvh;
+    }
+    .treeRow {
+      font-family: var(--mono);
+      font-size: 12px;
+      color: #bdbdbd;
+      padding: 4px 6px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .treeRow:hover { background: #1a1a1a; }
+    .treeIcon { width: 16px; color: #888; text-align: center; }
+    .treePath { color: #777; margin-left: auto; font-size: 11px; }
+    .treeIndent { width: 12px; flex-shrink: 0; }
+    .treeRow.active { background: rgba(201,123,75,0.10); border: 1px solid rgba(201,123,75,0.25); }
+
+    #results {
+      border: 1px solid var(--border);
+      background: #101010;
+      border-radius: 10px;
+      padding: 10px;
+      overflow: auto;
+      max-height: 22dvh;
+    }
+    .hit {
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 7px 8px;
+      border-radius: 8px;
+      cursor: pointer;
+      color: #bdbdbd;
+      border: 1px solid transparent;
+      display: flex;
+      gap: 10px;
+      align-items: baseline;
+    }
+    .hit:hover { background: #1a1a1a; border-color: #222; }
+    .hit .file { color: #cfcfcf; }
+    .hit .line { color: #777; }
+    .hit .prev { color: #9a9a9a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+
+    #fileHeader {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+    #filePath {
+      font-family: var(--mono);
+      font-size: 12px;
+      color: #bdbdbd;
+      background: #101010;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 10px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 1;
+      min-width: 220px;
+    }
+    .note {
+      font-size: 12px;
+      color: var(--dim);
+      margin-top: 8px;
+    }
+    .outline {
+      border: 1px solid var(--border);
+      background: #101010;
+      border-radius: 10px;
+      padding: 10px;
+      max-height: 26dvh;
+      overflow: auto;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: #bdbdbd;
+    }
+    .outlineItem {
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      padding: 5px 6px;
+      border-radius: 8px;
+      cursor: pointer;
+      border: 1px solid transparent;
+    }
+    .outlineItem:hover { background: #1a1a1a; border-color: #222; }
+    .outlineKind { color: #777; width: 56px; flex-shrink: 0; }
+    .outlineName { color: #d0d0d0; overflow:hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .outlineLine { color: #777; margin-left: auto; flex-shrink: 0; }
+    details summary {
+      cursor: pointer;
+      user-select: none;
+      color: var(--text);
+      font-weight: 600;
+      margin: 6px 0;
+    }
+    details p, details ul { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <aside id="nav">
+    <div id="navHeader">
+      <div id="brandRow">
+        <div id="brand">
+          <div id="brandTitle">aihomeserver Â· Learn</div>
+          <div id="brandSub">Interview-mode walkthrough</div>
+        </div>
+        <div class="pill" id="statusPill" title="Click to refresh status">
+          <span class="pillDot" id="statusDot"></span>
+          <span id="statusText">offline</span>
+        </div>
+      </div>
+      <div id="navTabs">
+        <button class="tabBtn active" id="tab-tour">Tour</button>
+        <button class="tabBtn" id="tab-code">Code</button>
+      </div>
+    </div>
+    <div id="navBody">
+      <div id="tourNav"></div>
+      <div id="codeNav" style="display:none"></div>
+    </div>
+  </aside>
+
+  <main id="main">
+    <div id="topbar">
+      <div id="topbarLeft">
+        <div id="pageTitle">Overview</div>
+      </div>
+      <div id="topbarRight">
+        <a class="linkBtn" href="/" title="Back to chat UI">Chat UI</a>
+        <button class="linkBtn" id="copyLinkBtn" title="Copy link to current section">Copy link</button>
+        <button class="linkBtn primary" id="exportBtn" title="Export an interview cheat sheet">Export cheat sheet</button>
+      </div>
+    </div>
+    <div id="content"></div>
+  </main>
+
+  <script>
+    /**
+     * /learn is a tiny, dependency-free single-page app.
+     *
+     * Design goals:
+     * - fast to load (single HTML response)
+     * - easy to scan (left nav → right content)
+     * - “learning platform” behaviors: quick quizzes, labs you can run, and a code browser
+     *
+     * Everything is plain DOM + fetch() against the server’s `/learn/*` read-only endpoints.
+     */
+
+    /** Shorthand for `document.getElementById`. */
+    const $ = (id) => document.getElementById(id);
+    /**
+     * HTML escape helper to prevent accidental HTML injection.
+     * Use for any user/remote string that is inserted via `innerHTML`.
+     */
+    const esc = (s) => (s ?? '').toString()
+      .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+
+    /**
+     * Switch between the “Tour” and “Code” nav lists.
+     * Content is still rendered into the same `#content` mount.
+     */
+    function setTab(which) {
+      $('tab-tour').classList.toggle('active', which === 'tour');
+      $('tab-code').classList.toggle('active', which === 'code');
+      $('tourNav').parentElement.style.display = which === 'tour' ? '' : '';
+      $('tourNav').style.display = which === 'tour' ? '' : 'none';
+      $('codeNav').style.display = which === 'code' ? '' : 'none';
+    }
+
+    // ---------- Status ----------
+    /**
+     * Pings `/health` to show an “online/offline” indicator and server version.
+     * This is intentionally simple: it’s a quick sanity check for demos.
+     */
+    async function refreshStatus() {
+      const dot = $('statusDot');
+      const txt = $('statusText');
+      dot.className = 'pillDot';
+      txt.textContent = 'checkingâ€¦';
+      try {
+        const r = await fetch('/health');
+        if (!r.ok) throw new Error('health ' + r.status);
+        const d = await r.json();
+        dot.classList.add('ok');
+        txt.textContent = 'online v' + (d.version ?? '?');
+      } catch (e) {
+        dot.classList.add('bad');
+        txt.textContent = 'offline';
+      }
+    }
+    $('statusPill').onclick = refreshStatus;
+
+    // ---------- Navigation ----------
+    const TOUR_GROUPS = [
+      { title: 'Core', items: [
+        { id: 'overview', title: 'Overview', hint: '10 min demo script' },
+        { id: 'architecture', title: 'Architecture', hint: 'layers + dataflow' },
+        { id: 'orchestrator', title: 'Orchestrator', hint: 'nodes + loop' },
+        { id: 'tools', title: 'Tools + Safety', hint: 'guardrails' },
+        { id: 'memory', title: 'Memory + Storage', hint: 'SQLite + sources' },
+        { id: 'api', title: 'HTTP API Tour', hint: 'endpoints' },
+      ]},
+      { title: 'Lessons (Start Here)', items: [
+        { id: 'lesson_trace', title: 'Trace a Request', hint: 'follow the code path' },
+        { id: 'lesson_rust', title: 'Rust in this Repo', hint: 'what you must know' },
+        { id: 'lesson_async', title: 'Async + Concurrency', hint: 'tokio patterns' },
+        { id: 'lesson_axum', title: 'Axum HTTP Basics', hint: 'routes + state' },
+        { id: 'lesson_tools', title: 'Tools + Results', hint: 'I/O + safety' },
+        { id: 'lesson_memory', title: 'SQLite Memory', hint: 'schemas + sqlx' },
+        { id: 'lesson_grounding', title: 'Grounding Contract', hint: 'facts + sources' },
+      ]},
+      { title: 'Interview', items: [
+        { id: 'talktrack', title: 'Talk Track', hint: 'what to say' },
+        { id: 'questions', title: 'Common Questions', hint: 'Q&A' },
+        { id: 'checklist', title: 'Demo Checklist', hint: 'runbook' },
+      ]},
+      { title: 'Interactive', items: [
+        { id: 'diagnostics', title: 'Diagnostics', hint: 'evals + deep health' },
+        { id: 'metrics', title: 'Metrics', hint: 'latency + counters' },
+        { id: 'replay', title: 'Run Replay', hint: 'history â†’ plan â†’ artifacts' },
+        { id: 'glossary', title: 'Glossary', hint: 'terms + anchors' },
+        { id: 'labs', title: 'Hands-on Labs', hint: 'practice prompts' },
+      ]},
+      { title: 'Repo Docs', items: [
+        { id: 'doc_readme', title: 'README.md', hint: 'quickstart' },
+        { id: 'doc_design', title: 'DESIGN.md', hint: 'deep dive' },
+        { id: 'doc_roadmap', title: 'UI roadmap', hint: 'product' },
+        { id: 'doc_next', title: 'NEXT_STEPS', hint: 'execution' },
+        { id: 'doc_progress', title: 'PROGRESS', hint: 'status' },
+      ]},
+    ];
+
+    const CODE_GROUPS = [
+      { title: 'Code Tour (Start Here)', items: [
+        { id: 'code_main', title: 'src/main.rs', hint: 'startup wiring' },
+        { id: 'code_server', title: 'src/api/server.rs', hint: 'routes + handlers' },
+        { id: 'code_ui', title: 'src/api/ui.rs', hint: 'embedded UI' },
+        { id: 'code_orch', title: 'src/orchestrator.rs', hint: 'state machine' },
+        { id: 'code_executor', title: 'src/nodes/executor.rs', hint: 'step loop' },
+        { id: 'code_tools', title: 'src/tools/', hint: 'tool registry' },
+        { id: 'code_grounding', title: 'src/grounding.rs', hint: 'facts gate' },
+        { id: 'code_config', title: 'src/config.rs', hint: 'runtime config' },
+      ]},
+      { title: 'Repo Browser', items: [
+        { id: 'browser', title: 'Browse + Search', hint: '/learn/* endpoints' },
+      ]},
+    ];
+
+    function renderNav(container, groups) {
+      container.innerHTML = '';
+      for (const g of groups) {
+        const t = document.createElement('div');
+        t.className = 'groupTitle';
+        t.textContent = g.title;
+        container.appendChild(t);
+        for (const it of g.items) {
+          const row = document.createElement('div');
+          row.className = 'navItem';
+          row.dataset.page = it.id;
+          row.innerHTML = `<span>${esc(it.title)}</span><span class="hint">${esc(it.hint ?? '')}</span>`;
+          row.onclick = () => navigate(it.id);
+          container.appendChild(row);
+        }
+      }
+    }
+
+    renderNav($('tourNav'), TOUR_GROUPS);
+    renderNav($('codeNav'), CODE_GROUPS);
+
+    function setActiveNav(id) {
+      for (const el of document.querySelectorAll('.navItem')) {
+        el.classList.toggle('active', el.dataset.page === id);
+      }
+    }
+
+    // ---------- Content ----------
+    function setTitle(t) { $('pageTitle').textContent = t; }
+
+    /**
+     * GET helper for JSON endpoints.
+     * All `/learn/*` data endpoints return JSON.
+     */
+    async function fetchJson(url) {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`${url} -> ${r.status}`);
+      return await r.json();
+    }
+
+    /**
+     * POST helper for JSON endpoints.
+     *
+     * Returns parsed JSON when possible; otherwise returns raw text.
+     * On non-2xx, throws with a body snippet to make debugging easier.
+     */
+    async function postJson(url, body) {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body ?? {}),
+      });
+      const txt = await r.text();
+      let parsed = null;
+      try { parsed = JSON.parse(txt); } catch (_) {}
+      if (!r.ok) {
+        const msg = parsed ? prettyJson(parsed) : txt;
+        throw new Error(`${url} -> ${r.status}\n${msg}`);
+      }
+      return parsed ?? txt;
+    }
+
+    /** Promise-based sleep used for polling. */
+    const sleep = (ms) => new Promise(res => setTimeout(res, ms));
+
+    async function fetchText(url) {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`${url} -> ${r.status}`);
+      return await r.text();
+    }
+
+    async function fetchFileAndOutline(path) {
+      const [file, outline] = await Promise.all([
+        fetchJson(`/learn/file?path=${encodeURIComponent(path)}`),
+        fetchJson(`/learn/outline?path=${encodeURIComponent(path)}`).catch(() => ({ symbols: [] })),
+      ]);
+      return { file, outline };
+    }
+
+    function makeCard(title, html) {
+      return `<div class="card"><h2>${esc(title)}</h2>${html}</div>`;
+    }
+
+    function mono(x) { return `<span class="kbd">${esc(x)}</span>`; }
+
+    /**
+     * Tiny Markdown-to-HTML renderer used for repo docs in `/learn`.
+     *
+     * Intentional constraints:
+     * - supports just enough Markdown for READMEs (headings, lists, code fences, links)
+     * - sanitizes URLs and escapes raw text (no arbitrary HTML passthrough)
+     *
+     * This is not a full Markdown parser; it’s a safe-ish viewer for local docs.
+     */
+    function mdToSafeHtml(md) {
+      const src = (md ?? '').toString().replaceAll('\r\n', '\n');
+      const lines = src.split('\n');
+      const codeBlocks = [];
+      const outLines = [];
+      let inCode = false;
+      let codeBuf = [];
+      let codeLang = '';
+
+      for (const line of lines) {
+        const fence = line.trimStart().startsWith('```');
+        if (fence) {
+          if (!inCode) {
+            inCode = true;
+            codeLang = line.trim().slice(3).trim();
+            codeBuf = [];
+          } else {
+            inCode = false;
+            const idx = codeBlocks.length;
+            codeBlocks.push({ code: codeBuf.join('\n'), lang: codeLang });
+            outLines.push(`@@CODE_${idx}@@`);
+            codeBuf = [];
+            codeLang = '';
+          }
+          continue;
+        }
+        if (inCode) codeBuf.push(line);
+        else outLines.push(line);
+      }
+      if (inCode) {
+        const idx = codeBlocks.length;
+        codeBlocks.push({ code: codeBuf.join('\n'), lang: codeLang });
+        outLines.push(`@@CODE_${idx}@@`);
+      }
+
+      function sanitizeUrl(u) {
+        const url = (u ?? '').toString().trim();
+        if (!url) return null;
+        if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('/')) return url;
+        return null;
+      }
+
+      function fmtInline(raw) {
+        let s = esc(raw);
+        s = s.replace(/`([^`]+)`/g, (m, g1) => `<code>${g1}</code>`);
+        s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+        s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+        s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, text, url) => {
+          const safe = sanitizeUrl(url);
+          if (!safe) return text;
+          return `<a href="${esc(safe)}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+        });
+        return s;
+      }
+
+      const html = [];
+      let i = 0;
+      while (i < outLines.length) {
+        const line = outLines[i];
+        const t = (line ?? '').trim();
+        if (!t) { i++; continue; }
+
+        const mCode = t.match(/^@@CODE_(\d+)@@$/);
+        if (mCode) {
+          const idx = parseInt(mCode[1], 10);
+          const blk = codeBlocks[idx] || { code: '', lang: '' };
+          const label = blk.lang ? `<div class="note">language: <span class="kbd">${esc(blk.lang)}</span></div>` : '';
+          html.push(`${label}<pre>${esc(blk.code)}</pre>`);
+          i++;
+          continue;
+        }
+
+        const mH = t.match(/^(#{1,4})\s+(.*)$/);
+        if (mH) {
+          const level = mH[1].length;
+          const tag = `h${Math.min(4, Math.max(1, level))}`;
+          html.push(`<${tag}>${fmtInline(mH[2])}</${tag}>`);
+          i++;
+          continue;
+        }
+
+        if (/^---+$/.test(t)) { html.push('<hr />'); i++; continue; }
+
+        if (t.startsWith('>')) {
+          const q = [];
+          while (i < outLines.length && (outLines[i] ?? '').trim().startsWith('>')) {
+            q.push((outLines[i] ?? '').trim().replace(/^>\s?/, ''));
+            i++;
+          }
+          html.push(`<blockquote>${fmtInline(q.join('\\n'))}</blockquote>`);
+          continue;
+        }
+
+        if (/^[-*+]\s+/.test(t)) {
+          const items = [];
+          while (i < outLines.length && /^\s*[-*+]\s+/.test(outLines[i] ?? '')) {
+            items.push((outLines[i] ?? '').replace(/^\s*[-*+]\s+/, ''));
+            i++;
+          }
+          html.push('<ul>' + items.map(x => `<li>${fmtInline(x)}</li>`).join('') + '</ul>');
+          continue;
+        }
+
+        if (/^\d+\.\s+/.test(t)) {
+          const items = [];
+          while (i < outLines.length && /^\s*\d+\.\s+/.test(outLines[i] ?? '')) {
+            items.push((outLines[i] ?? '').replace(/^\s*\d+\.\s+/, ''));
+            i++;
+          }
+          html.push('<ol>' + items.map(x => `<li>${fmtInline(x)}</li>`).join('') + '</ol>');
+          continue;
+        }
+
+        const p = [];
+        while (i < outLines.length && (outLines[i] ?? '').trim()) {
+          const nt = (outLines[i] ?? '').trim();
+          if (/^@@CODE_\d+@@$/.test(nt) || /^(#{1,4})\s+/.test(nt) || /^---+$/.test(nt) || nt.startsWith('>') || /^[-*+]\s+/.test(nt) || /^\d+\.\s+/.test(nt)) break;
+          p.push(outLines[i]);
+          i++;
+        }
+        if (p.length) html.push('<p>' + fmtInline(p.join(' ').trim()) + '</p>');
+        else i++;
+      }
+
+      return `<div class="md">${html.join('')}</div>`;
+    }
+
+    function bullets(items) {
+      return `<ul>${items.map(x => `<li>${x}</li>`).join('')}</ul>`;
+    }
+
+    async function renderOverview() {
+      setTitle('Overview');
+      const content = [];
+      content.push(makeCard('What you are demoing', `
+        <p>This is a local-first Rust agent server with: (1) a state-machine orchestrator, (2) a tool layer (fs/shell/git/web), (3) memory stores, and (4) an embedded web UI.</p>
+        <div class="mutedRow">
+          <span class="tag"><strong>Run loop</strong> Planner â†’ Executor â†’ ToolExecution â†’ Critic â†’ Repair/Replan</span>
+          <span class="tag"><strong>Safety</strong> risk gating + approvals + grounding contract</span>
+          <span class="tag"><strong>Ops</strong> evals + deep health + metrics</span>
+        </div>
+      `));
+
+      content.push(makeCard('10-minute interview demo script', `
+        ${bullets([
+          `Open the Chat UI at <span class="kbd">/</span> and show streaming + tool timeline.`,
+          `Run a safe task (e.g. â€œsearch repo for where routes are definedâ€) and narrate the plan/execute/critic loop.`,
+          `Trigger a tool call (files / git / http_fetch) and show tool logs + artifacts.`,
+          `Open <span class="kbd">/learn</span> and show the architecture + code tour and where key logic lives.`,
+          `Run <span class="kbd">/health/deep</span> (or Diagnostics) to show eval-driven health and reproducibility.`,
+        ])}
+        <p class="note">Tip: keep the â€œwhyâ€ narrative tight â€” predictability, safety, auditability, and local-first control.</p>
+      `));
+
+      content.push(makeCard('Live system snapshot (from the server)', `
+        <div id="snapshot" class="note">Loadingâ€¦</div>
+      `));
+
+      $('content').innerHTML = content.join('');
+      try {
+        const [health, settings] = await Promise.all([
+          fetchJson('/health'),
+          fetchJson('/settings'),
+        ]);
+        $('snapshot').innerHTML = `
+          <div class="split">
+            <div class="card" style="margin:0">
+              <h3>Health</h3>
+              ${bullets([
+                `<span class="kbd">version</span>: ${esc(health.version ?? '?')}`,
+                `<span class="kbd">status</span>: ${esc(health.status ?? 'ok')}`,
+              ])}
+            </div>
+            <div class="card" style="margin:0">
+              <h3>Settings</h3>
+              ${bullets([
+                `<span class="kbd">fast_model</span>: ${esc(settings.fast_model ?? '?')}`,
+                `<span class="kbd">critic_model</span>: ${esc(settings.critic_model ?? '?')}`,
+                `<span class="kbd">ollama_url</span>: ${esc(settings.ollama_url ?? '?')}`,
+                `<span class="kbd">workspace_path</span>: ${esc(settings.workspace_path ?? '?')}`,
+              ])}
+            </div>
+          </div>
+        `;
+      } catch (e) {
+        $('snapshot').textContent = 'Snapshot failed: ' + (e?.message ?? e);
+      }
+
+      // If running from the minimal production Docker image, the repo source
+      // files may not be present at REPO_ROOT. Detect and guide.
+      try {
+        const tree = await fetchJson('/learn/tree');
+        const children = Array.isArray(tree.children) ? tree.children.length : 0;
+        if (children === 0) {
+          const hint = document.createElement('div');
+          hint.innerHTML = makeCard('Repo files not visible', `
+            <p>This container doesn't currently have the repo source files available to the Learn browser.</p>
+            <p>Fix options:</p>
+            ${bullets([
+              `Use the dev compose: <span class="kbd">docker compose -f docker-compose.dev.yml up --build</span>`,
+              `Or mount your repo read-only and set <span class="kbd">REPO_ROOT</span> (example: <span class="kbd">- ./:/repo:ro</span> and <span class="kbd">REPO_ROOT=/repo</span>).`,
+            ])}
+          `);
+          $('content').appendChild(hint.firstElementChild);
+        }
+      } catch (_) {}
+    }
+
+    async function renderArchitecture() {
+      setTitle('Architecture');
+      const diagram = [
+        'Inference (Ollama)',
+        '  â†“',
+        'Orchestrator (state machine)',
+        '  â†“',
+        'Tools (fs/shell/git/web) + Memory (SQLite) + Metrics/Evals',
+      ].join('\\n');
+      $('content').innerHTML = [
+        makeCard('Three layers (mental model)', `
+          <p><strong>Inference layer</strong>: Ollama models (fast planner/executor + deeper critic, plus embeddings if enabled).</p>
+          <p><strong>Orchestration layer</strong>: a typed state machine that drives planning, tool execution, critique, and repair.</p>
+          <p><strong>Tool layer</strong>: explicit, logged capabilities (filesystem/shell/git/http_fetch/search).</p>
+          <div class="code">${esc(diagram)}</div>
+        `),
+        makeCard('Dataflow (one task)', `
+          ${bullets([
+            `UI sends <span class="kbd">POST /run</span> (or <span class="kbd">/run/stream</span>).`,
+            `Server creates/loads a session, injects recent turns + semantic examples + KB context.`,
+            `Planner returns a structured plan; Executor runs step-by-step.`,
+            `ToolExecution dispatches tool calls; artifacts + logs accumulate.`,
+            `Critic validates output (risk-tiered); Repair/Replan triggers if needed.`,
+            `Finalization persists memory and returns final answer + artifacts.`,
+          ])}
+        `),
+        makeCard('Where to read the implementation', `
+          ${bullets([
+            `<span class="kbd">src/main.rs</span> â€” wiring: config, tools, stores, axum router.`,
+            `<span class="kbd">src/orchestrator.rs</span> â€” orchestration driver.`,
+            `<span class="kbd">src/nodes/</span> â€” planner/executor/tool_execution/critic/repair/finalization.`,
+            `<span class="kbd">src/tools/</span> â€” individual tools and registry.`,
+            `<span class="kbd">src/memory/</span> â€” SQLite stores (episodic, conversation, semantic, KB, sources).`,
+            `<span class="kbd">src/api/server.rs</span> â€” HTTP API routes + handlers.`,
+          ])}
+        `),
+      ].join('');
+    }
+
+    async function renderOrchestrator() {
+      setTitle('Orchestrator');
+      $('content').innerHTML = [
+        makeCard('What the loop guarantees', `
+          ${bullets([
+            `<strong>Predictable phases</strong>: plan â†’ execute â†’ validate.`,
+            `<strong>Tool transparency</strong>: tool calls are explicit and logged (inputs/outputs/exit codes).`,
+            `<strong>Self-correction</strong>: critic feedback drives repair/replan loops.`,
+            `<strong>Human-in-the-loop</strong>: high-risk actions can pause for approval.`,
+          ])}
+        `),
+        makeCard('How to explain it in an interview', `
+          <p>â€œWe model the agent as a finite state machine. Each node is a pure step that consumes a typed <span class="kbd">SystemState</span> and emits artifacts/log events. The orchestrator routes based on risk, tool errors, and critic outcomes, which makes runs reproducible and debuggable.â€</p>
+          <details>
+            <summary>Good follow-up talking points</summary>
+            ${bullets([
+              `Separation of concerns: planning vs execution vs validation vs tool dispatch.`,
+              `Invariants: every tool call produces a structured result; every run has an event log.`,
+              `Failure modes: tool failure vs model failure vs grounding violations â€” handled differently.`,
+              `Latency: fast model for most nodes; deep critic only for high risk.`,
+            ])}
+          </details>
+        `),
+        makeCard('Suggested â€œfirst readâ€ files', `
+          ${bullets([
+            `Start at <span class="kbd">src/orchestrator.rs</span> and <span class="kbd">src/state.rs</span>.`,
+            `Then read <span class="kbd">src/nodes/executor.rs</span> and <span class="kbd">src/nodes/tool_execution.rs</span>.`,
+            `Finally: <span class="kbd">src/grounding.rs</span> for â€œfacts gateâ€ and trust UX design.`,
+          ])}
+        `),
+      ].join('');
+    }
+
+    async function renderTools() {
+      setTitle('Tools + Safety');
+      $('content').innerHTML = [
+        makeCard('Tooling model', `
+          <p>Tools are explicit capabilities (filesystem/shell/git/http_fetch/search). The agent cannot â€œmagicallyâ€ do side effects without emitting a tool call.</p>
+          ${bullets([
+            `<strong>Auditability</strong>: every tool call returns structured JSON + logs.`,
+            `<strong>Safety controls</strong>: risk scoring, approvals, and â€œgroundedâ€ contracts for research tasks.`,
+            `<strong>Environment correctness</strong>: the shell tool runs in the same OS as the server (PowerShell on Windows / sh on Linux).`,
+          ])}
+        `),
+        makeCard('How to demo safety', `
+          ${bullets([
+            `Show a high-risk action prompting approval (if enabled) before proceeding.`,
+            `Show that workspace operations are restricted to the configured root (path traversal blocked).`,
+            `Show grounded mode: claims are paired with a <span class="kbd">facts</span> table or blocked when missing.`,
+          ])}
+        `),
+        makeCard('Where the code lives', `
+          ${bullets([
+            `<span class="kbd">src/tools/</span> â€” tool implementations.`,
+            `<span class="kbd">src/nodes/tool_execution.rs</span> â€” dispatch + capturing results.`,
+            `<span class="kbd">src/grounding.rs</span> â€” â€œmust have factsâ€ enforcement.`,
+          ])}
+        `),
+      ].join('');
+    }
+
+    async function renderMemory() {
+      setTitle('Memory + Storage');
+      $('content').innerHTML = [
+        makeCard('What is stored', `
+          ${bullets([
+            `<strong>Episodic</strong>: task records (prompt, artifacts, outcomes).`,
+            `<strong>Conversation</strong>: sessions + turns for chat context injection.`,
+            `<strong>Semantic</strong>: embeddings for â€œsimilar past tasksâ€ retrieval (optional).`,
+            `<strong>Knowledge base</strong>: curated notes with tags + versions.`,
+            `<strong>Sources cache</strong>: fetched pages/snippets for grounded citations.`,
+          ])}
+        `),
+        makeCard('How to explain it', `
+          <p>â€œWe separate memory by purpose: replayable task logs (episodic), short-term chat history (conversation), vector similarity for repeated workflows (semantic), and curated durable notes (knowledge base). Each has a clear schema, and retrieval is intentionally small to avoid prompt bloat.â€</p>
+        `),
+        makeCard('Where the code lives', `
+          ${bullets([
+            `<span class="kbd">src/memory/</span> â€” stores + schemas.`,
+            `<span class="kbd">src/main.rs</span> â€” initializes DB paths and stores.`,
+            `<span class="kbd">src/api/server.rs</span> â€” KB + memory endpoints.`,
+          ])}
+        `),
+      ].join('');
+    }
+
+    async function renderApi() {
+      setTitle('HTTP API Tour');
+      $('content').innerHTML = [
+        makeCard('Endpoints to know', `
+          ${bullets([
+            `<span class="kbd">GET /</span> chat UI (embedded).`,
+            `<span class="kbd">POST /run</span> start a task (background).`,
+            `<span class="kbd">POST /run/stream</span> SSE streaming run.`,
+            `<span class="kbd">GET /task/:id</span> fetch a task record.`,
+            `<span class="kbd">GET /task/:id/status</span> live status.`,
+            `<span class="kbd">GET /workspace/*</span> IDE-lite file ops.`,
+            `<span class="kbd">GET /eval/*</span> eval cases + run suites.`,
+            `<span class="kbd">GET /health/deep</span> eval-backed health gate.`,
+            `<span class="kbd">GET /metrics</span> runtime counters/latencies.`,
+          ])}
+        `),
+        makeCard('Where it is implemented', `
+          <p>All routes are registered in <span class="kbd">src/api/server.rs</span>. The UI is a string constant in <span class="kbd">src/api/ui.rs</span>.</p>
+        `),
+      ].join('');
+    }
+
+    async function renderTalkTrack() {
+      setTitle('Talk Track');
+      const pitch = [
+        'aihomeserver is a local-first agent runtime written in Rust.',
+        '',
+        'It runs a predictable planâ†’executeâ†’validate loop (a finite state machine), dispatches explicit tools (filesystem/shell/git/web), and stores durable memory in SQLite.',
+        '',
+        'The UI is embedded into the binary for single-process deployment, and ops are built-in: eval suites, deep health, and metrics.',
+        '',
+        'The key design goal is trust and reproducibility: every run has a timeline, artifacts, and clear failure modes with repair/replan.',
+      ].join('\\n');
+      $('content').innerHTML = [
+        makeCard('1-minute high-level pitch', `
+          <div class="code">${esc(pitch)}</div>
+        `),
+        makeCard('Tradeoffs (be ready to discuss)', `
+          ${bullets([
+            `<strong>Embedded UI</strong>: no npm build step; tradeoff is less frontend tooling.`,
+            `<strong>State machine</strong> vs â€œagent frameworksâ€: simpler, typed, debuggable; tradeoff is more code you own.`,
+            `<strong>Local models</strong>: privacy + control; tradeoff is latency and GPU constraints.`,
+            `<strong>Safety</strong> without auth: intended for localhost/LAN; production needs auth + policy.`,
+          ])}
+        `),
+      ].join('');
+    }
+
+    async function renderQuestions() {
+      setTitle('Common Questions');
+      $('content').innerHTML = [
+        makeCard('Q&A to practice', `
+          <details open>
+            <summary>How do you keep runs predictable?</summary>
+            <p>Typed state machine, explicit tool calls, structured artifacts/event log, and eval-backed health. Failures route into repair/replan deterministically.</p>
+          </details>
+          <details>
+            <summary>How do you handle â€œLLM hallucinationsâ€?</summary>
+            <p>Grounding contracts for research tasks: outputs must be backed by fetched facts; otherwise the run is blocked or flagged. Critic validates high-risk outputs.</p>
+          </details>
+          <details>
+            <summary>What are the biggest risks?</summary>
+            <p>Powerful tools + no auth. Mitigations: localhost-only deployment, workspace root restrictions, approvals for high-risk actions, and audit logging.</p>
+          </details>
+          <details>
+            <summary>How would you productionize it?</summary>
+            <p>Add auth/authorization, per-user workspaces, rate limits, stronger audit trails, and separate least-privilege runtimes for tool execution.</p>
+          </details>
+        `),
+      ].join('');
+    }
+
+    async function renderChecklist() {
+      setTitle('Demo Checklist');
+      $('content').innerHTML = [
+        makeCard('Pre-demo', `
+          ${bullets([
+            `Start server (<span class="kbd">cargo run --release</span>) and open <span class="kbd">http://localhost:3000</span>.`,
+            `Confirm Ollama is reachable and models exist (fast + critic).`,
+            `Pick a safe workspace path; keep the repo clean (<span class="kbd">DATA_DIR=./data</span>).`,
+            `Have one â€œtoolfulâ€ task ready (files or git), and one â€œgrounded researchâ€ task ready.`,
+          ])}
+        `),
+        makeCard('During demo', `
+          ${bullets([
+            `Narrate the loop: planner output â†’ step execution â†’ tool results â†’ critic â†’ repair/replan.`,
+            `Show where the code lives (open <span class="kbd">src/main.rs</span> and <span class="kbd">src/api/server.rs</span>).`,
+            `Show diagnostics: <span class="kbd">/health/deep</span> or eval runner.`,
+            `Close with a productionization plan: auth + policies + auditing.`,
+          ])}
+        `),
+      ].join('');
+    }
+
+    async function searchFirst(query, preferFilePrefix) {
+      const j = await fetchJson(`/learn/search?q=${encodeURIComponent(query)}`);
+      const matches = j.matches ?? [];
+      if (!matches.length) return null;
+      if (preferFilePrefix) {
+        const m = matches.find(x => (x.file ?? '').startsWith(preferFilePrefix));
+        if (m) return m;
+      }
+      return matches[0];
+    }
+
+    /**
+     * “Jump” is a convenience used by lessons: search the repo for a string
+     * and open the first match in the embedded file viewer.
+     */
+    async function jumpTo(query, preferFilePrefix) {
+      const m = await searchFirst(query, preferFilePrefix);
+      if (!m) throw new Error(`No matches for: ${query}`);
+      await openRepoFile(m.file, m.line);
+      return m;
+    }
+
+    function quiz(items) {
+      const id = 'qz_' + Math.random().toString(36).slice(2);
+      return `
+        <div class="card">
+          <h2>Check Yourself</h2>
+          <p>Try answering before expanding.</p>
+          ${items.map((it, idx) => `
+            <details style="margin-bottom:8px">
+              <summary>${esc((idx + 1) + '. ' + it.q)}</summary>
+              <p>${esc(it.a)}</p>
+            </details>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    function jumpButtons(buttons) {
+      return `<div class="mutedRow">${buttons.map(b =>
+        `<button class="btn ${b.primary ? 'primary' : ''}" data-jump-q="${esc(b.q)}" data-jump-pref="${esc(b.pref ?? '')}">${esc(b.label)}</button>`
+      ).join('')}</div>`;
+    }
+
+    /**
+     * Attaches click handlers for any lesson buttons rendered by `jumpButtons(...)`.
+     * This is done after `innerHTML` render because the nodes are recreated on navigation.
+     */
+    function wireJumpButtons(root) {
+      for (const el of root.querySelectorAll('[data-jump-q]')) {
+        el.onclick = async () => {
+          const q = el.getAttribute('data-jump-q') || '';
+          const pref = el.getAttribute('data-jump-pref') || '';
+          try { await jumpTo(q, pref || null); }
+          catch (e) { alert(String(e?.message ?? e)); }
+        };
+      }
+    }
+
+    async function renderLessonTrace() {
+      setTitle('Trace a Request');
+      $('content').innerHTML = [
+        makeCard('Goal', `
+          <p>This lesson walks the real code path from â€œbrowser requestâ€ â†’ â€œRust handlerâ€ â†’ â€œorchestrator run loopâ€ â†’ â€œtoolsâ€ â†’ â€œstored memoryâ€.</p>
+          <p class="note">If you donâ€™t know Rust deeply yet, thatâ€™s fine: focus on the dataflow and â€œwhat calls whatâ€.</p>
+        `),
+        makeCard('1) Process startup (wiring)', `
+          <p><strong>What to learn:</strong> how config, tools, memory stores, and the HTTP router are created.</p>
+          ${jumpButtons([
+            { label: 'Open server startup (main)', q: 'async fn main', pref: 'src/main.rs', primary: true },
+            { label: 'Open AppState wiring', q: 'let app_state = AppState', pref: 'src/main.rs' },
+          ])}
+        `),
+        makeCard('2) Router + endpoints', `
+          <p><strong>What to learn:</strong> how routes map to handler functions and how shared state is injected.</p>
+          ${jumpButtons([
+            { label: 'Open router()', q: 'pub fn router(state: AppState)', pref: 'src/api/server.rs', primary: true },
+            { label: 'Open /run handler', q: 'async fn run_task', pref: 'src/api/server.rs' },
+            { label: 'Open /run/stream handler', q: 'async fn run_stream', pref: 'src/api/server.rs' },
+          ])}
+        `),
+        makeCard('3) Build the SystemState', `
+          <p><strong>What to learn:</strong> the â€œsingle state objectâ€ that flows through planner â†’ executor â†’ tool execution â†’ critic â†’ repair.</p>
+          ${jumpButtons([
+            { label: 'Open SystemState struct', q: 'pub struct SystemState', pref: 'src/state.rs', primary: true },
+            { label: 'Open SystemState::new', q: 'impl SystemState', pref: 'src/state.rs' },
+          ])}
+        `),
+        makeCard('4) Orchestrator loop', `
+          <p><strong>What to learn:</strong> where the state machine lives and how it routes between nodes.</p>
+          ${jumpButtons([
+            { label: 'Open Orchestrator', q: 'pub struct Orchestrator', pref: 'src/orchestrator.rs', primary: true },
+            { label: 'Open Orchestrator::run', q: 'pub async fn run', pref: 'src/orchestrator.rs' },
+          ])}
+        `),
+        makeCard('5) Tools + tool results', `
+          <p><strong>What to learn:</strong> tools are explicit â€œcapabilitiesâ€ with structured JSON outputs (this is key for safety and debugging).</p>
+          ${jumpButtons([
+            { label: 'Open tool registry', q: 'pub struct ToolRegistry', pref: 'src/tools/mod.rs', primary: true },
+            { label: 'Open tool execution node', q: 'tool_execution', pref: 'src/nodes/tool_execution.rs' },
+            { label: 'Open filesystem tool', q: 'struct FilesystemTool', pref: 'src/tools/filesystem.rs' },
+          ])}
+        `),
+        makeCard('6) Persistence (memory)', `
+          <p><strong>What to learn:</strong> what gets saved after a run and how SQLite tables store it.</p>
+          ${jumpButtons([
+            { label: 'Open EpisodicMemory (tasks table)', q: 'pub struct EpisodicMemory', pref: 'src/memory/episodic.rs', primary: true },
+            { label: 'Open where TaskRecord is saved', q: 'let record = TaskRecord', pref: 'src/api/server.rs' },
+          ])}
+        `),
+        quiz([
+          { q: 'Where do HTTP routes get registered?', a: 'In `src/api/server.rs` inside `pub fn router(state: AppState) -> Router`.' },
+          { q: 'What is the â€œone state objectâ€ that flows through the agent loop?', a: '`SystemState` in `src/state.rs`.' },
+          { q: 'Why are tool calls explicit rather than â€œmagicâ€?', a: 'Auditability + safety: side effects are logged and structured; you can replay/inspect exactly what happened.' },
+        ]),
+      ].join('');
+      wireJumpButtons($('content'));
+    }
+
+    async function renderLessonRust() {
+      setTitle('Rust in this Repo');
+      $('content').innerHTML = [
+        makeCard('You only need these Rust concepts (for this codebase)', `
+          ${bullets([
+            `<strong>Structs/enums</strong> are â€œdata modelsâ€ (like classes + tagged unions).`,
+            `<strong>impl blocks</strong> attach methods to types.`,
+            `<strong>Result&lt;T, E&gt;</strong> is Rustâ€™s error-return type (no exceptions).`,
+            `<strong>Arc&lt;T&gt;</strong> is shared ownership across threads/tasks.`,
+            `<strong>Mutex / RwLock</strong> provide safe shared mutability.`,
+            `<strong>async/await</strong> lets the server do concurrent I/O without blocking threads.`,
+          ])}
+        `),
+        makeCard('Where these show up (click to open)', `
+          ${jumpButtons([
+            { label: 'Arc / RwLock usage', q: 'Arc<RwLock<ServerConfig>>', pref: 'src', primary: true },
+            { label: 'AppState (shared state)', q: 'pub struct AppState', pref: 'src/api/server.rs' },
+            { label: 'Result + anyhow', q: 'use anyhow::Result', pref: 'src/main.rs' },
+            { label: 'Serde (JSON)', q: '#[derive(Deserialize)]', pref: 'src/api/server.rs' },
+          ])}
+        `),
+        makeCard('Mental translations (if you come from JS/Python)', `
+          ${bullets([
+            `<span class="kbd">struct</span> â‰ˆ a plain object with fixed fields (schema).`,
+            `<span class="kbd">enum</span> â‰ˆ a tagged union: {type: "...", ...}.`,
+            `<span class="kbd">match</span> â‰ˆ a switch that must cover all cases.`,
+            `<span class="kbd">Option&lt;T&gt;</span> â‰ˆ T | null (but explicit).`,
+            `<span class="kbd">Arc&lt;Mutex&lt;T&gt;&gt;</span> â‰ˆ shared object protected by a lock.`,
+          ])}
+        `),
+        quiz([
+          { q: 'Why do we wrap config in Arc<RwLock<...>>?', a: 'So many handlers/tools can read it concurrently, and settings can be updated safely at runtime.' },
+          { q: 'What does Result mean for control flow?', a: 'Every fallible operation returns Ok(value) or Err(error); callers explicitly handle errors.' },
+          { q: 'Why â€œOptionâ€ instead of null?', a: 'It forces you to handle missing values explicitly, preventing a big class of runtime bugs.' },
+        ]),
+      ].join('');
+      wireJumpButtons($('content'));
+    }
+
+    async function renderLessonAsync() {
+      setTitle('Async + Concurrency');
+      $('content').innerHTML = [
+        makeCard('What â€œasyncâ€ means here', `
+          <p>Most work is network/filesystem I/O: calling Ollama, reading/writing files, hitting SQLite. Async lets one thread handle many in-flight operations.</p>
+          ${bullets([
+            `<strong>tokio</strong> is the async runtime (event loop + scheduler).`,
+            `<strong>await</strong> yields while waiting for I/O.`,
+            `<strong>tokio::spawn</strong> runs work in the background (used for /run).`,
+          ])}
+        `),
+        makeCard('Open the real async patterns', `
+          ${jumpButtons([
+            { label: 'Spawn background task (/run)', q: 'tokio::spawn(async move', pref: 'src/api/server.rs', primary: true },
+            { label: 'SSE stream (/run/stream)', q: 'Sse<', pref: 'src/api/server.rs' },
+            { label: 'Tool execution (async I/O)', q: 'async fn', pref: 'src/nodes/tool_execution.rs' },
+          ])}
+        `),
+        quiz([
+          { q: 'Why not just â€œblockâ€ and do one request at a time?', a: 'Blocking would waste CPU time while waiting on network/DB; async improves throughput and responsiveness.' },
+          { q: 'What risk does shared state introduce in async code?', a: 'Race conditions. Rust forces you to use Arc + locks to share mutable state safely.' },
+        ]),
+      ].join('');
+      wireJumpButtons($('content'));
+    }
+
+    async function renderLessonAxum() {
+      setTitle('Axum HTTP Basics');
+      $('content').innerHTML = [
+        makeCard('The pattern', `
+          ${bullets([
+            `<span class="kbd">Router::new().route("/path", get(handler))</span>`,
+            `Handlers are async functions that take â€œextractorsâ€ like <span class="kbd">State</span>, <span class="kbd">Json</span>, <span class="kbd">Path</span>, <span class="kbd">Query</span>.`,
+            `<span class="kbd">AppState</span> is cloned and shared with <span class="kbd">with_state(state)</span>.`,
+          ])}
+        `),
+        makeCard('Open the code', `
+          ${jumpButtons([
+            { label: 'Router registration', q: 'pub fn router(state: AppState)', pref: 'src/api/server.rs', primary: true },
+            { label: 'Example handler (workspace/file)', q: 'async fn workspace_file', pref: 'src/api/server.rs' },
+          ])}
+        `),
+        quiz([
+          { q: 'Where does handler state come from?', a: 'Axum injects it via `State(app): State<AppState>`; the router is configured with `.with_state(state)`.' },
+        ]),
+      ].join('');
+      wireJumpButtons($('content'));
+    }
+
+    async function renderLessonTools() {
+      setTitle('Tools + Results');
+      $('content').innerHTML = [
+        makeCard('Why tools matter', `
+          <p>Tools are the only way the agent can cause side effects. Thatâ€™s the foundation for safety and debugging.</p>
+          ${bullets([
+            `Every tool returns structured JSON (success/error_code/trace/stdout/etc).`,
+            `Tool results are stored in artifacts and can be replayed in Learn â†’ Run Replay.`,
+            `Workspace is sandboxed to a root path (path traversal blocked).`,
+          ])}
+        `),
+        makeCard('Open the code', `
+          ${jumpButtons([
+            { label: 'Tool registry + trait', q: 'pub trait Tool', pref: 'src/tools/mod.rs', primary: true },
+            { label: 'Filesystem safety checks', q: 'Path outside workspace', pref: 'src/api/server.rs' },
+            { label: 'HTTP fetch tool', q: 'struct HttpFetchTool', pref: 'src/tools/http_fetch.rs' },
+          ])}
+        `),
+        quiz([
+          { q: 'How do you debug a â€œtool failedâ€ run?', a: 'Open Run Replay â†’ inspect `*_result` artifacts and event_log; youâ€™ll see error_code + trace + stdout/stderr.' },
+        ]),
+      ].join('');
+      wireJumpButtons($('content'));
+    }
+
+    async function renderLessonMemory() {
+      setTitle('SQLite Memory');
+      $('content').innerHTML = [
+        makeCard('What gets stored', `
+          ${bullets([
+            `<strong>Episodic tasks</strong>: user_request, plan_json, artifacts_json, success, timings.`,
+            `<strong>Conversations</strong>: sessions + turns (used for context injection).`,
+            `<strong>Knowledge base</strong>: curated notes (topic/summary/content/tags).`,
+          ])}
+        `),
+        makeCard('Open the code', `
+          ${jumpButtons([
+            { label: 'Tasks table schema', q: 'CREATE TABLE IF NOT EXISTS tasks', pref: 'src/memory/episodic.rs', primary: true },
+            { label: 'Save TaskRecord', q: 'pub async fn save(&self, record: &TaskRecord)', pref: 'src/memory/episodic.rs' },
+            { label: 'Conversation store', q: 'pub struct ConversationStore', pref: 'src/memory/conversation.rs' },
+          ])}
+        `),
+        quiz([
+          { q: 'Why store artifacts_json as JSON text?', a: 'Flexibility: artifacts evolve without constant schema migrations, but still persist everything needed to debug.' },
+        ]),
+      ].join('');
+      wireJumpButtons($('content'));
+    }
+
+    async function renderLessonGrounding() {
+      setTitle('Grounding Contract');
+      $('content').innerHTML = [
+        makeCard('The problem', `
+          <p>LLMs can confidently output incorrect claims. For research-like tasks, you want â€œclaims with evidenceâ€.</p>
+        `),
+        makeCard('The approach', `
+          ${bullets([
+            `Detect when a request requires grounding (research, â€œlatestâ€, patch/version checks, etc).`,
+            `Force tool usage (search + http_fetch) and store sources.`,
+            `Require a <span class="kbd">facts</span> table and block outputs that arenâ€™t backed by facts.`,
+          ])}
+        `),
+        makeCard('Open the code', `
+          ${jumpButtons([
+            { label: 'Grounding enforcement', q: 'request_needs_grounding', pref: 'src/grounding.rs', primary: true },
+            { label: 'Sources cache store', q: 'SourceCacheStore', pref: 'src/memory/sources.rs' },
+          ])}
+        `),
+        quiz([
+          { q: 'Whatâ€™s the invariant you can tell an interviewer?', a: 'For grounded tasks, the system refuses to answer without evidence; all claims must map to stored sources/facts.' },
+        ]),
+      ].join('');
+      wireJumpButtons($('content'));
+    }
+
+    // (learn) interactive panels live above this point
+
+    function prettyJson(obj) {
+      try { return JSON.stringify(obj, null, 2); } catch (_) { return String(obj); }
+    }
+
+    /**
+     * Runs a practice prompt from the Labs page without leaving `/learn`.
+     *
+     * Flow:
+     * 1) POST `/run` to start a background task.
+     * 2) Poll `/task/:id/status` until it completes.
+     * 3) Render the “answer” artifact (or raw artifacts) inline.
+     *
+     * This turns Labs into a loop: read → run → inspect → repeat.
+     */
+    async function runPracticePrompt(prompt, mountId) {
+      const mount = document.getElementById(mountId);
+      if (!mount) return;
+      mount.innerHTML = `<div class="note">Starting...</div>`;
+      try {
+        const quick = await postJson('/run', { request: prompt, max_steps: 6 });
+        const taskId = (quick?.task_id ?? '').toString();
+        if (!taskId) throw new Error('Missing task_id');
+        try { localStorage.setItem('learn_last_task_id', taskId); } catch (_) {}
+
+        mount.innerHTML = `<div class="note">Running <span class="kbd">${esc(taskId)}</span>...</div>`;
+
+        const started = Date.now();
+        while (Date.now() - started < 240_000) {
+          await sleep(900);
+          const st = await fetchJson(`/task/${encodeURIComponent(taskId)}/status`);
+          const status = (st?.status ?? '').toString();
+          if (status === 'running') continue;
+          if (status === 'failed') {
+            mount.innerHTML = `<div class="card" style="margin:10px 0 0 0">
+              <h3>Run failed</h3>
+              <div class="code">${esc(st?.error ?? 'unknown error')}</div>
+              <div class="mutedRow"><button class="btn" onclick="navigate('replay')">Open Run Replay</button></div>
+            </div>`;
+            return;
+          }
+          if (status === 'done') {
+            const resp = st?.response ?? {};
+            const artifacts = resp?.artifacts ?? {};
+            const answer = (artifacts?.answer && typeof artifacts.answer === 'string') ? artifacts.answer : '';
+            mount.innerHTML = `<div class="card" style="margin:10px 0 0 0">
+              <h3>Run result</h3>
+              <div class="mutedRow">
+                ${taskBadge(!!resp?.success)}
+                <span class="tag"><strong>duration</strong> ${esc(resp?.duration_ms ?? 0)}ms</span>
+                <span class="tag"><strong>steps</strong> ${esc(resp?.steps_taken ?? 0)}</span>
+                <span class="tag"><strong>repairs</strong> ${esc(resp?.repair_cycles ?? 0)}</span>
+                <span class="tag"><strong>failures</strong> ${esc(resp?.failure_count ?? 0)}</span>
+              </div>
+              ${answer ? `<div class="code" style="margin-top:10px">${esc(answer)}</div>` : `<details style="margin-top:10px"><summary>Artifacts</summary><div class="code">${esc(prettyJson(artifacts))}</div></details>`}
+              <div class="mutedRow" style="margin-top:10px">
+                <button class="btn" onclick="copyText(${JSON.stringify(taskId)})">Copy task id</button>
+                <button class="btn primary" onclick="navigate('replay')">Open Run Replay</button>
+              </div>
+            </div>`;
+            return;
+          }
+
+          // Unexpected status; keep polling briefly.
+        }
+        mount.innerHTML = `<div class="note">Timed out waiting for the run to finish. Open Run Replay to check status.</div>`;
+      } catch (e) {
+        mount.innerHTML = `<div class="note">Failed: ${esc(e?.message ?? e)}</div>`;
+      }
+    }
+
+    async function renderDiagnostics() {
+      setTitle('Diagnostics');
+      $('content').innerHTML = [
+        makeCard('What this shows', `
+          <p>These endpoints are your credibility boosters in an interview: reproducible evals, deep health gating, and observable metrics.</p>
+          ${bullets([
+            `Deep health is eval-backed (<span class="kbd">/health/deep</span>) and can return non-200 when capabilities break.`,
+            `Evals are runnable on demand (<span class="kbd">/eval/run</span>) and listable (<span class="kbd">/eval/cases</span>).`,
+            `Self-check aggregates multiple checks (<span class="kbd">/eval/self_check</span>).`,
+          ])}
+        `),
+        `<div class="card">
+          <h2>Controls</h2>
+          <div class="mutedRow">
+            <button class="btn primary" id="btnSelfCheck">Run self-check</button>
+            <button class="btn" id="btnDeepHealth">GET /health/deep</button>
+            <button class="btn" id="btnListCases">List eval cases</button>
+            <button class="btn" id="btnRunQuick">Run eval: quick</button>
+            <button class="btn" id="btnRunFull">Run eval: full</button>
+          </div>
+          <div class="note" style="margin-top:10px">Output:</div>
+          <div class="code" id="diagOut">Click a button to run.</div>
+        </div>`,
+      ].join('');
+
+      const out = $('diagOut');
+      const setOut = (x) => { out.textContent = x; };
+      const busy = (b) => {
+        for (const id of ['btnSelfCheck','btnDeepHealth','btnListCases','btnRunQuick','btnRunFull']) {
+          const el = $(id);
+          if (el) el.disabled = !!b;
+        }
+      };
+
+      $('btnSelfCheck').onclick = async () => {
+        busy(true); setOut('Running /eval/self_checkâ€¦');
+        try { setOut(prettyJson(await fetchJson('/eval/self_check'))); }
+        catch (e) { setOut(String(e?.message ?? e)); }
+        finally { busy(false); }
+      };
+      $('btnDeepHealth').onclick = async () => {
+        busy(true); setOut('Fetching /health/deepâ€¦');
+        try {
+          const r = await fetch('/health/deep');
+          const txt = await r.text();
+          let j = null; try { j = JSON.parse(txt); } catch (_) {}
+          setOut((j ? prettyJson(j) : txt) + `\\n\\nHTTP ${r.status}`);
+        } catch (e) { setOut(String(e?.message ?? e)); }
+        finally { busy(false); }
+      };
+      $('btnListCases').onclick = async () => {
+        busy(true); setOut('Fetching /eval/casesâ€¦');
+        try { setOut(prettyJson(await fetchJson('/eval/cases'))); }
+        catch (e) { setOut(String(e?.message ?? e)); }
+        finally { busy(false); }
+      };
+      $('btnRunQuick').onclick = async () => {
+        busy(true); setOut('POST /eval/run {"mode":"quick"}â€¦');
+        try { setOut(prettyJson(await postJson('/eval/run', { mode: 'quick' }))); }
+        catch (e) { setOut(String(e?.message ?? e)); }
+        finally { busy(false); }
+      };
+      $('btnRunFull').onclick = async () => {
+        busy(true); setOut('POST /eval/run {"mode":"full"}â€¦');
+        try { setOut(prettyJson(await postJson('/eval/run', { mode: 'full' }))); }
+        catch (e) { setOut(String(e?.message ?? e)); }
+        finally { busy(false); }
+      };
+    }
+
+    async function renderMetricsPanel() {
+      setTitle('Metrics');
+      $('content').innerHTML = [
+        makeCard('How to talk about this', `
+          <p>Metrics make agent behavior observable: you can answer â€œwhat got slower?â€, â€œwhat fails?â€, and â€œwhat tools are used?â€.</p>
+          ${bullets([
+            `Use this view to watch counters move while you run tasks in the Chat UI.`,
+            `In an interview, emphasize that metrics + evals make the system safer to evolve.`,
+          ])}
+        `),
+        `<div class="card">
+          <h2>Live metrics</h2>
+          <div class="mutedRow">
+            <button class="btn primary" id="btnMetricsRefresh">Refresh</button>
+            <button class="btn" id="btnMetricsToggle">Auto: off</button>
+          </div>
+          <div class="note" style="margin-top:10px">Output:</div>
+          <div class="code" id="metricsOut">Click Refresh.</div>
+        </div>`,
+      ].join('');
+
+      const out = $('metricsOut');
+      let timer = null;
+      const setOut = (x) => { out.textContent = x; };
+
+      async function refresh() {
+        try {
+          const j = await fetchJson('/metrics');
+          setOut(prettyJson(j));
+        } catch (e) {
+          setOut(String(e?.message ?? e));
+        }
+      }
+
+      $('btnMetricsRefresh').onclick = refresh;
+      $('btnMetricsToggle').onclick = async () => {
+        if (timer) {
+          clearInterval(timer);
+          timer = null;
+          $('btnMetricsToggle').textContent = 'Auto: off';
+          return;
+        }
+        await refresh();
+        timer = setInterval(refresh, 1500);
+        $('btnMetricsToggle').textContent = 'Auto: on';
+      };
+    }
+
+    function taskBadge(success) {
+      const label = success ? 'ok' : 'fail';
+      return `<span class="tag"><strong>${label}</strong></span>`;
+    }
+
+    async function renderReplay() {
+      setTitle('Run Replay');
+      $('content').innerHTML = [
+        makeCard('What this is', `
+          <p>Pick a past run and study: plan JSON, artifacts, critic scores, and persisted event logs.</p>
+          <p class="note">Tip: run a few tasks in the Chat UI first, then come back here.</p>
+        `),
+        `<div class="card">
+          <h2>History</h2>
+          <div class="split">
+            <div>
+              <div class="mutedRow">
+                <button class="btn primary" id="btnHistRefresh">Refresh history</button>
+              </div>
+              <div id="histList" style="margin-top:10px"></div>
+            </div>
+            <div>
+              <div id="histDetail"><div class="note">Select a run.</div></div>
+            </div>
+          </div>
+        </div>`,
+      ].join('');
+
+      const list = $('histList');
+      const detail = $('histDetail');
+
+      function renderHistoryRows(items) {
+        if (!items.length) return `<div class="note">No tasks found.</div>`;
+        return items.map(r => {
+          const req = (r.user_request ?? '').toString().trim();
+          const short = req.length > 80 ? req.slice(0, 77) + 'â€¦' : req;
+          return `
+            <div class="hit" data-id="${esc(r.task_id)}" style="margin-bottom:6px">
+              <span class="file">${short ? esc(short) : esc(r.task_id)}</span>
+              <span class="line">${r.duration_ms ?? 0}ms</span>
+              <span class="prev">${(r.created_at ?? '').toString().replace('T',' ').replace('Z','')}</span>
+            </div>`;
+        }).join('');
+      }
+
+      function renderPlan(plan) {
+        if (!plan || !Array.isArray(plan.steps)) return `<div class="note">No plan captured.</div>`;
+        const steps = plan.steps.map((s, idx) => {
+          const tool = (s.tool_name || s.tool || '').toString();
+          const desc = (s.description || '').toString();
+          const n = idx + 1;
+          return `<li><span class="kbd">${n}</span> ${esc(desc)} ${tool ? `<span class="tag"><strong>tool</strong> ${esc(tool)}</span>` : ''}</li>`;
+        }).join('');
+        return `<ol style="margin:8px 0 0 18px">${steps}</ol>`;
+      }
+
+      function renderArtifacts(obj) {
+        if (!obj || typeof obj !== 'object') return `<div class="note">No artifacts.</div>`;
+        const keys = Object.keys(obj).sort();
+        const answer = (obj.answer && typeof obj.answer === 'string') ? obj.answer : '';
+        const ev = Array.isArray(obj.event_log) ? obj.event_log : null;
+        const toolKeys = keys.filter(k => k.endsWith('_result'));
+        return `
+          ${answer ? `<div class="card" style="margin:0 0 10px 0"><h3>Answer (artifact)</h3><div class="code">${esc(answer)}</div></div>` : ''}
+          <details open>
+            <summary>Artifacts keys (${keys.length})</summary>
+            <div class="code">${esc(keys.join('\\n'))}</div>
+          </details>
+          ${toolKeys.length ? `
+            <details>
+              <summary>Tool results (${toolKeys.length})</summary>
+              <div class="code">${esc(toolKeys.join('\\n'))}</div>
+            </details>` : ''}
+          ${ev ? `
+            <details>
+              <summary>Event log (${ev.length})</summary>
+              <div class="code">${esc(prettyJson(ev))}</div>
+            </details>` : ''}
+        `;
+      }
+
+      async function loadDetail(id) {
+        detail.innerHTML = `<div class="note">Loading ${esc(id)}â€¦</div>`;
+        try {
+          const rec = await fetchJson(`/task/${encodeURIComponent(id)}`);
+          let plan = null;
+          let artifacts = null;
+          try { plan = rec.plan_json ? JSON.parse(rec.plan_json) : null; } catch (_) {}
+          try { artifacts = rec.artifacts_json ? JSON.parse(rec.artifacts_json) : null; } catch (_) {}
+
+          const headline = (rec.user_request ?? '').toString().trim() || rec.task_id;
+          detail.innerHTML = [
+            `<div class="card" style="margin:0 0 10px 0">
+              <h3>Run</h3>
+              <p style="color:var(--text)">${esc(headline)}</p>
+              <div class="mutedRow">
+                ${taskBadge(!!rec.success)}
+                <span class="tag"><strong>duration</strong> ${esc(rec.duration_ms ?? 0)}ms</span>
+                <span class="tag"><strong>repairs</strong> ${esc(rec.repair_cycles ?? 0)}</span>
+                <span class="tag"><strong>failures</strong> ${esc(rec.failure_count ?? 0)}</span>
+              </div>
+              <div class="mutedRow" style="margin-top:10px">
+                <button class="btn" onclick="copyText(${JSON.stringify(rec.user_request ?? '')})">Copy prompt</button>
+                <button class="btn" onclick="copyText(${JSON.stringify(id)})">Copy task id</button>
+              </div>
+            </div>`,
+            `<div class="card" style="margin:0 0 10px 0"><h3>Plan</h3>${renderPlan(plan)}</div>`,
+            `<div class="card" style="margin:0"><h3>Artifacts</h3>${renderArtifacts(artifacts)}</div>`,
+          ].join('');
+        } catch (e) {
+          detail.innerHTML = `<div class="note">Failed: ${esc(e?.message ?? e)}</div>`;
+        }
+      }
+
+      async function refresh() {
+        list.innerHTML = `<div class="note">Loadingâ€¦</div>`;
+        detail.innerHTML = `<div class="note">Select a run.</div>`;
+        try {
+          const items = await fetchJson('/history');
+          list.innerHTML = renderHistoryRows(items ?? []);
+          for (const el of list.querySelectorAll('.hit')) {
+            el.onclick = () => loadDetail(el.dataset.id);
+          }
+          try {
+            const last = localStorage.getItem('learn_last_task_id');
+            if (last && last.trim()) loadDetail(last.trim());
+          } catch (_) {}
+        } catch (e) {
+          list.innerHTML = `<div class="note">Failed: ${esc(e?.message ?? e)}</div>`;
+        }
+      }
+
+      $('btnHistRefresh').onclick = refresh;
+      await refresh();
+    }
+
+    const GLOSSARY = [
+      { term: 'Orchestrator', why: 'Predictable agent loop', body: 'A finite state machine that routes between nodes (planner/executor/tool execution/critic/repair). This is the â€œagent runtimeâ€.', open: 'src/orchestrator.rs' },
+      { term: 'SystemState', why: 'Single source of truth', body: 'Typed struct holding the task request, current plan, artifacts, risk, logs, and memory context for a run.', open: 'src/state.rs' },
+      { term: 'Artifacts', why: 'Debuggable outputs', body: 'A structured map of intermediate and final outputs (tool results, summaries, facts, answer). Itâ€™s what you inspect when something goes wrong.', open: 'src/api/server.rs' },
+      { term: 'Risk gating', why: 'Safety + human-in-the-loop', body: 'High risk tasks can require explicit approval. Critic depth escalates with risk.', open: 'src/nodes/intake.rs' },
+      { term: 'Grounding', why: 'Anti-hallucination contract', body: 'Some request types must be backed by fetched evidence (â€œfacts tableâ€). Output can be blocked if not grounded.', open: 'src/grounding.rs' },
+      { term: 'Evals', why: 'Reproducibility', body: 'Test-like cases that validate tool connectivity and key behaviors. Used for deep health and confidence.', open: 'src/api/evals.rs' },
+    ];
+
+    async function renderGlossary() {
+      setTitle('Glossary');
+      $('content').innerHTML = [
+        makeCard('Use this to study', `
+          <p>Memorize the â€œwhyâ€ for each term. In interviews, youâ€™re selling tradeoffs and invariants, not just features.</p>
+        `),
+        `<div class="card">
+          <h2>Terms</h2>
+          <div id="glossTop" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap">
+            <input id="glossQ" class="input" placeholder="Filter termsâ€¦" />
+            <button class="btn primary" id="glossClear">Clear</button>
+          </div>
+          <div id="glossList" style="margin-top:10px"></div>
+        </div>`,
+      ].join('');
+
+      const q = $('glossQ');
+      const list = $('glossList');
+
+      function render(items) {
+        if (!items.length) { list.innerHTML = `<div class="note">No matches.</div>`; return; }
+        list.innerHTML = items.map(it => `
+          <details style="margin-bottom:8px" open>
+            <summary>${esc(it.term)} <span class="hint" style="margin-left:8px">${esc(it.why)}</span></summary>
+            <p>${esc(it.body)}</p>
+            ${it.open ? `<div class="mutedRow"><button class="btn" onclick="openRepoFile(${JSON.stringify(it.open)}, null)">Open ${esc(it.open)}</button></div>` : ''}
+          </details>
+        `).join('');
+      }
+
+      function filter() {
+        const s = (q.value ?? '').toLowerCase().trim();
+        const items = !s ? GLOSSARY : GLOSSARY.filter(it =>
+          (it.term ?? '').toLowerCase().includes(s) ||
+          (it.body ?? '').toLowerCase().includes(s) ||
+          (it.why ?? '').toLowerCase().includes(s)
+        );
+        render(items);
+      }
+
+      q.oninput = filter;
+      $('glossClear').onclick = () => { q.value = ''; filter(); };
+      render(GLOSSARY);
+    }
+
+    const LABS = [
+      {
+        title: 'Tour the HTTP router',
+        goal: 'Prove you can find entry points fast.',
+        prompt: 'Show me where the HTTP routes are registered and list the most important endpoints. Point to the file and function names.',
+      },
+      {
+        title: 'Explain the agent loop',
+        goal: 'Narrate the planâ†’executeâ†’criticâ†’repair cycle like a systems engineer.',
+        prompt: 'Explain how the orchestrator state machine works (nodes, transitions, termination conditions). Cite which files implement which parts.',
+      },
+      {
+        title: 'Demonstrate eval-driven trust',
+        goal: 'Show reproducibility and safety.',
+        prompt: 'Run the quick eval suite and summarize what it validates. If something fails, explain likely causes and how you would debug.',
+      },
+      {
+        title: 'Grounded research contract',
+        goal: 'Show anti-hallucination architecture.',
+        prompt: 'Explain how grounded research is enforced and how facts are tracked and surfaced. Show where the contract is implemented.',
+      },
+    ];
+
+    async function renderLabs() {
+      setTitle('Hands-on Labs');
+      $('content').innerHTML = [
+        makeCard('How to use these', `
+          <p>Each lab is a practice prompt. You can run it in Chat UI, or run it right here and then jump to <span class="kbd">Run Replay</span> to inspect plan + artifacts.</p>
+        `),
+        `<div class="card">
+          <h2>Labs</h2>
+          <div id="labsList"></div>
+        </div>`,
+      ].join('');
+
+      const mount = $('labsList');
+      mount.innerHTML = LABS.map((l, idx) => `
+        <div class="card" style="margin:10px 0; background:var(--surface2)">
+          <h3>${esc(idx + 1 + '. ' + l.title)}</h3>
+          <p><strong>Goal:</strong> ${esc(l.goal)}</p>
+          <div class="code">${esc(l.prompt)}</div>
+          <div class="mutedRow">
+            <button class="btn primary" onclick="copyText(${JSON.stringify(l.prompt)})">Copy prompt</button>
+            <button class="btn" onclick="runPracticePrompt(${JSON.stringify(l.prompt)}, 'labOut_${idx}')">Run here</button>
+            <a class="linkBtn" href="/" style="padding:7px 10px">Open Chat UI</a>
+          </div>
+          <div id="labOut_${idx}"></div>
+        </div>
+      `).join('');
+    }
+    async function renderDoc(path, title) {
+      setTitle(title);
+      $('content').innerHTML = makeCard(title, `<div class="note">Loading <span class="kbd">${esc(path)}</span>â€¦</div>`);
+      try {
+        const j = await fetchJson(`/learn/file?path=${encodeURIComponent(path)}`);
+        const note = j.truncated ? `<span class="tag"><strong>note</strong> truncated</span>` : '';
+        const emb = j.embedded ? `<span class="tag"><strong>source</strong> embedded</span>` : `<span class="tag"><strong>source</strong> repo</span>`;
+        const meta = `<div class="docMeta">${emb}${note}<span class="tag"><strong>path</strong> ${esc(path)}</span></div>`;
+        $('content').innerHTML = makeCard(title, `${meta}${mdToSafeHtml(j.content ?? '')}`);
+      } catch (e) {
+        $('content').innerHTML = makeCard(title, `<p>Failed to load: ${esc(e?.message ?? e)}</p>`);
+      }
+    }
+
+    // ---------- Code tour pages ----------
+    async function renderCodeFile(path, title) {
+      setTitle(title);
+      $('content').innerHTML = makeCard(title, `<div class="note">Loading <span class="kbd">${esc(path)}</span>â€¦</div>`);
+      try {
+        const { file: j, outline } = await fetchFileAndOutline(path);
+        $('content').innerHTML = [
+          `<div class="card"><h2>${esc(title)}</h2><p>Path: <span class="kbd">${esc(path)}</span></p></div>`,
+          renderFileViewer(path, j.content ?? '', j.truncated, null, outline.symbols ?? []),
+        ].join('');
+        wireOutlineClicks($('content'));
+      } catch (e) {
+        $('content').innerHTML = makeCard(title, `<p>Failed to load: ${esc(e?.message ?? e)}</p>`);
+      }
+    }
+
+    function renderOutline(symbols, path) {
+      const items = Array.isArray(symbols) ? symbols : [];
+      if (!items.length) return `<div class="note">No symbols found.</div>`;
+      return `
+        <div class="outline">
+          ${items.map(s => `
+            <div class="outlineItem" data-path="${esc(path)}" data-line="${esc(s.line)}">
+              <span class="outlineKind">${esc(s.kind)}</span>
+              <span class="outlineName">${esc(s.name)}</span>
+              <span class="outlineLine">:${esc(s.line)}</span>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    function wireOutlineClicks(rootEl) {
+      for (const el of rootEl.querySelectorAll('.outlineItem')) {
+        el.onclick = () => {
+          const p = el.dataset.path;
+          const ln = parseInt(el.dataset.line || '0', 10) || null;
+          openRepoFile(p, ln);
+        };
+      }
+    }
+
+    function renderFileViewer(path, content, truncated, highlightLine, symbols) {
+      const lines = (content ?? '').split('\\n');
+      const maxLines = 2200;
+      const shown = lines.slice(0, maxLines);
+      const isTrunc = truncated || lines.length > maxLines;
+      let html = '';
+      for (let i = 0; i < shown.length; i++) {
+        const ln = i + 1;
+        const cls = (highlightLine === ln) ? ' style="background:rgba(201,123,75,0.12)"' : '';
+        html += `<div${cls}><span class="ln">${ln.toString().padStart(4,' ')}</span>${esc(shown[i])}</div>`;
+      }
+      return `
+        <div class="card">
+          <div id="fileHeader">
+            <div id="filePath" title="${esc(path)}">${esc(path)}</div>
+            <div style="display:flex; gap:8px; align-items:center">
+              <button class="btn" onclick="copyText(${JSON.stringify(path)})">Copy path</button>
+              <button class="btn" onclick="copyText(${JSON.stringify(content ?? '')})">Copy file</button>
+            </div>
+          </div>
+          <details style="margin-top:10px" ${Array.isArray(symbols) && symbols.length ? 'open' : ''}>
+            <summary>Outline</summary>
+            ${renderOutline(symbols, path)}
+          </details>
+          ${isTrunc ? `<div class="note">Note: file display truncated (for performance). Use your editor for full context.</div>` : ''}
+          <div class="code" style="margin-top:10px">${html}</div>
+        </div>
+      `;
+    }
+
+    function copyText(text) {
+      navigator.clipboard?.writeText(text).catch(() => {});
+    }
+
+    async function renderBrowser() {
+      setTitle('Browse + Search');
+      $('content').innerHTML = [
+        `<div class="card">
+          <h2>Repo browser</h2>
+          <p>Browse and search the server's repo root from the browser. This is read-only and intended for interview prep.</p>
+          <div class="mutedRow">
+            <span class="tag"><strong>Tree</strong> <span class="kbd">GET /learn/tree</span></span>
+            <span class="tag"><strong>File</strong> <span class="kbd">GET /learn/file?path=â€¦</span></span>
+            <span class="tag"><strong>Search</strong> <span class="kbd">GET /learn/search?q=â€¦</span></span>
+          </div>
+        </div>`,
+        `<div class="card">
+          <div id="browserTop">
+            <input id="searchBox" class="input" placeholder="Search repo (substring)â€¦" />
+            <button id="searchBtn" class="btn primary">Search</button>
+            <button id="refreshTreeBtn" class="btn">Refresh tree</button>
+          </div>
+          <div class="split">
+            <div>
+              <h3 style="margin:0 0 8px 0">Tree</h3>
+              <div id="tree"><div class="note">Loadingâ€¦</div></div>
+            </div>
+            <div>
+              <h3 style="margin:0 0 8px 0">Results</h3>
+              <div id="results"><div class="note">Type a query and hit Search.</div></div>
+            </div>
+          </div>
+        </div>`,
+        `<div id="fileMount"></div>`,
+      ].join('');
+
+      $('searchBtn').onclick = () => runRepoSearch();
+      $('searchBox').onkeydown = (e) => { if (e.key === 'Enter') runRepoSearch(); };
+      $('refreshTreeBtn').onclick = () => loadTree();
+
+      await loadTree();
+    }
+
+    let lastOpenedPath = null;
+    /**
+     * Opens a repo file inside the Browser page (tree + file viewer).
+     *
+     * Important: `#fileMount` only exists on the Browser route. If a lesson’s
+     * “Open …” button is clicked from a different route, we navigate first.
+     */
+    async function openRepoFile(path, highlightLine) {
+      lastOpenedPath = path;
+      // If we're not currently on the Browser page, navigate there first so #fileMount exists.
+      if (!$('fileMount')) {
+        await navigate('browser', { setHash: true, scrollTop: false });
+      }
+      for (const el of document.querySelectorAll('.treeRow')) {
+        el.classList.toggle('active', el.dataset.path === path);
+      }
+      try {
+        const { file, outline } = await fetchFileAndOutline(path);
+        $('fileMount').innerHTML = renderFileViewer(path, file.content ?? '', file.truncated, highlightLine ?? null, outline.symbols ?? []);
+        wireOutlineClicks($('fileMount'));
+        $('fileMount').scrollIntoView({ block: 'start', behavior: 'smooth' });
+      } catch (e) {
+        if ($('fileMount')) $('fileMount').innerHTML = `<div class="card"><h2>File</h2><p>Failed: ${esc(e?.message ?? e)}</p></div>`;
+      }
+    }
+
+    function renderTreeNode(node, depth) {
+      const rows = [];
+      const indent = '<span class="treeIndent"></span>'.repeat(depth);
+      if (node.type === 'dir') {
+        const id = 'dir_' + Math.random().toString(36).slice(2);
+        const hasChildren = Array.isArray(node.children) && node.children.length > 0;
+        rows.push(`<div class="treeRow" data-kind="dir" data-id="${id}">
+          ${indent}<span class="treeIcon">â–¸</span><span>${esc(node.name)}</span><span class="treePath">${esc(node.path || '')}</span>
+        </div>`);
+        if (hasChildren) {
+          for (const child of node.children) rows.push(renderTreeNode(child, depth + 1));
+        }
+      } else {
+        rows.push(`<div class="treeRow" data-kind="file" data-path="${esc(node.path)}">
+          ${indent}<span class="treeIcon">Â·</span><span>${esc(node.name)}</span><span class="treePath">${esc(node.path || '')}</span>
+        </div>`);
+      }
+      return rows.join('');
+    }
+
+    async function loadTree() {
+      const tree = $('tree');
+      tree.innerHTML = `<div class="note">Loadingâ€¦</div>`;
+      try {
+        const root = await fetchJson('/learn/tree');
+        tree.innerHTML = renderTreeNode(root, 0);
+        for (const row of tree.querySelectorAll('.treeRow')) {
+          if (row.dataset.kind === 'file') {
+            row.onclick = () => openRepoFile(row.dataset.path, null);
+          }
+        }
+      } catch (e) {
+        tree.innerHTML = `<div class="note">Failed: ${esc(e?.message ?? e)}</div>`;
+      }
+    }
+
+    async function runRepoSearch() {
+      const q = ($('searchBox').value ?? '').trim();
+      const results = $('results');
+      if (!q) { results.innerHTML = `<div class="note">Enter a query.</div>`; return; }
+      results.innerHTML = `<div class="note">Searchingâ€¦</div>`;
+      try {
+        const j = await fetchJson(`/learn/search?q=${encodeURIComponent(q)}`);
+        const hits = j.matches ?? [];
+        if (!hits.length) { results.innerHTML = `<div class="note">No results.</div>`; return; }
+        results.innerHTML = hits.map(h => `
+          <div class="hit" data-file="${esc(h.file)}" data-line="${esc(h.line)}">
+            <span class="file">${esc(h.file)}</span>
+            <span class="line">:${esc(h.line)}</span>
+            <span class="prev">${esc(h.preview ?? '')}</span>
+          </div>
+        `).join('');
+        for (const el of results.querySelectorAll('.hit')) {
+          el.onclick = () => openRepoFile(el.dataset.file, parseInt(el.dataset.line || '0', 10) || null);
+        }
+      } catch (e) {
+        results.innerHTML = `<div class="note">Failed: ${esc(e?.message ?? e)}</div>`;
+      }
+    }
+
+    // ---------- Router ----------
+    const ROUTES = {
+      overview:     { title: 'Overview', fn: renderOverview, tab: 'tour' },
+      architecture: { title: 'Architecture', fn: renderArchitecture, tab: 'tour' },
+      orchestrator: { title: 'Orchestrator', fn: renderOrchestrator, tab: 'tour' },
+      tools:        { title: 'Tools + Safety', fn: renderTools, tab: 'tour' },
+      memory:       { title: 'Memory + Storage', fn: renderMemory, tab: 'tour' },
+      api:          { title: 'HTTP API Tour', fn: renderApi, tab: 'tour' },
+      lesson_trace: { title: 'Trace a Request', fn: renderLessonTrace, tab: 'tour' },
+      lesson_rust:  { title: 'Rust in this Repo', fn: renderLessonRust, tab: 'tour' },
+      lesson_async: { title: 'Async + Concurrency', fn: renderLessonAsync, tab: 'tour' },
+      lesson_axum:  { title: 'Axum HTTP Basics', fn: renderLessonAxum, tab: 'tour' },
+      lesson_tools: { title: 'Tools + Results', fn: renderLessonTools, tab: 'tour' },
+      lesson_memory:{ title: 'SQLite Memory', fn: renderLessonMemory, tab: 'tour' },
+      lesson_grounding:{ title: 'Grounding Contract', fn: renderLessonGrounding, tab: 'tour' },
+      talktrack:    { title: 'Talk Track', fn: renderTalkTrack, tab: 'tour' },
+      questions:    { title: 'Common Questions', fn: renderQuestions, tab: 'tour' },
+      checklist:    { title: 'Demo Checklist', fn: renderChecklist, tab: 'tour' },
+      diagnostics:  { title: 'Diagnostics', fn: renderDiagnostics, tab: 'tour' },
+      metrics:      { title: 'Metrics', fn: renderMetricsPanel, tab: 'tour' },
+      replay:       { title: 'Run Replay', fn: renderReplay, tab: 'tour' },
+      glossary:     { title: 'Glossary', fn: renderGlossary, tab: 'tour' },
+      labs:         { title: 'Hands-on Labs', fn: renderLabs, tab: 'tour' },
+      doc_readme:   { title: 'README.md', fn: () => renderDoc('README.md', 'README.md'), tab: 'tour' },
+      doc_design:   { title: 'DESIGN.md', fn: () => renderDoc('DESIGN.md', 'DESIGN.md'), tab: 'tour' },
+      doc_roadmap:  { title: 'UI_FEATURES_ROADMAP_2026-04-22.md', fn: () => renderDoc('UI_FEATURES_ROADMAP_2026-04-22.md', 'UI_FEATURES_ROADMAP_2026-04-22.md'), tab: 'tour' },
+      doc_next:     { title: 'NEXT_STEPS_2026-04-22.md', fn: () => renderDoc('NEXT_STEPS_2026-04-22.md', 'NEXT_STEPS_2026-04-22.md'), tab: 'tour' },
+      doc_progress: { title: 'PROGRESS_2026-04-22.md', fn: () => renderDoc('PROGRESS_2026-04-22.md', 'PROGRESS_2026-04-22.md'), tab: 'tour' },
+      code_main:    { title: 'src/main.rs', fn: () => renderCodeFile('src/main.rs', 'src/main.rs'), tab: 'code' },
+      code_server:  { title: 'src/api/server.rs', fn: () => renderCodeFile('src/api/server.rs', 'src/api/server.rs'), tab: 'code' },
+      code_ui:      { title: 'src/api/ui.rs', fn: () => renderCodeFile('src/api/ui.rs', 'src/api/ui.rs'), tab: 'code' },
+      code_orch:    { title: 'src/orchestrator.rs', fn: () => renderCodeFile('src/orchestrator.rs', 'src/orchestrator.rs'), tab: 'code' },
+      code_executor:{ title: 'src/nodes/executor.rs', fn: () => renderCodeFile('src/nodes/executor.rs', 'src/nodes/executor.rs'), tab: 'code' },
+      code_tools:   { title: 'src/tools/', fn: () => renderBrowser(), tab: 'code' }, // browser is more useful than listing a directory file
+      code_grounding:{ title: 'src/grounding.rs', fn: () => renderCodeFile('src/grounding.rs', 'src/grounding.rs'), tab: 'code' },
+      code_config:  { title: 'src/config.rs', fn: () => renderCodeFile('src/config.rs', 'src/config.rs'), tab: 'code' },
+      browser:      { title: 'Browse + Search', fn: renderBrowser, tab: 'code' },
+    };
+
+    // Prevent “double renders” when we programmatically set `location.hash`.
+    // Without this, setting the hash triggers `hashchange`, which calls `navigate` again.
+    let ignoreNextHashChange = false;
+
+    /**
+     * Route to a page id in ROUTES (SPA navigation).
+     *
+     * Options:
+     * - `setHash`: update URL hash (default true)
+     * - `scrollTop`: scroll to top after render (default true)
+     */
+    async function navigate(id, opts) {
+      const options = { setHash: true, scrollTop: true, ...(opts || {}) };
+      const r = ROUTES[id] || ROUTES.overview;
+      if (r.tab === 'code') setTab('code'); else setTab('tour');
+      setActiveNav(id);
+      if (options.setHash && location.hash !== '#' + id) {
+        ignoreNextHashChange = true;
+        location.hash = '#' + id;
+      }
+      await r.fn();
+      $('pageTitle').textContent = r.title;
+      if (options.scrollTop) window.scrollTo({ top: 0, behavior: 'auto' });
+      setTimeout(() => { ignoreNextHashChange = false; }, 0);
+    }
+
+    function currentPageId() {
+      const h = (location.hash || '').replace('#','').trim();
+      return ROUTES[h] ? h : 'overview';
+    }
+
+    $('tab-tour').onclick = () => { setTab('tour'); };
+    $('tab-code').onclick = () => { setTab('code'); };
+
+    $('copyLinkBtn').onclick = () => {
+      const url = location.origin + location.pathname + location.hash;
+      navigator.clipboard?.writeText(url).catch(() => {});
+    };
+
+    $('exportBtn').onclick = async () => {
+      // Lightweight â€œcheat sheetâ€ export: one-pager markdown with your current config.
+      try {
+        const settings = await fetchJson('/settings');
+        const health = await fetchJson('/health');
+        const md = [
+          '# aihomeserver Â· interview cheat sheet',
+          '',
+          '- Date: ' + new Date().toLocaleString(),
+          '- Version: ' + (health.version ?? '?'),
+          '- Fast model: ' + (settings.fast_model ?? '?'),
+          '- Critic model: ' + (settings.critic_model ?? '?'),
+          '- Ollama URL: ' + (settings.ollama_url ?? '?'),
+          '- Workspace: ' + (settings.workspace_path ?? '?'),
+          '',
+          '## Run loop',
+          'Planner â†’ Executor â†’ ToolExecution â†’ Critic â†’ Repair/Replan â†’ Finalization',
+          '',
+          '## Key files',
+          '- src/main.rs (wiring)',
+          '- src/orchestrator.rs (routing)',
+          '- src/nodes/* (planner/executor/tool_execution/critic/repair)',
+          '- src/tools/* (capabilities)',
+          '- src/memory/* (SQLite stores)',
+          '- src/api/server.rs (HTTP API)',
+          '',
+          '## Demo endpoints',
+          '- / (UI)',
+          '- /learn (this site)',
+          '- /health/deep (eval-backed health)',
+          '- /metrics (counters/latencies)',
+        ].join('\\n');
+        const blob = new Blob([md], { type: 'text/markdown' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'aihomeserver-cheat-sheet-' + new Date().toISOString().slice(0,10) + '.md';
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      } catch (e) {
+        alert('Export failed: ' + (e?.message ?? e));
+      }
+    };
+
+    // Init
+    refreshStatus();
+    window.addEventListener('hashchange', () => {
+      if (ignoreNextHashChange) return;
+      navigate(currentPageId(), { setHash: false });
+    });
+    navigate(currentPageId(), { setHash: false });
+  </script>
+</body>
+</html>
+

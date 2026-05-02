@@ -1,6 +1,16 @@
-use anyhow::Result;
-use crate::state::SystemState;
+//! Intake node.
+//!
+//! Responsibility:
+//! - Initialize/reset per-run counters before planning starts.
+//! - Emit an initial log event so replays always have a clear starting point.
+//!
+//! Why this exists:
+//! - Keeps “reset logic” in one place (avoids subtle state carry-over bugs).
 
+use crate::state::SystemState;
+use anyhow::Result;
+
+/// Initialize/reset per-run counters before planning starts.
 pub async fn run(mut state: SystemState) -> Result<SystemState> {
     state.log("intake", "Task received");
     state.log_meta(

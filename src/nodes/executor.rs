@@ -1,9 +1,24 @@
-use anyhow::Result;
+//! Executor node.
+//!
+//! Responsibility:
+//! - Given a `PlannerOutput`, execute one step at a time.
+//! - If a step requires a tool (`tool_binding`), generate a structured tool call JSON
+//!   for `tool_execution` to run.
+//! - If a step is LLM-only (`tool_binding: null`), produce the step output and store it
+//!   under the step’s `output_key` in artifacts.
+//!
+//! Why split “executor” and “tool execution”:
+//! - The executor handles reasoning + schema enforcement.
+//! - Tool execution is the only place side effects occur, making auditing/safety easier.
+
 use crate::{
     llm::ollama::{Message, ModelRole, OllamaClient},
-    state::SystemState,
+    state::{PlannerOutput, StepDefinition, SystemState},
 };
+use anyhow::Result;
+use serde_json::json;
 
+/// Best-effort container detection used to tune prompts (e.g. shell guidance).
 fn in_container() -> bool {
     if std::path::Path::new("/.dockerenv").exists() {
         return true;
@@ -15,7 +30,12 @@ fn in_container() -> bool {
     false
 }
 
-/// Used when the step has a tool_binding — produce a structured tool call JSON
+/// Build the system prompt used when a step has a tool binding.
+///
+/// Connection:
+/// - The executor asks the LLM to emit a *single* JSON object describing the tool call.
+/// - The tool_execution node parses and executes that call, so this prompt is the
+///   schema contract between reasoning and side effects.
 fn system_prompt_tool(workspace_path: &str) -> String {
     let os = std::env::consts::OS;
     let shell_hint = if os == "windows" {
@@ -104,7 +124,11 @@ Rules:
 - Prefer a compact, structured format that can be used for downstream code generation.
 - Include source URLs and short evidence snippets for any non-trivial fact."#;
 
+/// Execute the next plan step (LLM-only output or tool-call generation).
 pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemState> {
+    // The executor advances `state.current_step` and either:
+    // - generates a tool call artifact (for tool-bound steps), or
+    // - generates the step output directly (for LLM-only steps).
     state.current_step += 1;
 
     let plan = match state.current_plan.clone() {
@@ -117,8 +141,35 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
     };
 
     if state.current_step > plan.steps.len() {
-        state.log("executor", "All steps complete");
-        state.termination_met = true;
+        // All steps executed, but only mark the run "done" if we actually produced the
+        // expected outputs (most importantly: `answer`). Otherwise the UI will show a
+        // misleading "Task completed." placeholder.
+        let expected = plan.expected_outputs.clone();
+        let mut missing: Vec<String> = Vec::new();
+        for k in expected.iter() {
+            match state.artifacts.get(k) {
+                Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {}
+                Some(serde_json::Value::Null) | None => missing.push(k.clone()),
+                Some(_) => {} // non-string structured output is acceptable
+            }
+        }
+
+        if missing.is_empty() {
+            state.log("executor", "All steps complete");
+            state.termination_met = true;
+        } else {
+            state.log_meta(
+                "executor_incomplete",
+                "All steps executed but expected outputs missing",
+                serde_json::json!({
+                    "missing_outputs": missing,
+                    "expected_outputs": expected,
+                    "artifacts_present": state.artifacts.keys().collect::<Vec<_>>(),
+                }),
+            );
+            state.failure_count += 1;
+            state.termination_met = false;
+        }
         return Ok(state);
     }
 
@@ -135,12 +186,34 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
     // Build artifact context for LLM steps:
     // Prioritise *_result keys (tool outputs, including failures) then fill
     // with up to 3 non-result keys so the model sees what actually happened.
+    // Always include `facts` if present so grounded steps don't hallucinate.
     let mut ctx_map = serde_json::Map::new();
-    for (k, v) in state.artifacts.iter().filter(|(k, _)| k.ends_with("_result")) {
+    for (k, v) in state
+        .artifacts
+        .iter()
+        .filter(|(k, _)| k.ends_with("_result"))
+    {
         ctx_map.insert(k.clone(), v.clone());
     }
-    for (k, v) in state.artifacts.iter()
-        .filter(|(k, _)| !k.ends_with("_result") && !k.starts_with("repair_"))
+    if let Some(v) = state.artifacts.get("facts") {
+        ctx_map.insert("facts".into(), v.clone());
+    }
+    if let Some(v) = state.artifacts.get("facts_gate_result") {
+        ctx_map.insert("facts_gate_result".into(), v.clone());
+    }
+    if let Some(v) = state.artifacts.get("research_expansions") {
+        ctx_map.insert("research_expansions".into(), v.clone());
+    }
+    for (k, v) in state
+        .artifacts
+        .iter()
+        .filter(|(k, _)| {
+            !k.ends_with("_result")
+                && !k.starts_with("repair_")
+                && k.as_str() != "facts"
+                && k.as_str() != "facts_gate_result"
+                && k.as_str() != "research_expansions"
+        })
         .take(3)
     {
         ctx_map.insert(k.clone(), v.clone());
@@ -157,7 +230,8 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
 
     // Guardrail: if a step requires grounded facts, refuse to proceed unless a facts artifact exists.
     if step.requires_facts {
-        let has_facts = state.artifacts.contains_key("facts") || state.artifacts.contains_key("facts_json");
+        let has_facts =
+            state.artifacts.contains_key("facts") || state.artifacts.contains_key("facts_json");
         if !has_facts {
             // Record a deterministic failure artifact so the Critic can fail and trigger a replan,
             // instead of the system continuing and hallucinating patch-specific outputs.
@@ -239,10 +313,7 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
         )
     };
 
-    let messages = vec![
-        Message::system(system_prompt),
-        Message::user(user_prompt),
-    ];
+    let messages = vec![Message::system(system_prompt), Message::user(user_prompt)];
 
     // Always use the Fast model for streaming — the Critic (32b) is 3-4x slower per token
     // and makes streaming feel terrible. The Critic node still runs separately after each
@@ -276,7 +347,9 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
             let _ = sse_tx.send(crate::state::SseEvent::Status {
                 phase: format!("executing_step_{}", state.current_step),
             });
-            llm.chat_stream(messages, synthesis_model, &tok_tx, true, Some(&think_tx)).await.ok()
+            llm.chat_stream(messages, synthesis_model, &tok_tx, true, Some(&think_tx))
+                .await
+                .ok()
         } else {
             llm.chat(messages, synthesis_model, false, true).await.ok()
         }
@@ -287,7 +360,9 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
 
     match output {
         Some(out) => {
-            let output_key = step.output_key.clone()
+            let output_key = step
+                .output_key
+                .clone()
                 .unwrap_or_else(|| format!("step_{}", state.current_step));
             if wants_json && !has_tool {
                 match serde_json::from_str::<serde_json::Value>(&out) {
@@ -296,11 +371,15 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
                     }
                     Err(_) => {
                         // If the model produced invalid JSON, persist the raw output for debugging.
-                        state.artifacts.insert(output_key, serde_json::Value::String(out));
+                        state
+                            .artifacts
+                            .insert(output_key, serde_json::Value::String(out));
                     }
                 }
             } else {
-                state.artifacts.insert(output_key, serde_json::Value::String(out));
+                state
+                    .artifacts
+                    .insert(output_key, serde_json::Value::String(out));
             }
         }
         None => {
@@ -309,5 +388,199 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
         }
     }
 
+    // If we just produced a facts table for a grounded request, and it reports missing coverage,
+    // automatically expand research (bounded) instead of plowing ahead with shallow evidence.
+    maybe_expand_research_loop(&mut state, &step);
+
     Ok(state)
+}
+
+/// Parse an integer from JSON, accepting both `u64` and `i64` representations.
+///
+/// Connection:
+/// - Some models emit numeric fields as signed ints; this keeps executor logic tolerant.
+fn get_u64(v: Option<&serde_json::Value>) -> Option<u64> {
+    v.and_then(|x| x.as_u64()).or_else(|| {
+        v.and_then(|x| x.as_i64())
+            .and_then(|n| u64::try_from(n).ok())
+    })
+}
+
+/// Normalize a JSON value into a string array.
+///
+/// Connection:
+/// - Used when interpreting “missing coverage” lists in facts tables.
+fn get_string_array(v: Option<&serde_json::Value>) -> Vec<String> {
+    v.and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|q| q.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+/// Renumber plan steps sequentially after programmatic insertion.
+///
+/// Connection:
+/// - `maybe_expand_research_loop` can insert additional tool steps; the UI expects stable numbering.
+fn renumber_steps(plan: &mut PlannerOutput) {
+    for (idx, s) in plan.steps.iter_mut().enumerate() {
+        s.step_id = (idx + 1).to_string();
+    }
+}
+
+/// If the facts table indicates missing coverage, insert additional research steps (bounded).
+///
+/// Why this exists:
+/// - Grounded runs can easily “underfetch” evidence (blocked sites, missing patch notes, etc.).
+/// - This bounded loop increases the chance of producing a complete facts table before code/guidance is generated.
+///
+/// Connection:
+/// - Called by the executor after each step; modifies `state.current_plan` when appropriate.
+fn maybe_expand_research_loop(state: &mut SystemState, executed_step: &StepDefinition) {
+    // Only trigger after the facts step (LLM-only JSON).
+    let is_facts_step = executed_step.tool_binding.is_none()
+        && executed_step.output_key.as_deref() == Some("facts")
+        && executed_step
+            .output_format
+            .as_deref()
+            .map(|f| f.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
+    if !is_facts_step {
+        return;
+    }
+    if !crate::grounding::request_needs_grounding(&state.user_request) {
+        return;
+    }
+
+    let expansions = get_u64(state.artifacts.get("research_expansions")).unwrap_or(0);
+    const MAX_EXPANSIONS: u64 = 2;
+    if expansions >= MAX_EXPANSIONS {
+        return;
+    }
+
+    let facts = match state.artifacts.get("facts") {
+        Some(v) => v,
+        None => return,
+    };
+
+    // Prefer explicit missing/coverage from the fact extractor.
+    let missing_len = facts
+        .get("missing")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let coverage_score = facts
+        .get("coverage_score")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0);
+    let sources_len = facts
+        .get("sources")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let facts_len = facts
+        .get("facts")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    // Heuristic: treat as incomplete if it explicitly says missing, or if it has too few sources/facts.
+    let incomplete = missing_len > 0 || coverage_score < 0.85 || sources_len < 2 || facts_len < 6;
+    if !incomplete {
+        return;
+    }
+
+    let mut next_queries = get_string_array(facts.get("next_queries"));
+    if next_queries.is_empty() {
+        // Fallback: ask for sources + patch changes explicitly.
+        next_queries.push(format!("{} sources", state.user_request));
+        next_queries.push(format!("{} patch notes changes", state.user_request));
+    }
+    next_queries.truncate(6);
+
+    let Some(plan) = state.current_plan.as_mut() else {
+        return;
+    };
+
+    // Insert loop steps immediately after the just-executed facts step.
+    let insert_at = state.current_step; // current_step is 1-based; insert after (idx = current_step-1)
+    let loop_n = expansions + 1;
+
+    let search_key = format!("search_result_loop{loop_n}");
+    let fetch1_key = format!("fetch_loop{loop_n}_1");
+    let fetch2_key = format!("fetch_loop{loop_n}_2");
+
+    let steps_to_insert = vec![
+        StepDefinition {
+            step_id: String::new(),
+            action: "Expand research: run additional targeted searches to fill missing facts".into(),
+            tool_binding: Some("parallel_search".into()),
+            input_params: json!({ "queries": next_queries }),
+            output_key: Some(search_key.clone()),
+            expected_output: None,
+            output_format: None,
+            requires_facts: false,
+        },
+        StepDefinition {
+            step_id: String::new(),
+            action: "Expand research: fetch the best new source URL from the latest search results".into(),
+            tool_binding: Some("http_fetch".into()),
+            input_params: json!({ "url": "" }),
+            output_key: Some(fetch1_key),
+            expected_output: None,
+            output_format: None,
+            requires_facts: false,
+        },
+        StepDefinition {
+            step_id: String::new(),
+            action: "Expand research: fetch a second independent new source URL".into(),
+            tool_binding: Some("http_fetch".into()),
+            input_params: json!({ "url": "" }),
+            output_key: Some(fetch2_key),
+            expected_output: None,
+            output_format: None,
+            requires_facts: false,
+        },
+        StepDefinition {
+            step_id: String::new(),
+            action: "Re-extract a grounded fact table from all research artifacts (include URLs + evidence snippets). Output JSON with: facts[] (each has claim+url+evidence), sources[] (urls), missing[] (what is still unknown), next_queries[] (<=6 targeted searches to fill missing), coverage_score (0..1).".into(),
+            tool_binding: None,
+            input_params: json!({}),
+            output_key: Some("facts".into()),
+            expected_output: None,
+            output_format: Some("json".into()),
+            requires_facts: false,
+        },
+    ];
+
+    // Defensive: don't insert the same loop twice.
+    if plan
+        .steps
+        .iter()
+        .any(|s| s.output_key.as_deref() == Some(&search_key))
+    {
+        return;
+    }
+
+    plan.steps.splice(insert_at..insert_at, steps_to_insert);
+    renumber_steps(plan);
+
+    state
+        .artifacts
+        .insert("research_expansions".into(), json!(loop_n));
+    state.log_meta(
+        "research_expand",
+        "Facts coverage incomplete â€” expanding research loop",
+        json!({
+            "loop": loop_n,
+            "missing_len": missing_len,
+            "coverage_score": coverage_score,
+            "sources_len": sources_len,
+            "facts_len": facts_len
+        }),
+    );
 }

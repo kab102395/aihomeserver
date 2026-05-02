@@ -1,3 +1,15 @@
+//! Tool execution node.
+//!
+//! Responsibility:
+//! - Take the tool call artifact produced by the executor/repair.
+//! - Validate/normalize params.
+//! - Invoke the concrete tool implementation via `ToolRegistry`.
+//! - Store the resulting `ToolResult` into artifacts (success *and* failure).
+//!
+//! Why this is its own node:
+//! - It is the only place in the runtime where side effects happen.
+//! - It provides a single choke point for safety checks and logging.
+
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -6,6 +18,28 @@ use crate::{
     tools::ToolRegistry,
 };
 
+/// Normalize a JSON value into a string array (`Vec<String>`).
+///
+/// Connection:
+/// - Tool calls sometimes accept either a single string or an array; this helper keeps parsing
+///   tolerant to minor schema drift from the LLM.
+fn get_string_array(v: Option<&serde_json::Value>) -> Vec<String> {
+    v.and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|q| q.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse tool params out of an executor/repair artifact.
+///
+/// Connection:
+/// - The executor stores the generated tool call under `output_key`.
+/// - Tool execution needs only the params object to pass into the actual tool implementation.
 fn parse_tool_params_from_artifact(
     artifact: Option<&serde_json::Value>,
 ) -> Option<serde_json::Value> {
@@ -35,7 +69,11 @@ fn parse_tool_params_from_artifact(
     None
 }
 
+/// Execute the tool call for the current step and store the result into artifacts.
 pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<SystemState> {
+    // Tool execution is driven by the current plan step’s `output_key`, which the
+    // executor uses to store a tool-call JSON blob. We read that artifact, parse it,
+    // and run the named tool with the derived params.
     let plan = match state.current_plan.clone() {
         Some(p) => p,
         None => return Ok(state),
@@ -72,7 +110,9 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
                 // If the executor produced something but we can't parse it, treat this as an LLM failure.
                 if executor_tool_call.is_some() {
                     let tool_output_key = format!("{output_key}_result");
-                    let raw = executor_tool_call.cloned().unwrap_or(serde_json::Value::Null);
+                    let raw = executor_tool_call
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
                     let result = crate::state::ToolResult::err(
                         ErrorType::Llm,
                         "invalid_tool_call",
@@ -96,25 +136,191 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
             }
         };
 
+        // Web search tools: auto-fill missing required params so we fail less often when the
+        // tool-call generator produces incomplete JSON.
+        if tool_name == "parallel_search" {
+            let has_queries = p.get("queries").and_then(|v| v.as_array()).is_some();
+            let has_query = p
+                .get("query")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !has_queries && !has_query {
+                // Prefer planner-provided queries, else fall back to the user request.
+                let mut qs = get_string_array(step.input_params.get("queries"));
+                if qs.is_empty() {
+                    if let Some(q) = step.input_params.get("query").and_then(|v| v.as_str()) {
+                        let q = q.trim();
+                        if !q.is_empty() {
+                            qs.push(q.to_string());
+                        }
+                    }
+                }
+                if qs.is_empty() {
+                    qs.push(state.user_request.clone());
+                }
+                if let Some(obj) = p.as_object_mut() {
+                    obj.insert(
+                        "queries".into(),
+                        serde_json::Value::Array(
+                            qs.into_iter().map(serde_json::Value::String).collect(),
+                        ),
+                    );
+                }
+            }
+        }
+
+        if tool_name == "web_search" {
+            let has_query = p
+                .get("query")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !has_query {
+                let q = step
+                    .input_params
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| state.user_request.clone());
+                if let Some(obj) = p.as_object_mut() {
+                    obj.insert("query".into(), serde_json::Value::String(q));
+                }
+            }
+        }
+
         // Shell: inject workspace as cwd if missing
-        let is_shell = tool_name == "shell" || tool_name == "run_command"
-            || tool_name == "bash" || tool_name == "execute_command";
+        let is_shell = tool_name == "shell"
+            || tool_name == "run_command"
+            || tool_name == "bash"
+            || tool_name == "execute_command";
         if is_shell && p.get("cwd").and_then(|v| v.as_str()).is_none() {
             if let Some(obj) = p.as_object_mut() {
-                obj.insert("cwd".into(), serde_json::Value::String(state.workspace_path.clone()));
+                obj.insert(
+                    "cwd".into(),
+                    serde_json::Value::String(state.workspace_path.clone()),
+                );
+            }
+        }
+
+        // Filesystem: tolerate minor schema drift (models sometimes omit `path` or use `file`/`filename`).
+        if tool_name == "filesystem" {
+            let has_path = p
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let has_action = p
+                .get("action")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+
+            if let Some(obj) = p.as_object_mut() {
+                if !has_action {
+                    // Prefer planner-provided action.
+                    if let Some(a) = step.input_params.get("action").and_then(|v| v.as_str()) {
+                        if !a.trim().is_empty() {
+                            obj.insert("action".into(), serde_json::Value::String(a.trim().into()));
+                        }
+                    }
+                }
+
+                if !has_path {
+                    // Common alternate param names.
+                    let mut path = obj
+                        .get("file")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| obj.get("filename").and_then(|v| v.as_str()))
+                        .or_else(|| obj.get("filepath").and_then(|v| v.as_str()))
+                        .or_else(|| obj.get("file_path").and_then(|v| v.as_str()))
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+
+                    // Planner fallback.
+                    if path.is_none() {
+                        path = step
+                            .input_params
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                    }
+
+                    // Heuristic: pull a likely path from the step action text.
+                    if path.is_none() {
+                        let a = step.action.to_lowercase();
+                        for cand in ["cargo.toml", "src/main.rs", "src\\main.rs", "readme.md"] {
+                            if a.contains(cand) {
+                                path = Some(cand.replace('\\', "/"));
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some(pth) = path {
+                        obj.insert("path".into(), serde_json::Value::String(pth));
+                    }
+                }
             }
         }
 
         // http_fetch: resolve URL from search artifacts if the planner left a placeholder
         // or if the URL is missing/invalid. This avoids the LLM guessing wrong URLs.
         if tool_name == "http_fetch" {
-            let url = p.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let needs_resolution = url.is_empty()
-                || url == "FROM_SEARCH_RESULTS"
-                || !url.starts_with("http");
+            let url = p
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let needs_resolution =
+                url.is_empty() || url == "FROM_SEARCH_RESULTS" || !url.starts_with("http");
 
             if needs_resolution {
-                if let Some(best_url) = pick_best_url_from_artifacts(&state.artifacts, &url) {
+                // Avoid re-fetching the same page across multiple http_fetch steps.
+                let mut exclude: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for (k, v) in &state.artifacts {
+                    if !k.ends_with("_result") {
+                        continue;
+                    }
+                    // Tool results are stored as the raw output object.
+                    // Older code wrapped outputs under {output:{...}}; support both shapes.
+                    let url = v
+                        .get("output")
+                        .and_then(|o| o.get("url"))
+                        .or_else(|| v.get("url"))
+                        .and_then(|x| x.as_str());
+                    if let Some(u) = url {
+                        exclude.insert(crate::memory::sources::normalize_url(u));
+                    }
+                }
+
+                // Cross-run de-dupe: also exclude URLs fetched recently in past tasks.
+                if let Some(arr) = state
+                    .capabilities
+                    .get("recent_source_urls_normalized")
+                    .and_then(|v| v.as_array())
+                {
+                    for item in arr.iter().filter_map(|v| v.as_str()) {
+                        let t = item.trim();
+                        if !t.is_empty() {
+                            exclude.insert(t.to_string());
+                        }
+                    }
+                }
+
+                let hint_for_pick = if url.is_empty() || url == "FROM_SEARCH_RESULTS" {
+                    state.user_request.as_str()
+                } else {
+                    url.as_str()
+                };
+
+                if let Some(best_url) =
+                    pick_best_url_from_artifacts(&state.artifacts, hint_for_pick, &exclude)
+                {
                     if let Some(obj) = p.as_object_mut() {
                         obj.insert("url".into(), serde_json::Value::String(best_url));
                     }
@@ -123,13 +329,162 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
 
             // Defaults for research: allow fallback and return more text.
             if let Some(obj) = p.as_object_mut() {
-                if obj.get("allow_reddit_fallback").and_then(|v| v.as_bool()).is_none() {
-                    obj.insert("allow_reddit_fallback".into(), serde_json::Value::Bool(true));
+                if obj
+                    .get("allow_reddit_fallback")
+                    .and_then(|v| v.as_bool())
+                    .is_none()
+                {
+                    obj.insert(
+                        "allow_reddit_fallback".into(),
+                        serde_json::Value::Bool(true),
+                    );
                 }
                 if obj.get("max_chars").and_then(|v| v.as_u64()).is_none() {
                     obj.insert(
                         "max_chars".into(),
-                        serde_json::Value::Number(serde_json::Number::from(12000u64)),
+                        serde_json::Value::Number(serde_json::Number::from(18000u64)),
+                    );
+                }
+            }
+        }
+
+        // save_knowledge: auto-fill missing topic/content so KB updates reliably even when the
+        // tool-call generator forgets required fields.
+        if tool_name == "save_knowledge" {
+            // If chapters were provided, we don't need to auto-fill topic/content.
+            let has_chapters = p.get("chapters").and_then(|v| v.as_array()).is_some();
+            let is_auto = p.get("auto").and_then(|v| v.as_bool()).unwrap_or(false);
+            let chapters_from = p
+                .get("chapters_from")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+
+            let has_topic = p
+                .get("topic")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let has_content = p
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+
+            if let Some(obj) = p.as_object_mut() {
+                // Resolve chapters from an earlier textbook synthesis artifact.
+                if !has_chapters {
+                    if let Some(src) = &chapters_from {
+                        if src == "kb_textbook" {
+                            if let Some(v) = state.artifacts.get("kb_textbook") {
+                                let parsed: Option<serde_json::Value> = match v {
+                                    serde_json::Value::String(s) => serde_json::from_str(s).ok(),
+                                    serde_json::Value::Object(_) => Some(v.clone()),
+                                    _ => None,
+                                };
+                                if let Some(book) = parsed {
+                                    if let Some(chaps) =
+                                        book.get("chapters").and_then(|c| c.as_array())
+                                    {
+                                        obj.insert("chapters".into(), serde_json::Value::Array(chaps.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !has_chapters && !has_topic {
+                    let topic = state
+                        .user_request
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .chars()
+                        .take(80)
+                        .collect::<String>();
+                    if !topic.is_empty() {
+                        obj.insert("topic".into(), serde_json::Value::String(topic));
+                    }
+                }
+
+                if !has_chapters && !has_content {
+                    // Prefer a synthesized answer artifact if present.
+                    let mut content: Option<String> = state
+                        .artifacts
+                        .get("answer")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
+                    // Otherwise, pick the first "large" string artifact that isn't a tool result.
+                    if content.as_deref().map(|s| s.trim().len()).unwrap_or(0) < 200 {
+                        for (k, v) in &state.artifacts {
+                            if k.ends_with("_result") || k.starts_with("repair_") {
+                                continue;
+                            }
+                            if let Some(s) = v.as_str() {
+                                let t = s.trim();
+                                if t.len() >= 200 {
+                                    content = Some(t.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Last resort: store the request itself (better than failing the tool call).
+                    let content = content.unwrap_or_else(|| state.user_request.clone());
+                    obj.insert("content".into(), serde_json::Value::String(content));
+                }
+
+                // If this is an auto-save, pass through the configured minimum size threshold
+                // so the save_knowledge tool can decide to skip without persisting.
+                if is_auto && obj.get("min_chars").and_then(|v| v.as_u64()).is_none() {
+                    if let Some(min) = state
+                        .capabilities
+                        .get("auto_kb_min_chars")
+                        .and_then(|v| v.as_u64())
+                    {
+                        obj.insert(
+                            "min_chars".into(),
+                            serde_json::Value::Number(serde_json::Number::from(min)),
+                        );
+                    }
+                }
+
+                // If sources weren't provided, collect URLs from search/fetch artifacts.
+                let has_sources = obj
+                    .get("sources")
+                    .map(|v| {
+                        v.as_array()
+                            .map(|a| !a.is_empty())
+                            .or_else(|| v.as_str().map(|s| !s.trim().is_empty()))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if !has_sources {
+                    let mut urls: Vec<String> = Vec::new();
+                    for (k, v) in &state.artifacts {
+                        if !k.ends_with("_result") {
+                            continue;
+                        }
+                        let out = v.get("output").unwrap_or(v);
+                        if let Some(u) = out.get("url").and_then(|x| x.as_str()) {
+                            urls.push(u.to_string());
+                        }
+                        if let Some(results) = out.get("results").and_then(|x| x.as_array()) {
+                            for r in results.iter().take(10) {
+                                if let Some(u) = r.get("url").and_then(|x| x.as_str()) {
+                                    urls.push(u.to_string());
+                                }
+                            }
+                        }
+                    }
+                    urls.sort();
+                    urls.dedup();
+                    obj.insert(
+                        "sources".into(),
+                        serde_json::Value::Array(urls.into_iter().map(serde_json::Value::String).collect()),
                     );
                 }
             }
@@ -173,16 +528,20 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
     if let Some(tx) = &state.sse_tx {
         // Build a human-readable detail for tools that hit external resources
         let detail = match tool_name.as_str() {
-            "http_fetch" => tool_params.get("url")
+            "http_fetch" => tool_params
+                .get("url")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            "web_search" => tool_params.get("query")
+            "web_search" => tool_params
+                .get("query")
                 .and_then(|v| v.as_str())
                 .map(|s| format!("🔍 {s}")),
-            "parallel_search" => tool_params.get("queries")
+            "parallel_search" => tool_params
+                .get("queries")
                 .and_then(|v| v.as_array())
                 .map(|qs| {
-                    let labels: Vec<String> = qs.iter()
+                    let labels: Vec<String> = qs
+                        .iter()
                         .filter_map(|q| q.as_str())
                         .take(4)
                         .map(|q| format!("🔍 {q}"))
@@ -199,18 +558,22 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
         });
     }
 
-    let is_shell_tool = tool_name == "shell" || tool_name == "run_command"
-        || tool_name == "bash" || tool_name == "execute_command";
+    let is_shell_tool = tool_name == "shell"
+        || tool_name == "run_command"
+        || tool_name == "bash"
+        || tool_name == "execute_command";
 
     // Emit the command that will be run (before execution so it appears immediately)
     if is_shell_tool {
         if let Some(tx) = &state.sse_tx {
-            let cmd = tool_params.get("command")
+            let cmd = tool_params
+                .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("(unknown command)")
                 .to_string();
             // Show the effective cwd: caller-supplied or workspace default
-            let cwd = tool_params.get("cwd")
+            let cwd = tool_params
+                .get("cwd")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .or_else(|| Some(state.workspace_path.clone()));
@@ -230,9 +593,20 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
         // Emit the output
         if let Some(tx) = &state.sse_tx {
             let (stdout, stderr, exit_code) = if let Some(output) = &result.output {
-                let stdout = output.get("stdout").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let stderr = output.get("stderr").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let exit_code = output.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                let stdout = output
+                    .get("stdout")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let stderr = output
+                    .get("stderr")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let exit_code = output
+                    .get("exit_code")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32;
                 (stdout, stderr, exit_code)
             } else {
                 (String::new(), result.trace.clone().unwrap_or_default(), -1)
@@ -249,13 +623,16 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
 
     // Emit FileWritten so the UI can auto-refresh the editor if that file is open
     if result.success && (tool_name == "filesystem" || tool_name == "write_file") {
-        let wrote_path = result.output.as_ref()
+        let wrote_path = result
+            .output
+            .as_ref()
             .and_then(|o| o.get("path"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         if let (Some(path), Some(tx)) = (wrote_path, &state.sse_tx) {
             // Convert absolute path to relative if it starts with workspace root
-            let rel = path.strip_prefix(&state.workspace_path)
+            let rel = path
+                .strip_prefix(&state.workspace_path)
                 .unwrap_or(&path)
                 .trim_start_matches(['/', '\\'])
                 .replace('\\', "/");
@@ -298,64 +675,208 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
 }
 
 /// Scan all search result artifacts and return the best URL to fetch.
-/// Prefers old.reddit.com, then liquipedia, then fandom wikis, then anything else.
-/// Skips known-blocked domains (dotabuff, stratz) and DDG redirect URLs.
+/// Prefers high-signal sources and avoids obvious search/redirect pages.
 fn pick_best_url_from_artifacts(
     artifacts: &std::collections::HashMap<String, serde_json::Value>,
     hint: &str,
+    exclude: &std::collections::HashSet<String>,
 ) -> Option<String> {
     // Collect all URLs from every search result artifact
     let mut candidates: Vec<String> = Vec::new();
     for (key, val) in artifacts {
         // Only look at search result artifacts
-        if !key.ends_with("_result") { continue; }
+        if !key.ends_with("_result") {
+            continue;
+        }
         let results = val
-            .get("output").and_then(|o| o.get("results"))
+            .get("output")
+            .and_then(|o| o.get("results"))
             .or_else(|| val.get("results"))
             .and_then(|r| r.as_array());
         if let Some(arr) = results {
             for item in arr {
                 if let Some(url) = item.get("url").and_then(|u| u.as_str()) {
-                    if url.starts_with("http") { candidates.push(url.to_string()); }
+                    if url.starts_with("http") {
+                        candidates.push(url.to_string());
+                    }
                 }
             }
         }
     }
 
-    if candidates.is_empty() { return None; }
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let hint_lower = hint.to_lowercase();
+    let wants_bug = hint_lower.contains("bug") || hint_lower.contains("issue");
+    let wants_build = hint_lower.contains("build")
+        || hint_lower.contains("playstyle")
+        || hint_lower.contains("guide")
+        || hint_lower.contains("skill")
+        || hint_lower.contains("item")
+        || hint_lower.contains("ability");
+    let wants_rust = hint_lower.contains("rust");
+
+    /// Normalize a URL and extract its host domain for de-duplication/exclusion.
+    ///
+    /// Connection:
+    /// - `exclude` is typically a set of previously-fetched URLs; comparing by domain reduces
+    ///   repeated fetches from the same site when iterating through candidates.
+    fn domain_of(url: &str) -> String {
+        let n = crate::memory::sources::normalize_url(url);
+        crate::memory::sources::domain_from_url(&n)
+    }
+
+    let excluded_domains: std::collections::HashSet<String> = exclude
+        .iter()
+        .map(|u| domain_of(u))
+        .filter(|d| !d.is_empty())
+        .collect();
 
     // Score URLs — higher = better
     let score = |url: &str| -> i32 {
         let u = url.to_lowercase();
-        // Immediately disqualify known blockers and DDG redirects
-        if u.contains("dotabuff.com")  { return -100; }
-        if u.contains("stratz.com")    { return -100; }
-        if u.contains("duckduckgo.com"){ return -100; }
-        if u.contains("google.com/search") { return -100; }
-        if u.contains("bing.com/search")   { return -100; }
+        // Immediately disqualify redirect/search pages
+        if u.contains("duckduckgo.com") {
+            return -100;
+        }
+        if u.contains("google.com/search") {
+            return -100;
+        }
+        if u.contains("bing.com/search") {
+            return -100;
+        }
+
+        // Prefer high-signal sources in general
+        if wants_rust {
+            if u.contains("doc.rust-lang.org/book") || u.contains("doc.rust-lang.org/stable/book") {
+                return 30;
+            }
+            if u.contains("doc.rust-lang.org/reference") {
+                return 29;
+            }
+            if u.contains("doc.rust-lang.org/rust-by-example") {
+                return 28;
+            }
+            if u.contains("doc.rust-lang.org/") {
+                return 24;
+            }
+        }
+        if u.contains("github.com") {
+            return 12;
+        }
+        if u.contains("readthedocs.io") {
+            return 11;
+        }
+        if u.contains("docs.") {
+            return 10;
+        }
+
+        // If the user wants builds/meta, prioritize build sites over bug trackers.
+        if wants_build {
+            if u.contains("dota2protracker") {
+                return 14;
+            }
+            if u.contains("dotacoach") {
+                return 13;
+            }
+            if u.contains("opendota.com") {
+                return 12;
+            }
+            if u.contains("stratz.com") {
+                return 11;
+            }
+            if u.contains("dotabuff.com") {
+                return 11;
+            }
+            if u.contains("dota2.com/patches") {
+                return 10;
+            }
+            if u.contains("liquipedia.net") {
+                return 10;
+            }
+            // Downweight bug trackers for build-oriented questions
+            if u.contains("github.com/valvesoftware/dota2-gameplay/issues") {
+                return 3;
+            }
+        }
+
+        // If the user wants bugs/issues, do the opposite.
+        if wants_bug {
+            if u.contains("github.com/valvesoftware/dota2-gameplay/issues") {
+                return 14;
+            }
+            if u.contains("old.reddit.com") || u.contains("reddit.com") {
+                return 13;
+            }
+        }
+
         // Prefer these in order
-        if u.contains("old.reddit.com")    { return 10; }
-        if u.contains("reddit.com")        { return  9; }  // will be rewritten to old.reddit
-        if u.contains("liquipedia.net")    { return  8; }
-        if u.contains("dota2.fandom.com")  { return  7; }
-        if u.contains("steamcommunity.com"){ return  6; }
-        if u.contains("dota2.com")         { return  5; }
-        if u.contains("dota2protracker")   { return  4; }
+        if u.contains("old.reddit.com") {
+            return 10;
+        }
+        if u.contains("reddit.com") {
+            return 9;
+        } // will be rewritten to old.reddit
+        if u.contains("steamcommunity.com") {
+            return 8;
+        }
+        if u.contains("dota2.com") {
+            return 8;
+        }
+        if u.contains("dota2protracker") {
+            return 7;
+        }
+        if u.contains("liquipedia.net") {
+            return 6;
+        }
+        if u.contains("fandom.com") {
+            return 5;
+        }
+        if u.contains("dotabuff.com") {
+            return 4;
+        }
+        if u.contains("stratz.com") {
+            return 3;
+        }
         1 // anything else
     };
 
     // If hint contains a keyword, give a small bonus to URLs containing it
     let hint_word = hint.split('/').last().unwrap_or("").to_lowercase();
 
-    let best = candidates.iter().max_by_key(|url| {
+    let score_key = |url: &&String| {
         let mut s = score(url);
-        if !hint_word.is_empty() && url.to_lowercase().contains(&hint_word) { s += 1; }
+        if !hint_word.is_empty() && url.to_lowercase().contains(&hint_word) {
+            s += 1;
+        }
+        // Mild penalty to encourage domain diversity across multiple fetches.
+        let d = domain_of(url);
+        if !d.is_empty() && excluded_domains.contains(&d) {
+            s -= 2;
+        }
         s
-    });
+    };
 
-    best.cloned()
+        // Prefer not-yet-fetched URLs, but never fail outright if everything is excluded.
+        let best_new = candidates
+            .iter()
+            .filter(|u| !exclude.contains(&crate::memory::sources::normalize_url(u)))
+            .max_by_key(score_key)
+            .cloned();
+
+    if best_new.is_some() {
+        return best_new;
+    }
+
+    candidates.iter().max_by_key(score_key).cloned()
 }
 
+/// Map low-level tool/LLM error types into a coarse taxonomy for analytics and repair strategy.
+///
+/// Connection:
+/// - The orchestrator keeps `failure_taxonomy` so replan/repair decisions can evolve over time.
 fn map_error(e: &ErrorType) -> Option<FailureTaxonomy> {
     match e {
         ErrorType::Tool => Some(FailureTaxonomy::ToolFailure),
@@ -373,7 +894,9 @@ mod tests {
 
     #[test]
     fn parse_tool_params_accepts_json_string_with_params() {
-        let v = serde_json::Value::String(r#"{"tool":"shell","params":{"command":"pwd","timeout_secs":5}}"#.into());
+        let v = serde_json::Value::String(
+            r#"{"tool":"shell","params":{"command":"pwd","timeout_secs":5}}"#.into(),
+        );
         let p = parse_tool_params_from_artifact(Some(&v)).expect("params parsed");
         assert_eq!(p.get("command").and_then(|x| x.as_str()), Some("pwd"));
         assert_eq!(p.get("timeout_secs").and_then(|x| x.as_i64()), Some(5));
@@ -386,5 +909,57 @@ mod tests {
         assert_eq!(p.get("command").and_then(|x| x.as_str()), Some("pwd"));
         assert_eq!(p.get("timeout_secs").and_then(|x| x.as_i64()), Some(5));
         assert!(p.get("tool").is_none());
+    }
+
+    #[test]
+    fn url_picker_prefers_build_sources_when_hint_is_build() {
+        let artifacts: std::collections::HashMap<String, serde_json::Value> = [
+            (
+                "search_result_result".to_string(),
+                serde_json::json!({
+                    "output": {
+                        "results": [
+                            {"url":"https://github.com/ValveSoftware/Dota2-Gameplay/issues/29000"},
+                            {"url":"https://www.reddit.com/r/DotA2/comments/1rfo4id/kez_bug_that_has_been_around_since_october_last/"},
+                            {"url":"https://dota2protracker.com/hero/Kez"}
+                        ]
+                    }
+                }),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let exclude = std::collections::HashSet::<String>::new();
+        let picked =
+            pick_best_url_from_artifacts(&artifacts, "Kez Dota 2 build guide playstyle", &exclude)
+                .expect("picked url");
+        assert!(picked.contains("dota2protracker.com"), "picked={picked}");
+    }
+
+    #[test]
+    fn url_picker_prefers_bug_trackers_when_hint_is_bug() {
+        let artifacts: std::collections::HashMap<String, serde_json::Value> = [(
+            "search_result_result".to_string(),
+            serde_json::json!({
+                "output": {
+                    "results": [
+                        {"url":"https://dota2protracker.com/hero/Kez"},
+                        {"url":"https://github.com/ValveSoftware/Dota2-Gameplay/issues/29000"}
+                    ]
+                }
+            }),
+        )]
+        .into_iter()
+        .collect();
+
+        let exclude = std::collections::HashSet::<String>::new();
+        let picked =
+            pick_best_url_from_artifacts(&artifacts, "Kez aghanim bug issue report", &exclude)
+                .expect("picked url");
+        assert!(
+            picked.contains("github.com/ValveSoftware/Dota2-Gameplay/issues"),
+            "picked={picked}"
+        );
     }
 }

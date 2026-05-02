@@ -1,3 +1,13 @@
+//! Shared data model for the agent runtime.
+//!
+//! This module defines the “state” that flows through the orchestrator nodes:
+//! planner → executor → tool execution → critic → repair → finalization.
+//!
+//! Interview talk track:
+//! - `SystemState` is the single source of truth for a run.
+//! - Nodes only communicate by reading/writing this state (no hidden globals).
+//! - Side effects are captured as `ToolResult`s and stored as artifacts for replay.
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -8,16 +18,29 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+/// High-level classification for failures produced by tools/LLM/runtime.
 pub enum ErrorType {
+    /// No error (success).
     None,
+    /// LLM call failed (timeouts, bad responses, etc.).
     Llm,
+    /// Tool execution failed.
     Tool,
+    /// Environment issue (missing binary, bad PATH, etc.).
     Env,
+    /// Timeout (either tool or LLM).
     Timeout,
+    /// Permissions / policy block (risk gate, path traversal, etc.).
     Permission,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Normalized output from a tool invocation.
+///
+/// Tools always return structured data so that:
+/// - the agent can reason about success/failure,
+/// - the UI can render tool output consistently,
+/// - runs can be replayed/debugged from persisted artifacts.
 pub struct ToolResult {
     pub success: bool,
     pub error_type: ErrorType,
@@ -30,6 +53,7 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
+    /// Convenience constructor for successful tool calls.
     pub fn ok(output: serde_json::Value, checkpoint: Option<serde_json::Value>) -> Self {
         Self {
             success: true,
@@ -43,6 +67,7 @@ impl ToolResult {
         }
     }
 
+    /// Convenience constructor for failed tool calls.
     pub fn err(error_type: ErrorType, code: &str, trace: &str) -> Self {
         Self {
             success: false,
@@ -60,6 +85,7 @@ impl ToolResult {
 // ==================== PLAN TYPES ====================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// One step in a planner-produced plan (what to do next and how).
 pub struct StepDefinition {
     pub step_id: String,
     pub action: String,
@@ -82,6 +108,10 @@ pub struct StepDefinition {
     pub expected_output: Option<serde_json::Value>,
 }
 
+/// Accepts either a string tool name or an object containing a tool name, and normalizes
+/// the result into `Option<String>`.
+///
+/// This handles inconsistent planner outputs across different models.
 fn deserialize_tool_binding<'de, D>(de: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -92,7 +122,8 @@ where
         serde_json::Value::String(s) => Ok(if s.is_empty() { None } else { Some(s) }),
         serde_json::Value::Object(map) => {
             // {"tool_name":"web_search",...} or {"tool":"web_search",...}
-            let name = map.get("tool_name")
+            let name = map
+                .get("tool_name")
                 .or_else(|| map.get("tool"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
@@ -103,12 +134,17 @@ where
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Planner output stored in `SystemState.current_plan`.
 pub struct PlannerOutput {
+    /// Ordered list of steps to execute.
     pub steps: Vec<StepDefinition>,
+    /// Allow-list of tools the plan expects to use (useful for UI/tool gating).
     pub tools_required: Vec<String>,
     /// 0–10: 0-3 low (no critic), 4-7 standard (fast critic), 8-10 high (deep critic + human gate)
     pub risk_score: u8,
+    /// A list of artifact keys or conceptual outputs the plan expects to produce.
     pub expected_outputs: Vec<String>,
+    /// Text criteria that indicate the task is done.
     pub completion_criteria: Vec<String>,
     /// Dependency map — shape varies by model output, never used at runtime.
     #[serde(default)]
@@ -121,6 +157,12 @@ fn default_timestamp() -> DateTime<Utc> {
     Utc::now()
 }
 
+/// Deserialize a “list of strings” from multiple possible shapes.
+///
+/// Why this exists:
+/// - Different models sometimes emit `issues`/`recommendations` as a string, array of strings,
+///   or array of objects with a `description` field.
+/// - The critic/repair pipeline wants a stable `Vec<String>` regardless.
 fn deserialize_string_vec<'de, D>(de: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -153,6 +195,7 @@ where
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Result of a critic pass after tool execution and/or LLM reasoning.
 pub struct CriticReview {
     pub overall_pass: bool,
     pub score: f32,
@@ -170,6 +213,7 @@ pub struct CriticReview {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Lightweight categorization of failure types for analytics and repair strategies.
 pub enum FailureTaxonomy {
     SchemaMismatch,
     LogicError,
@@ -183,7 +227,7 @@ pub enum FailureTaxonomy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationTurn {
-    pub role: String,    // "user" or "assistant"
+    pub role: String, // "user" or "assistant"
     pub content: String,
     pub timestamp: chrono::DateTime<Utc>,
 }
@@ -228,6 +272,10 @@ pub struct KnowledgeContext {
 // ==================== SYSTEM STATE ====================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// The single source of truth for a run.
+///
+/// Every orchestrator node takes ownership of this state, mutates it, and returns it.
+/// This makes the runtime easier to reason about (no hidden side channels).
 pub struct SystemState {
     pub task_id: Uuid,
     pub session_id: Option<Uuid>,
@@ -270,10 +318,17 @@ pub struct SystemState {
     /// Approval gate store — shared with the HTTP server so approve/reject endpoints can
     /// resolve a pending oneshot. Only set on streaming requests; None for non-streaming.
     #[serde(skip)]
-    pub gate_store: Option<Arc<tokio::sync::RwLock<HashMap<Uuid, tokio::sync::oneshot::Sender<bool>>>>>,
+    pub gate_store:
+        Option<Arc<tokio::sync::RwLock<HashMap<Uuid, tokio::sync::oneshot::Sender<bool>>>>>,
 }
 
 impl SystemState {
+    /// Create a new `SystemState` with safe defaults.
+    ///
+    /// Callers typically fill in:
+    /// - `session_id`, `conversation_history`
+    /// - `knowledge_context`, `semantic_context`
+    /// - `workspace_path`, `risk_gate_threshold`, `capabilities`
     pub fn new(user_request: impl Into<String>) -> Self {
         Self {
             task_id: Uuid::new_v4(),
@@ -303,10 +358,12 @@ impl SystemState {
         }
     }
 
+    /// Append an event to the run log.
     pub fn log(&mut self, event_type: &str, message: &str) {
         self.log_meta(event_type, message, serde_json::Value::Null);
     }
 
+    /// Append an event with structured metadata to the run log.
     pub fn log_meta(&mut self, event_type: &str, message: &str, metadata: serde_json::Value) {
         self.event_log.push(LogEvent {
             timestamp: Utc::now(),
@@ -317,17 +374,29 @@ impl SystemState {
         });
     }
 
+    /// Risk score for the current run (defaults to “standard” if no plan is present).
     pub fn risk_score(&self) -> u8 {
-        self.current_plan.as_ref().map(|p| p.risk_score).unwrap_or(5)
+        self.current_plan
+            .as_ref()
+            .map(|p| p.risk_score)
+            .unwrap_or(5)
     }
 
+    /// Merge a tool result into artifacts and checkpoints.
+    ///
+    /// Behavior:
+    /// - on success: store the output under `output_key`
+    /// - on failure: store a normalized error object under `output_key`
+    ///
+    /// This ensures the executor/critic can “see” failures and attempt repairs.
     pub fn apply_tool_result(&mut self, result: &ToolResult, output_key: &str) {
         if let Some(cp) = &result.checkpoint {
             self.checkpoints.push(cp.clone());
         }
         if result.success {
             if let Some(output) = &result.output {
-                self.artifacts.insert(output_key.to_string(), output.clone());
+                self.artifacts
+                    .insert(output_key.to_string(), output.clone());
             }
             return;
         }
@@ -335,7 +404,10 @@ impl SystemState {
         // Persist failures too so the LLM can diagnose what went wrong (network, DNS,
         // bot protection, missing binaries, etc.). Previously failures were dropped,
         // which made the executor think "no artifacts were returned".
-        let mut value = result.output.clone().unwrap_or_else(|| serde_json::json!({}));
+        let mut value = result
+            .output
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
         if !value.is_object() {
             value = serde_json::json!({ "output": value });
         }
@@ -348,7 +420,10 @@ impl SystemState {
             if let Some(trace) = &result.trace {
                 obj.insert("trace".into(), serde_json::json!(trace));
             }
-            obj.insert("timestamp".into(), serde_json::json!(result.timestamp.to_rfc3339()));
+            obj.insert(
+                "timestamp".into(),
+                serde_json::json!(result.timestamp.to_rfc3339()),
+            );
         }
         self.artifacts.insert(output_key.to_string(), value);
     }
@@ -358,16 +433,36 @@ impl SystemState {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+/// Events streamed to the UI during `POST /run/stream`.
+///
+/// This is a UX layer: it does not affect correctness, but it makes the system
+/// transparent by showing plan/tool/critic transitions live.
 pub enum SseEvent {
-    Status { phase: String },
-    Token { text: String },
+    Status {
+        phase: String,
+    },
+    Token {
+        text: String,
+    },
     /// Emitted during qwen3 thinking mode — chain-of-thought tokens before the answer
-    ThinkingToken { text: String },
-    Done { task_id: String, session_id: String, success: bool, answer: String, duration_ms: i64 },
-    Error { message: String },
+    ThinkingToken {
+        text: String,
+    },
+    Done {
+        task_id: String,
+        session_id: String,
+        success: bool,
+        answer: String,
+        duration_ms: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failure: Option<SseFailureInfo>,
+    },
+    Error {
+        message: String,
+    },
     /// Emitted after planner finishes — tells UI what steps are planned
     Plan {
-        steps: Vec<String>,   // human-readable step descriptions
+        steps: Vec<String>, // human-readable step descriptions
         risk: u8,
     },
     /// Emitted before a tool executes
@@ -430,9 +525,27 @@ pub enum SseEvent {
     },
 }
 
+#[derive(Debug, Clone, Serialize)]
+/// Compact failure context for UI debugging (which step/tool failed and why).
+pub struct SseFailureInfo {
+    pub step: usize,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace: Option<String>,
+}
+
 // ==================== ROUTING ====================
 
 #[derive(Debug, Clone, PartialEq)]
+/// Discrete states in the orchestrator’s finite state machine.
 pub enum OrchestratorNode {
     Intake,
     Planner,
@@ -446,6 +559,7 @@ pub enum OrchestratorNode {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Human-readable bucketed risk level derived from a numeric risk score.
 pub enum RiskLevel {
     /// 0–3: executor only, no critic
     Low,
@@ -456,6 +570,10 @@ pub enum RiskLevel {
 }
 
 impl RiskLevel {
+    /// Convert a numeric risk score (0–10) into a coarse bucket used by the orchestrator.
+    ///
+    /// Connection:
+    /// - The orchestrator uses this to decide critic depth and whether to require human approval.
     pub fn from_score(score: u8) -> Self {
         match score {
             0..=3 => RiskLevel::Low,

@@ -37,6 +37,7 @@ pub enum EvalMode {
 }
 
 impl Default for EvalMode {
+    /// Default to the lightweight eval set for fast preflight and â€œdeep healthâ€.
     fn default() -> Self {
         EvalMode::Quick
     }
@@ -69,16 +70,27 @@ pub struct EvalCaseResult {
 }
 
 #[async_trait]
+/// A single evaluative check (test-like) that validates a capability end-to-end.
+///
+/// Connection:
+/// - Evals back `/health/deep` and build user trust by producing reproducible results.
 trait EvalCase: Send + Sync {
+    /// Metadata used for listing and selection.
     fn info(&self) -> EvalCaseInfo;
+    /// Execute the case and return a structured result.
     async fn run(&self, app: &AppState, timeout_secs: Option<u64>) -> EvalCaseResult;
 }
 
+/// Construct the full list of eval cases supported by this server.
+///
+/// Connection:
+/// - Used by `/eval/cases`, `/eval/run`, and deep health checks to validate capabilities.
 fn all_cases() -> Vec<Box<dyn EvalCase>> {
     vec![
         Box::new(WorkspaceExistsCase),
         Box::new(FilesystemRoundtripCase),
         Box::new(FilesystemFindGrepCase),
+        Box::new(SourceCacheRecordCase),
         Box::new(ShellEchoCase),
         Box::new(ShellSyntaxGuardCase),
         Box::new(HttpFetchExampleCase),
@@ -90,10 +102,18 @@ fn all_cases() -> Vec<Box<dyn EvalCase>> {
     ]
 }
 
+/// List metadata for all eval cases (no execution).
+///
+/// Connection:
+/// - Served by `GET /eval/cases` for UI display and selection.
 pub fn list_case_infos() -> Vec<EvalCaseInfo> {
     all_cases().into_iter().map(|c| c.info()).collect()
 }
 
+/// Execute one or more eval cases and aggregate results.
+///
+/// Connection:
+/// - Used by `POST /eval/run` and by `GET /health/deep` preflight checks.
 pub async fn run_eval(app: &AppState, req: EvalRunRequest) -> (StatusCode, EvalRunResponse) {
     let start = Instant::now();
 
@@ -140,7 +160,11 @@ pub async fn run_eval(app: &AppState, req: EvalRunRequest) -> (StatusCode, EvalR
                 failed += 1;
             }
         }
-        EvalSummary { passed, failed, skipped }
+        EvalSummary {
+            passed,
+            failed,
+            skipped,
+        }
     };
 
     let ok = summary.failed == 0;
@@ -153,16 +177,21 @@ pub async fn run_eval(app: &AppState, req: EvalRunRequest) -> (StatusCode, EvalR
 
     app.metrics.record_eval_run(ok, start.elapsed());
 
-    let code = if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let code = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     (code, resp)
 }
 
-// ── Cases ──────────────────────────────────────────────────────────────────────
+// â”€â”€ Cases â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 struct WorkspaceExistsCase;
 
 #[async_trait]
 impl EvalCase for WorkspaceExistsCase {
+    /// Metadata for this eval case.
     fn info(&self) -> EvalCaseInfo {
         EvalCaseInfo {
             id: "workspace.exists".into(),
@@ -172,6 +201,7 @@ impl EvalCase for WorkspaceExistsCase {
         }
     }
 
+    /// Execute this eval case.
     async fn run(&self, app: &AppState, _timeout_secs: Option<u64>) -> EvalCaseResult {
         let t0 = Instant::now();
         let ws = app.config.read().await.workspace_path.clone();
@@ -190,6 +220,7 @@ struct FilesystemRoundtripCase;
 
 #[async_trait]
 impl EvalCase for FilesystemRoundtripCase {
+    /// Metadata for this eval case.
     fn info(&self) -> EvalCaseInfo {
         EvalCaseInfo {
             id: "tool.filesystem.roundtrip".into(),
@@ -199,6 +230,7 @@ impl EvalCase for FilesystemRoundtripCase {
         }
     }
 
+    /// Execute this eval case.
     async fn run(&self, app: &AppState, _timeout_secs: Option<u64>) -> EvalCaseResult {
         let t0 = Instant::now();
         let tools = &app.orchestrator.tools;
@@ -252,6 +284,7 @@ struct FilesystemFindGrepCase;
 
 #[async_trait]
 impl EvalCase for FilesystemFindGrepCase {
+    /// Metadata for this eval case.
     fn info(&self) -> EvalCaseInfo {
         EvalCaseInfo {
             id: "tool.filesystem.find_grep".into(),
@@ -261,6 +294,7 @@ impl EvalCase for FilesystemFindGrepCase {
         }
     }
 
+    /// Execute this eval case.
     async fn run(&self, app: &AppState, _timeout_secs: Option<u64>) -> EvalCaseResult {
         let t0 = Instant::now();
         let tools = &app.orchestrator.tools;
@@ -293,10 +327,69 @@ impl EvalCase for FilesystemFindGrepCase {
     }
 }
 
+struct SourceCacheRecordCase;
+
+#[async_trait]
+impl EvalCase for SourceCacheRecordCase {
+    /// Metadata for this eval case.
+    fn info(&self) -> EvalCaseInfo {
+        EvalCaseInfo {
+            id: "source_cache.record".into(),
+            description: "source cache can record and return recent normalized URLs".into(),
+            tags: vec!["memory".into(), "cache".into(), "sources".into()],
+            quick: true,
+        }
+    }
+
+    /// Execute this eval case.
+    async fn run(&self, app: &AppState, _timeout_secs: Option<u64>) -> EvalCaseResult {
+        let t0 = Instant::now();
+
+        let url = "https://www.reddit.com/r/DotA2/comments/abc123/test/";
+        let normalized = crate::memory::sources::normalize_url(url);
+
+        let before = app
+            .sources
+            .recent_normalized_urls(1, 200)
+            .await
+            .unwrap_or_default()
+            .len();
+
+        let rec = app
+            .sources
+            .record_fetch(url, 200, Some("text/plain"), "Example title\nBody")
+            .await;
+
+        let after_list = app
+            .sources
+            .recent_normalized_urls(1, 200)
+            .await
+            .unwrap_or_default();
+
+        let found = after_list.iter().any(|u| u == &normalized);
+        let ok = rec.is_ok() && found;
+
+        EvalCaseResult {
+            id: self.info().id,
+            ok,
+            skipped: false,
+            duration_ms: t0.elapsed().as_millis(),
+            detail: json!({
+                "before_recent_count": before,
+                "after_recent_count": after_list.len(),
+                "normalized": normalized,
+                "record_ok": rec.is_ok(),
+                "found": found
+            }),
+        }
+    }
+}
+
 struct ShellEchoCase;
 
 #[async_trait]
 impl EvalCase for ShellEchoCase {
+    /// Metadata for this eval case.
     fn info(&self) -> EvalCaseInfo {
         EvalCaseInfo {
             id: "tool.shell.echo".into(),
@@ -306,6 +399,7 @@ impl EvalCase for ShellEchoCase {
         }
     }
 
+    /// Execute this eval case.
     async fn run(&self, app: &AppState, timeout_secs: Option<u64>) -> EvalCaseResult {
         let t0 = Instant::now();
         let tools = &app.orchestrator.tools;
@@ -350,6 +444,7 @@ struct ShellSyntaxGuardCase;
 
 #[async_trait]
 impl EvalCase for ShellSyntaxGuardCase {
+    /// Metadata for this eval case.
     fn info(&self) -> EvalCaseInfo {
         EvalCaseInfo {
             id: "tool.shell.syntax_guard".into(),
@@ -359,6 +454,7 @@ impl EvalCase for ShellSyntaxGuardCase {
         }
     }
 
+    /// Execute this eval case.
     async fn run(&self, app: &AppState, timeout_secs: Option<u64>) -> EvalCaseResult {
         let t0 = Instant::now();
         let tools = &app.orchestrator.tools;
@@ -392,7 +488,11 @@ impl EvalCase for ShellSyntaxGuardCase {
             )
             .await;
 
-        let ok = !mismatch.success && matches!(mismatch.error_code.as_deref(), Some("shell_syntax_mismatch"));
+        let ok = !mismatch.success
+            && matches!(
+                mismatch.error_code.as_deref(),
+                Some("shell_syntax_mismatch")
+            );
 
         EvalCaseResult {
             id: self.info().id,
@@ -412,6 +512,7 @@ struct HttpFetchExampleCase;
 
 #[async_trait]
 impl EvalCase for HttpFetchExampleCase {
+    /// Metadata for this eval case.
     fn info(&self) -> EvalCaseInfo {
         EvalCaseInfo {
             id: "tool.http_fetch.example".into(),
@@ -421,6 +522,7 @@ impl EvalCase for HttpFetchExampleCase {
         }
     }
 
+    /// Execute this eval case.
     async fn run(&self, app: &AppState, timeout_secs: Option<u64>) -> EvalCaseResult {
         let t0 = Instant::now();
         let tools = &app.orchestrator.tools;
@@ -465,6 +567,7 @@ struct WebSearchCase;
 
 #[async_trait]
 impl EvalCase for WebSearchCase {
+    /// Metadata for this eval case.
     fn info(&self) -> EvalCaseInfo {
         EvalCaseInfo {
             id: "tool.web_search.basic".into(),
@@ -474,6 +577,7 @@ impl EvalCase for WebSearchCase {
         }
     }
 
+    /// Execute this eval case.
     async fn run(&self, app: &AppState, timeout_secs: Option<u64>) -> EvalCaseResult {
         let t0 = Instant::now();
         let search_url = app.config.read().await.search_url.clone();
@@ -528,6 +632,7 @@ struct ParallelSearchCase;
 
 #[async_trait]
 impl EvalCase for ParallelSearchCase {
+    /// Metadata for this eval case.
     fn info(&self) -> EvalCaseInfo {
         EvalCaseInfo {
             id: "tool.parallel_search.basic".into(),
@@ -537,6 +642,7 @@ impl EvalCase for ParallelSearchCase {
         }
     }
 
+    /// Execute this eval case.
     async fn run(&self, app: &AppState, timeout_secs: Option<u64>) -> EvalCaseResult {
         let t0 = Instant::now();
         let search_url = app.config.read().await.search_url.clone();
@@ -584,6 +690,7 @@ struct GroundingContractCase;
 
 #[async_trait]
 impl EvalCase for GroundingContractCase {
+    /// Metadata for this eval case.
     fn info(&self) -> EvalCaseInfo {
         EvalCaseInfo {
             id: "grounding.contract".into(),
@@ -593,6 +700,7 @@ impl EvalCase for GroundingContractCase {
         }
     }
 
+    /// Execute this eval case.
     async fn run(&self, _app: &AppState, _timeout_secs: Option<u64>) -> EvalCaseResult {
         let t0 = Instant::now();
 
@@ -624,11 +732,32 @@ impl EvalCase for GroundingContractCase {
             .steps
             .iter()
             .any(|s| s.tool_binding.as_deref() == Some("parallel_search"));
+        let search_queries_len = plan
+            .steps
+            .iter()
+            .find(|s| s.tool_binding.as_deref() == Some("parallel_search"))
+            .and_then(|s| s.input_params.get("queries"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
         let has_facts = plan.steps.iter().any(|s| {
             s.output_key.as_deref() == Some("facts")
                 && s.tool_binding.is_none()
                 && s.output_format.as_deref() == Some("json")
         });
+        let facts_pos = plan
+            .steps
+            .iter()
+            .position(|s| s.output_key.as_deref() == Some("facts"));
+        let fetch_before_facts = facts_pos
+            .map(|i| {
+                plan.steps
+                    .iter()
+                    .take(i)
+                    .filter(|s| s.tool_binding.as_deref() == Some("http_fetch"))
+                    .count()
+            })
+            .unwrap_or(0);
         let answer_requires_facts = plan
             .steps
             .iter()
@@ -636,7 +765,11 @@ impl EvalCase for GroundingContractCase {
             .map(|s| s.requires_facts)
             .unwrap_or(false);
 
-        let ok = has_search && has_facts && answer_requires_facts;
+        let ok = has_search
+            && search_queries_len >= 2
+            && has_facts
+            && fetch_before_facts >= 1
+            && answer_requires_facts;
 
         EvalCaseResult {
             id: self.info().id,
@@ -645,7 +778,9 @@ impl EvalCase for GroundingContractCase {
             duration_ms: t0.elapsed().as_millis(),
             detail: json!({
                 "has_search": has_search,
+                "search_queries_len": search_queries_len,
                 "has_facts": has_facts,
+                "fetch_before_facts": fetch_before_facts,
                 "answer_requires_facts": answer_requires_facts
             }),
         }
@@ -656,6 +791,7 @@ struct LlmChatJsonCase;
 
 #[async_trait]
 impl EvalCase for LlmChatJsonCase {
+    /// Metadata for this eval case.
     fn info(&self) -> EvalCaseInfo {
         EvalCaseInfo {
             id: "llm.chat.json".into(),
@@ -665,6 +801,7 @@ impl EvalCase for LlmChatJsonCase {
         }
     }
 
+    /// Execute this eval case.
     async fn run(&self, app: &AppState, _timeout_secs: Option<u64>) -> EvalCaseResult {
         let t0 = Instant::now();
         let llm = &app.orchestrator.llm;
@@ -676,7 +813,9 @@ impl EvalCase for LlmChatJsonCase {
             crate::llm::ollama::Message::user("ping"),
         ];
 
-        let resp = llm.chat(messages, crate::llm::ollama::ModelRole::Fast, true, false).await;
+        let resp = llm
+            .chat(messages, crate::llm::ollama::ModelRole::Fast, true, false)
+            .await;
         let ok = resp
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -697,6 +836,7 @@ struct LlmEmbedCase;
 
 #[async_trait]
 impl EvalCase for LlmEmbedCase {
+    /// Metadata for this eval case.
     fn info(&self) -> EvalCaseInfo {
         EvalCaseInfo {
             id: "llm.embed".into(),
@@ -706,6 +846,7 @@ impl EvalCase for LlmEmbedCase {
         }
     }
 
+    /// Execute this eval case.
     async fn run(&self, app: &AppState, _timeout_secs: Option<u64>) -> EvalCaseResult {
         let t0 = Instant::now();
         let llm = &app.orchestrator.llm;

@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy manifests first so dependency layer is cached
 COPY Cargo.toml Cargo.lock ./
+COPY *.md ./
 
 # Pre-fetch dependencies by building a stub main
 RUN mkdir src && echo "fn main(){}" > src/main.rs && \
@@ -34,6 +35,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/aihomeserver /app/aihomeserver
+
+# Optional: ship a read-only copy of the repo sources/docs for the `/learn` site
+# so it works even in the minimal runtime image (no bind mount).
+RUN mkdir -p /repo
+COPY *.md Cargo.toml Cargo.lock /repo/
+COPY src /repo/src
+ENV REPO_ROOT=/repo
 
 # Data lives on a mounted volume at /data
 ENV DATA_DIR=/data

@@ -2,12 +2,16 @@ use async_trait::async_trait;
 use reqwest::{header, Client};
 use serde_json::{json, Value};
 
+use crate::memory::sources::SourceCacheStore;
 use crate::state::{ErrorType, ToolResult};
 
 use super::Tool;
 
 /// Rewrite URLs to more scrapable equivalents.
 /// - new Reddit -> old Reddit (the new design is JS-heavy and often returns near-empty HTML)
+///
+/// Connection:
+/// - Used by `HttpFetchTool` before fetching so we get content suitable for LLM parsing.
 fn rewrite_url(url: &str) -> String {
     if url.contains("://www.reddit.com") {
         return url.replacen("://www.reddit.com", "://old.reddit.com", 1);
@@ -20,6 +24,9 @@ fn rewrite_url(url: &str) -> String {
 
 /// When a page returns 403/429, fall back to an old.reddit.com search using
 /// keywords extracted from the URL path as a best-effort alternative.
+///
+/// Connection:
+/// - This reduces “hard failures” in grounded research flows where one URL is blocked.
 fn reddit_fallback_url(blocked_url: &str) -> String {
     // Extract path segments as search keywords
     let path = blocked_url
@@ -46,6 +53,10 @@ fn reddit_fallback_url(blocked_url: &str) -> String {
 }
 
 /// Strip HTML tags and collapse whitespace so the LLM receives clean readable text.
+///
+/// Connection:
+/// - The grounding contract stores fetched page text as artifacts; stripping makes the
+///   text smaller and easier for the LLM/critic to use.
 fn strip_html(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
@@ -112,12 +123,19 @@ fn strip_html(html: &str) -> String {
     result
 }
 
+/// HTTP fetch tool used for grounded research.
+///
+/// Connection:
+/// - Typically follows a `web_search`/`parallel_search` step to fetch full page text.
+/// - Optionally writes metadata into `SourceCacheStore` for provenance and reuse.
 pub struct HttpFetchTool {
     client: Client,
+    cache: Option<std::sync::Arc<SourceCacheStore>>,
 }
 
 impl HttpFetchTool {
-    pub fn new() -> Self {
+    /// Create a new HTTP fetch tool with an optional source cache.
+    pub fn new(cache: Option<std::sync::Arc<SourceCacheStore>>) -> Self {
         Self {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -125,16 +143,19 @@ impl HttpFetchTool {
                 .gzip(true)
                 .build()
                 .expect("HTTP client"),
+            cache,
         }
     }
 }
 
 #[async_trait]
 impl Tool for HttpFetchTool {
+    /// Canonical tool name used in planner/executor `tool_binding`.
     fn name(&self) -> &str {
         "http_fetch"
     }
 
+    /// Fetch a URL and return cleaned text + metadata as a `ToolResult`.
     async fn execute(&self, params: Value) -> ToolResult {
         let raw_url = match params.get("url").and_then(|v| v.as_str()) {
             Some(u) if !u.trim().is_empty() && u.starts_with("http") => u.to_string(),
@@ -213,6 +234,13 @@ impl Tool for HttpFetchTool {
                     out.push_str("… [truncated]");
                 }
 
+                // Persist fetch metadata for cross-run de-dupe/relevance. Best-effort only.
+                if let Some(cache) = &self.cache {
+                    let _ = cache
+                        .record_fetch(&final_url, status, content_type.as_deref(), &out)
+                        .await;
+                }
+
                 ToolResult::ok(
                     json!({
                         "requested_url": raw_url,
@@ -234,4 +262,3 @@ impl Tool for HttpFetchTool {
         }
     }
 }
-
