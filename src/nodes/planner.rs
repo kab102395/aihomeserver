@@ -424,6 +424,8 @@ DO NOT USE: create_file, create_dir, save, touch (these return unsupported_actio
 risk_score for new coding projects: 4-6 (needs verification but not destructive)
 "#);
         ctx.push_str("=== END CODING CONTRACT ===\n\n");
+        ctx.push_str("IMPORTANT: Do NOT answer this request from the knowledge base or training data.\n");
+        ctx.push_str("The user wants actual files created in the workspace. Use the CODING PLAN CONTRACT above.\n\n");
 
         // Also inject execution manifest if already loaded (from replan)
         if let Some(manifest) = &state.execution_manifest {

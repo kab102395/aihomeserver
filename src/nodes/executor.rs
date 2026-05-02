@@ -116,7 +116,12 @@ MATH / LATEX RULES:
 
 Complete the requested task directly and thoroughly. Be specific and detailed.
 Output plain text only — no JSON wrappers, no tool calls, no metadata.
-Just the answer, code, or content that was asked for."#;
+
+IMPORTANT — START YOUR RESPONSE WITH THE ANSWER:
+Do NOT begin with "Okay", "Sure", "Let me", "First I need to", "Looking at", "I need to",
+"Alright", "Let's", "I should", or any other reasoning preamble or thinking-out-loud opener.
+Do NOT explain what you are about to do. Just do it.
+Start the first word of your response with the actual content, answer, or code."#;
 
 /// Grounding guardrail injected into the user-message for `requires_facts` steps.
 ///
