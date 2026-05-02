@@ -162,6 +162,33 @@ fn extract_subjects(user_request: &str) -> Vec<String> {
     out
 }
 
+/// Try to extract a likely technology / software subject from a freeform request.
+///
+/// Examples:
+/// - "what are the latest changes in Rust" → "Rust"
+/// - "tell me about Node.js updates" → "Node.js"
+/// - "latest python 3.12 release notes" → "python"
+fn extract_tech_subject(user_request: &str) -> Option<String> {
+    // Known languages/runtimes/tools — checked case-insensitively.
+    let tech_names = [
+        "Rust", "Python", "Node.js", "Node", "TypeScript", "JavaScript",
+        "Go", "Golang", "Java", "Kotlin", "Swift", "Ruby", "PHP", "C#", "C++",
+        "Zig", "Elixir", "Haskell", "Dart", "Flutter", "React", "Vue", "Angular",
+        "Next.js", "Nuxt", "Django", "FastAPI", "Spring", "Rails",
+        "Docker", "Kubernetes", "Terraform", "Ansible",
+        "PostgreSQL", "MySQL", "SQLite", "Redis", "MongoDB",
+        "Linux", "Ubuntu", "Debian", "Fedora", "Arch",
+        "Cargo", "npm", "pip", "cargo", "bun",
+    ];
+    let lower = user_request.to_lowercase();
+    for name in &tech_names {
+        if lower.contains(&name.to_lowercase()) {
+            return Some((*name).to_string());
+        }
+    }
+    None
+}
+
 /// Produce multiple search queries for time-sensitive requests.
 ///
 /// Why this exists:
@@ -202,12 +229,40 @@ fn decompose_search_queries(user_request: &str) -> Vec<String> {
             }
         }
     } else {
-        // Fallback: keep one literal query but add a couple of "source finding" variants.
-        queries.push(user_request.to_string());
-        if let Some(v) = &version {
-            queries.push(format!("{v} changes summary"));
+        // Fallback: detect whether this is a software/tech topic and generate
+        // targeted queries. A literal copy of the user request is a bad search query.
+        let tech = extract_tech_subject(user_request);
+        if let Some(ref t) = tech {
+            // Software/tech version research — generate specific, useful queries
+            if let Some(v) = &version {
+                queries.push(format!("{t} {v} release notes what's new"));
+                queries.push(format!("{t} {v} changelog new features"));
+                queries.push(format!("{t} {v} release blog announcement"));
+                queries.push(format!("{t} latest stable version release 2024 2025"));
+            } else {
+                queries.push(format!("{t} latest release what's new"));
+                queries.push(format!("{t} recent versions changelog"));
+                queries.push(format!("{t} release notes blog 2024 2025"));
+                queries.push(format!("{t} new features updates site:reddit.com"));
+            }
+        } else {
+            // True fallback for unknown topics — still better than repeating the request
+            // Clean up filler words to produce a tighter search query.
+            let cleaned = user_request
+                .to_lowercase()
+                .replace("i'd like you to", "")
+                .replace("tell me about", "")
+                .replace("look into", "")
+                .replace("please", "")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            queries.push(cleaned.trim().to_string());
+            if let Some(v) = &version {
+                queries.push(format!("{v} release notes changelog"));
+            }
+            queries.push(format!("{} recent updates 2024 2025", cleaned.trim()));
         }
-        queries.push(format!("{user_request} sources"));
     }
 
     // De-dupe and cap at 6 (parallel_search internal cap).

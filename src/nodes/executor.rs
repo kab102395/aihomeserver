@@ -85,20 +85,24 @@ You have access to local tools (filesystem, shell, git) and optional web tools (
 CRITICAL ANTI-HALLUCINATION RULES:
 - Your training data has a cutoff. Game patches, software versions, prices, rankings, and meta
   are almost certainly outdated in your training data. NEVER invent patch notes, hero stats,
-  item costs, or tier lists from memory — only use what is in the artifacts below.
-- If you have search/fetch artifacts: use them as your ONLY source for patch-specific facts.
-  Quote real numbers, real ability names, real item builds from the actual fetched content.
-- If you do NOT have search artifacts for a time-sensitive topic: say clearly
-  "I don't have current data on this — the search results weren't available." Do NOT fill the
-  gap with training-data guesses dressed up as facts.
-- Never cite a knowledge cutoff date and then proceed to answer anyway with made-up specifics.
-  Either use real artifact data or honestly say what you don't know.
+  item costs, tier lists, or release changelogs from memory.
+- If you have search/fetch artifacts: use them as your ONLY source for any specific fact.
+  Quote real numbers, real names, real content directly from the actual fetched content.
+- If you do NOT have search artifacts for a time-sensitive topic: say EXACTLY
+  "I don't have current data on this — my training data may be outdated and the search
+  results weren't sufficient to answer with confidence."
+  Do NOT fill the gap with training-data guesses dressed up as facts. Do NOT say "as of my
+  knowledge cutoff" and then proceed to give specifics.
+- SPECIFIC VERSION NUMBERS, DATES, AND STATISTICS: never state these from memory.
+  If a version number, release date, or statistic is not present in the artifacts, say it's
+  not available rather than guessing. A wrong version number is worse than no answer.
 
 ARTIFACT USAGE RULES:
 - web_search results contain search snippets (short). http_fetch results contain full page text (rich).
 - A failed http_fetch (403/timeout) does NOT mean the web search failed — use the snippets.
 - If a web_search itself returned success=false, say the search failed.
-- When you have real data, use it extensively — quote specific details, ability names, numbers.
+- When you have real data, use it extensively — quote specific details, exact version numbers,
+  exact names from the actual fetched content. Cite the source URL.
 
 CODING QUALITY RULES:
 - Prefer concrete, runnable implementations. Avoid placeholders unless you also implement them.
@@ -113,6 +117,32 @@ MATH / LATEX RULES:
 Complete the requested task directly and thoroughly. Be specific and detailed.
 Output plain text only — no JSON wrappers, no tool calls, no metadata.
 Just the answer, code, or content that was asked for."#;
+
+/// Grounding guardrail injected into the user-message for `requires_facts` steps.
+///
+/// This is appended to the user prompt (not system prompt) so it appears close to
+/// the end of context where modern LLMs give it the most weight.
+const GROUNDING_GUARDRAIL: &str = "
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GROUNDING ENFORCEMENT — THIS STEP REQUIRES FACTS ARTIFACTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The planner flagged this step as requiring grounded evidence.
+You MUST follow these rules without exception:
+
+1. Every specific claim (version number, date, stat, price, hero value, API name) MUST come
+   from the 'facts' or search/fetch artifacts shown above. Cite the source.
+
+2. If a specific fact is NOT present in the artifacts: write exactly
+   \"[not in research data]\" in place of the missing fact.
+   Do NOT substitute your training-data memory for missing evidence.
+
+3. If the artifacts are empty or failed: respond with a short paragraph explaining
+   what was searched and that the results were insufficient — do not attempt the answer.
+
+4. Do NOT begin your response with reasoning, meta-commentary, or caveats about your
+   training cutoff. Jump directly into the answer using the artifact data.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
 
 /// Used for LLM-only steps that must emit machine-readable JSON (e.g. evidence-backed fact tables).
 const SYSTEM_PROMPT_LLM_JSON: &str = r#"You are a research extraction agent.
@@ -361,15 +391,23 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
             artifact_context,
         )
     } else {
-        // For LLM-only steps, lead with history + question so the model sees everything
+        // For LLM-only steps, lead with history + question so the model sees everything.
+        // Append the grounding guardrail at the END of the user message for requires_facts
+        // steps — placing it last maximises the weight modern LLMs give to the instruction.
+        let grounding_suffix = if step.requires_facts {
+            GROUNDING_GUARDRAIL
+        } else {
+            ""
+        };
         format!(
-            "{}User request: {}\n\nCapabilities: {}\nStep ID: {}\nAction: {}\nAvailable artifacts: {}",
+            "{}User request: {}\n\nCapabilities: {}\nStep ID: {}\nAction: {}\nAvailable artifacts: {}{}",
             history_block,
             state.user_request,
             state.capabilities,
             step.step_id,
             step.action,
             artifact_context,
+            grounding_suffix,
         )
     };
 

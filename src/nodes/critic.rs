@@ -21,9 +21,9 @@ const FAST_CRITIC_PROMPT: &str = r#"You are a fast critic. Check whether the too
 
 Rules:
 - If a tool result shows success=true, the action succeeded — mark overall_pass: true
-- Only fail if there is a clear, specific, actionable problem
-- Do NOT fail because of missing information or uncertainty
+- Only fail if there is a clear, specific, actionable problem (wrong output, tool failure, missing required artifact)
 - File writes, shell commands, and git ops that returned success ARE complete
+- Do NOT fail because of cosmetic or style issues
 
 Output ONLY valid JSON:
 {
@@ -32,6 +32,41 @@ Output ONLY valid JSON:
   "confidence": 0.85,
   "issues": [],
   "recommendations": []
+}"#;
+
+/// Prompt used when an LLM-only answer step followed a grounded research chain.
+/// This checks whether the answer is grounded in the facts artifact or invented.
+const RESEARCH_CRITIC_PROMPT: &str = r#"You are a research quality critic. Your job is to detect hallucination in grounded answer steps.
+
+A "grounded answer step" is one where the planner ran web search + fetch + facts extraction,
+and then asked the LLM to synthesize an answer. You must check whether the answer actually
+uses the research data or invents specifics from training-data memory.
+
+Check the following:
+1. HALLUCINATED SPECIFICS — Does the answer contain specific version numbers, dates, stats,
+   patch values, prices, or API names that are NOT present in the 'facts' artifact or search
+   results? If so: FAIL. These are training-data inventions, not grounded claims.
+2. TRAINING DATA LEAK — Does the answer confidently state time-sensitive facts (e.g. "the
+   latest version is X.Y.Z") when the artifacts either don't mention that version or show a
+   different one? If so: FAIL.
+3. PROPER "I DON'T KNOW" — If the artifacts have thin/failed results, did the answer honestly
+   say so, or did it pretend to have data? Honest "search failed / data not available" = PASS.
+4. SOURCE USAGE — For answers that DO have good artifacts: did the answer quote and cite real
+   content from the fetched pages? If it ignored rich artifact content and answered vaguely,
+   that's a soft fail (score 4-5, pass=false with recommendation to quote specific evidence).
+
+IMPORTANT: Do NOT fail if:
+- The answer is honest about uncertainty or missing data
+- Tool results show success=true for search/fetch steps (those steps succeeded)
+- The answer is about a timeless topic (math, concepts, code that doesn't depend on versions)
+
+Output ONLY valid JSON:
+{
+  "overall_pass": false,
+  "score": 3.0,
+  "confidence": 0.9,
+  "issues": ["Answer states 'Rust 1.85 introduces X' but 1.85 is not mentioned in the facts artifact"],
+  "recommendations": ["Remove version-specific claims not present in artifacts; state '[not in research data]' instead"]
 }"#;
 
 const DEEP_CRITIC_PROMPT: &str = r#"You are a deep critic for HIGH-RISK operations. Perform thorough validation before any irreversible action.
@@ -226,8 +261,27 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
 
     let risk = RiskLevel::from_score(state.risk_score());
 
-    // Low risk path: skip critic entirely, auto-pass
-    if risk == RiskLevel::Low {
+    // Detect whether the current step is a grounded research answer step.
+    // If it is, use the research critic regardless of risk level — the standard
+    // low-risk auto-pass would let hallucinated answers through silently.
+    let current_step_requires_facts = state
+        .current_plan
+        .as_ref()
+        .and_then(|p| {
+            if state.current_step >= 1 && state.current_step <= p.steps.len() {
+                Some(p.steps[state.current_step - 1].requires_facts)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false);
+    let has_facts_artifact = state.artifacts.contains_key("facts");
+    let is_grounded_answer_step = current_step_requires_facts && has_facts_artifact;
+
+    // Low risk path: skip critic entirely, auto-pass.
+    // Exception: grounded research answer steps always need the research critic
+    // because the auto-pass would silently accept hallucinated version numbers.
+    if risk == RiskLevel::Low && !is_grounded_answer_step {
         state.log("critic", "Skipping (low risk path)");
         state.critic_history.push(CriticReview {
             overall_pass: true,
@@ -240,19 +294,28 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
         return Ok(state);
     }
 
-    let (prompt, model_role) = match risk {
-        RiskLevel::Standard => (FAST_CRITIC_PROMPT, ModelRole::Fast),
-        RiskLevel::High => (DEEP_CRITIC_PROMPT, ModelRole::Critic),
-        RiskLevel::Low => unreachable!(),
+    // Choose critic prompt — research steps get a dedicated hallucination detector
+    let (prompt, model_role) = if is_grounded_answer_step {
+        state.log("critic", "Running research grounding critic");
+        (RESEARCH_CRITIC_PROMPT, ModelRole::Fast)
+    } else {
+        match risk {
+            RiskLevel::Standard | RiskLevel::Low => (FAST_CRITIC_PROMPT, ModelRole::Fast),
+            RiskLevel::High => (DEEP_CRITIC_PROMPT, ModelRole::Critic),
+        }
     };
 
     state.log_meta(
         "critic",
         "Running critique",
-        serde_json::json!({ "risk": format!("{risk:?}") }),
+        serde_json::json!({
+            "risk": format!("{risk:?}"),
+            "grounded_answer": is_grounded_answer_step,
+        }),
     );
 
-    // Show tool results (_result keys) prominently so critic can verify execution
+    // Show tool results (_result keys) prominently so critic can verify execution.
+    // For grounded steps, also surface the facts artifact and the answer being reviewed.
     let tool_results: serde_json::Map<String, serde_json::Value> = state
         .artifacts
         .iter()
@@ -260,8 +323,32 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
+    let grounding_context = if is_grounded_answer_step {
+        let facts = state
+            .artifacts
+            .get("facts")
+            .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
+            .unwrap_or_default();
+        let answer = state
+            .current_plan
+            .as_ref()
+            .and_then(|p| {
+                if state.current_step >= 1 && state.current_step <= p.steps.len() {
+                    p.steps[state.current_step - 1].output_key.as_deref()
+                } else {
+                    None
+                }
+            })
+            .and_then(|key| state.artifacts.get(key))
+            .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
+            .unwrap_or_default();
+        format!("\n\nFacts artifact (grounded research data):\n{facts}\n\nAnswer artifact (what the LLM produced — check for hallucination):\n{answer}")
+    } else {
+        String::new()
+    };
+
     let context = format!(
-        "Completion criteria:\n{}\n\nTool execution results:\n{}\n\nAll artifacts:\n{}",
+        "Completion criteria:\n{}\n\nTool execution results:\n{}\n\nAll artifacts:\n{}{}",
         state
             .current_plan
             .as_ref()
@@ -269,6 +356,7 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
             .unwrap_or_default(),
         serde_json::to_string_pretty(&tool_results).unwrap_or_default(),
         serde_json::to_string_pretty(&state.artifacts).unwrap_or_default(),
+        grounding_context,
     );
 
     let messages = vec![Message::system(prompt), Message::user(context)];

@@ -204,7 +204,7 @@ impl OllamaClient {
             .json::<ChatResponse>()
             .await?;
 
-        Ok(resp.message.content)
+        Ok(strip_think_tags(&resp.message.content))
     }
 
     /// Stream tokens from Ollama. Sends each content token to `token_tx`.
@@ -287,7 +287,7 @@ impl OllamaClient {
                 break;
             }
         }
-        Ok(accumulated)
+        Ok(strip_think_tags(&accumulated))
     }
 
     /// Chat and parse the response as JSON into type T.
@@ -309,6 +309,7 @@ impl OllamaClient {
     }
 
     /// Generate a text embedding using nomic-embed-text.
+
     /// Returns a 768-dimensional vector. Fails gracefully — callers should
     /// log and continue rather than hard-failing if embeddings are unavailable.
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
@@ -338,4 +339,45 @@ impl OllamaClient {
 
         Ok(resp.embedding)
     }
+}
+
+/// Strip `<think>...</think>` blocks from model output.
+///
+/// Why this exists:
+/// - qwen3 in Ollama uses a dedicated `message.thinking` field for CoT, but some
+///   model versions also embed the reasoning inside `<think>...</think>` tags in
+///   the `content` field, especially in non-streaming responses.
+/// - Returning raw content with these tags leaks internal reasoning into the UI
+///   and into artifact values read by downstream nodes.
+/// - This function is a defensive layer applied to all `chat()` and `chat_stream()`
+///   return values so the rest of the system never sees thinking-mode artifacts.
+pub fn strip_think_tags(s: &str) -> String {
+    let mut result = s.to_string();
+    loop {
+        match result.find("<think>") {
+            None => break,
+            Some(start) => {
+                match result[start..].find("</think>") {
+                    Some(rel_end) => {
+                        let end = start + rel_end + "</think>".len();
+                        result.drain(start..end);
+                    }
+                    None => {
+                        // Unclosed tag — remove everything from <think> onward.
+                        result.drain(start..);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // Also strip any stray closing tags left behind and trim leading/trailing whitespace.
+    result
+        .replace("</think>", "")
+        .split('\n')
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
