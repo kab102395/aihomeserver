@@ -39,6 +39,7 @@ hex = "0.4"
 anyhow = "1"
 thiserror = "1"
 async-trait = "0.1"
+zip = "2"
 
 # Logging
 tracing = "0.1"

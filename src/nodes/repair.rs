@@ -16,6 +16,55 @@ use crate::{
     state::SystemState,
 };
 
+/// Describes what kind of repair is most appropriate for a coding task failure.
+enum CodingRepairTarget {
+    /// A required source file is missing — must be written
+    WriteFile(String),
+    /// Build failed — patch the source at project_root
+    PatchSource(String),
+    /// Expected artifact (e.g. zip) is missing — run packaging step
+    RunPackage(String),
+    /// Fallback: let LLM decide
+    General,
+}
+
+/// Determine the most targeted repair action for a coding task based on verifier output.
+fn coding_repair_target(state: &SystemState) -> CodingRepairTarget {
+    let verif = match state.artifacts.get("artifact_verification") {
+        Some(v) => v,
+        None => return CodingRepairTarget::General,
+    };
+
+    // Priority 1: missing source files — write the first one
+    if let Some(missing_files) = verif.get("missing_files").and_then(|v| v.as_array()) {
+        if let Some(first) = missing_files.first().and_then(|v| v.as_str()) {
+            return CodingRepairTarget::WriteFile(first.to_string());
+        }
+    }
+
+    // Priority 2: build failure — patch source
+    if verif.get("build_passed").and_then(|v| v.as_bool()) == Some(false) {
+        let root = state
+            .execution_manifest
+            .as_ref()
+            .map(|m| m.project_root.clone())
+            .unwrap_or_else(|| "project".to_string());
+        return CodingRepairTarget::PatchSource(root);
+    }
+
+    // Priority 3: zip/artifact missing — run packaging
+    if let Some(missing_artifacts) = verif
+        .get("missing_artifacts")
+        .and_then(|v| v.as_array())
+    {
+        if let Some(first) = missing_artifacts.first().and_then(|v| v.as_str()) {
+            return CodingRepairTarget::RunPackage(first.to_string());
+        }
+    }
+
+    CodingRepairTarget::General
+}
+
 /// Best-effort container detection used to tune shell syntax guidance for repairs.
 fn in_container() -> bool {
     if std::path::Path::new("/.dockerenv").exists() {
@@ -109,13 +158,35 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
             .cloned()
             .unwrap_or(serde_json::Value::Null);
 
+        // For coding tasks, add a targeted repair directive based on verifier output
+        let coding_directive = if state.coding_intent.is_some() {
+            match coding_repair_target(&state) {
+                CodingRepairTarget::WriteFile(path) => format!(
+                    "\n\nCODING REPAIR TARGET: Write missing file '{}' using the filesystem tool.\nAction: write\nParams: {{\"path\": \"{}\", \"content\": \"<complete implementation>\"}}\nDo NOT output a stub or placeholder — write the full implementation.",
+                    path, path
+                ),
+                CodingRepairTarget::PatchSource(root) => format!(
+                    "\n\nCODING REPAIR TARGET: Build failed. Read the build error from artifacts and patch the source file in '{}'.\nUse filesystem read to inspect current content, then write the corrected version.",
+                    root
+                ),
+                CodingRepairTarget::RunPackage(artifact) => format!(
+                    "\n\nCODING REPAIR TARGET: Missing artifact '{}'. Run the packaging step.\nIf this is a zip: use filesystem zip_dir action.\nParams example: {{\"action\": \"zip_dir\", \"source_dir\": \"<project_root>\", \"output_path\": \"{}\", \"exclude\": [\"target/\", \".git/\"]}}",
+                    artifact, artifact
+                ),
+                CodingRepairTarget::General => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
         let messages = vec![
             Message::system(repair_tool_prompt()),
             Message::user(format!(
-                "Tool: {tool_name}\nStep: {}\nOutput key: {output_key}\n\nIssues:\n{}\n\nRecommendations:\n{}\n\nPrior tool call (may be JSON string):\n{}\n\nLast tool result:\n{}\n\nAll artifacts:\n{}",
+                "Tool: {tool_name}\nStep: {}\nOutput key: {output_key}\n\nIssues:\n{}\n\nRecommendations:\n{}{}\n\nPrior tool call (may be JSON string):\n{}\n\nLast tool result:\n{}\n\nAll artifacts:\n{}",
                 step.action,
                 last_review.issues.join("\n"),
                 last_review.recommendations.join("\n"),
+                coding_directive,
                 serde_json::to_string_pretty(&prior_tool_call).unwrap_or_default(),
                 serde_json::to_string_pretty(&last_tool_result).unwrap_or_default(),
                 serde_json::to_string_pretty(&state.artifacts).unwrap_or_default(),

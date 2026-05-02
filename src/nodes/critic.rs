@@ -129,6 +129,101 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
         }
     }
 
+    // Deterministic fail: artifact verification found missing files or artifacts.
+    // This check runs only when a coding task is active AND we have a verification result.
+    // It is intentionally placed BEFORE the LLM critic so we never spend tokens on a
+    // coding task that mechanically failed (e.g. source file never written, zip missing).
+    if state.coding_intent.is_some() {
+        if let Some(verif) = state.artifacts.get("artifact_verification") {
+            let missing_files: Vec<String> = verif
+                .get("missing_files")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let missing_artifacts: Vec<String> = verif
+                .get("missing_artifacts")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let build_failed = verif
+                .get("build_passed")
+                .and_then(|v| v.as_bool())
+                == Some(false);
+
+            if !missing_files.is_empty() || !missing_artifacts.is_empty() || build_failed {
+                let mut issues = Vec::new();
+                if !missing_files.is_empty() {
+                    issues.push(format!("Missing required files: {:?}", missing_files));
+                }
+                if !missing_artifacts.is_empty() {
+                    issues.push(format!("Missing expected artifacts: {:?}", missing_artifacts));
+                }
+                if build_failed {
+                    issues.push("Build step failed (non-zero exit code)".to_string());
+                }
+
+                let mut recommendations = Vec::new();
+                if let Some(first_missing) = missing_files.first() {
+                    recommendations.push(format!("Write missing file: {first_missing}"));
+                }
+                if let Some(first_artifact) = missing_artifacts.first() {
+                    if first_artifact.ends_with(".zip") {
+                        recommendations.push(format!(
+                            "Run zip_dir to package project into: {first_artifact}"
+                        ));
+                    } else {
+                        recommendations.push(format!(
+                            "Produce missing artifact: {first_artifact}"
+                        ));
+                    }
+                }
+                if build_failed {
+                    recommendations.push(
+                        "Fix compilation errors and re-run build verification".to_string(),
+                    );
+                }
+
+                state.log_meta(
+                    "critic_artifact_fail",
+                    "Deterministic artifact verification failure",
+                    serde_json::json!({
+                        "missing_files": missing_files,
+                        "missing_artifacts": missing_artifacts,
+                        "build_failed": build_failed,
+                    }),
+                );
+
+                if let Some(tx) = &state.sse_tx {
+                    let _ = tx.send(crate::state::SseEvent::CriticResult {
+                        passed: false,
+                        score: 0.0,
+                        issues: issues.clone(),
+                    });
+                }
+
+                state.critic_history.push(CriticReview {
+                    overall_pass: false,
+                    score: 0.0,
+                    confidence: 1.0,
+                    issues,
+                    recommendations,
+                    timestamp: Utc::now(),
+                });
+                return Ok(state);
+            }
+        }
+    }
+
     let risk = RiskLevel::from_score(state.risk_score());
 
     // Low risk path: skip critic entirely, auto-pass

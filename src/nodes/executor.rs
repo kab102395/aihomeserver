@@ -124,6 +124,43 @@ Rules:
 - Prefer a compact, structured format that can be used for downstream code generation.
 - Include source URLs and short evidence snippets for any non-trivial fact."#;
 
+/// System prompt for the execution manifest step in coding tasks.
+///
+/// Connection:
+/// - Used only when `step.output_key == "coding_execution_manifest"` and a coding intent is set.
+/// - The manifest drives the verifier, critic, and repair nodes — it must be precise.
+fn coding_manifest_prompt() -> String {
+    r#"You are a coding project manifest generator.
+Output ONLY a single valid JSON object matching the ExecutionManifest schema below.
+No prose, no markdown, no code fences, no trailing commas.
+
+SCHEMA:
+{
+  "project_name": "string — short identifier, no spaces (e.g. snake_rust)",
+  "project_root": "string — path relative to workspace root (e.g. snake_rust)",
+  "language": "string — rust | python | javascript | typescript | go",
+  "profile": "string — profile from adapter (e.g. terminal-game-crossterm, cli, library)",
+  "intent": "string — new_project | modify_existing | add_feature | debug_existing | package_existing",
+  "deliverable": "string — source | binary | zip | library | web_app | script",
+  "required_files": ["array of relative paths that MUST exist for the project to be complete"],
+  "write_plan": [
+    {"path": "relative/path/to/file.ext", "purpose": "one-line description"}
+  ],
+  "verification_plan": ["ordered list of adapter recipe names, e.g. check_project, build_release, test"],
+  "expected_artifacts": ["paths that must exist when the task is done, including any .zip files"]
+}
+
+RULES:
+- project_root is relative to workspace. Do NOT include workspace_path in the value.
+- required_files and write_plan must cover every source file needed for the project to compile/run.
+- expected_artifacts MUST include the zip path if deliverable is zip (e.g. "snake_rust/snake_rust.zip").
+- expected_artifacts MUST include the binary path if deliverable is binary (e.g. "snake_rust/target/release/snake_rust").
+- verification_plan must be ordered: compile check first, then test, then package.
+- Do not include "target/" paths in required_files or write_plan.
+- Be specific: include all source files (main.rs, lib.rs, modules, etc.) in required_files."#
+        .to_string()
+}
+
 /// Execute the next plan step (LLM-only output or tool-call generation).
 pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemState> {
     // The executor advances `state.current_step` and either:
@@ -268,9 +305,32 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
     }
 
     let system_prompt = if has_tool {
-        system_prompt_tool(&state.workspace_path)
+        // For coding tool steps, append adapter-specific rules
+        let base = system_prompt_tool(&state.workspace_path);
+        if state.coding_intent.is_some() {
+            let adapter_addition = state
+                .artifacts
+                .get("adapter_manifest_json")
+                .and_then(|v| v.get("system_prompt_addition"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if adapter_addition.is_empty() {
+                base
+            } else {
+                format!("{}\n\n{}", base, adapter_addition)
+            }
+        } else {
+            base
+        }
     } else if wants_json {
-        SYSTEM_PROMPT_LLM_JSON.to_string()
+        // Special prompt for execution manifest step
+        if state.coding_intent.is_some()
+            && step.output_key.as_deref() == Some("coding_execution_manifest")
+        {
+            coding_manifest_prompt()
+        } else {
+            SYSTEM_PROMPT_LLM_JSON.to_string()
+        }
     } else {
         SYSTEM_PROMPT_LLM.to_string()
     };

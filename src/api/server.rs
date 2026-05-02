@@ -1871,6 +1871,7 @@ async fn run_stream(
             SseEvent::Replan { .. } => "replan",
             SseEvent::FileWritten { .. } => "file_written",
             SseEvent::ThinkingToken { .. } => "thinking_token",
+            SseEvent::ProjectCard { .. } => "project_card",
         };
         let data = serde_json::to_string(&event).unwrap_or_default();
         Ok::<Event, Infallible>(Event::default().event(event_type).data(data))

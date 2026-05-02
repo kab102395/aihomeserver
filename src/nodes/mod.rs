@@ -10,6 +10,7 @@
 //! to exactly where planning happens, where tools are called, where critique/repair
 //! occurs, and where the final answer is assembled.
 
+pub mod classifier;
 pub mod critic;
 pub mod executor;
 pub mod finalization;

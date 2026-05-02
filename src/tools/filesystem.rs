@@ -124,10 +124,18 @@ impl Tool for FilesystemTool {
             "mkdir" | "create_dir" | "create_directory" | "makedir" => "mkdir".to_string(),
             other => other.to_string(),
         };
+        // zip_dir can specify source_dir instead of path; allow empty path for it
         let path = match params["path"].as_str() {
             Some(p) if !p.is_empty() => p.to_string(),
             _ => {
-                return ToolResult::err(ErrorType::Tool, "missing_path", "params.path is required")
+                // zip_dir uses source_dir; other actions truly need path
+                if action != "zip_dir" && action != "zip" {
+                    return ToolResult::err(ErrorType::Tool, "missing_path", "params.path is required");
+                }
+                params.get("source_dir")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".")
+                    .to_string()
             }
         };
 
@@ -404,6 +412,131 @@ impl Tool for FilesystemTool {
                         "duration_ms": start.elapsed().as_millis(),
                     }),
                     None,
+                )
+            }
+
+            // Create a ZIP archive of a directory inside the workspace.
+            // Params:
+            // - source_dir (required): directory to zip (relative to workspace root)
+            // - output_path (required): where to write the .zip (relative to workspace root)
+            // - exclude (optional): list of glob-style prefixes to skip (default: ["target/", ".git/"])
+            //
+            // Returns: { path, entries: [String], size_bytes }
+            // Errors if source_dir does not exist or zip cannot be written.
+            "zip_dir" | "zip" => {
+                // resolve source_dir
+                let source_rel = match params.get("source_dir").and_then(|v| v.as_str()) {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => path.clone(), // fall back to "path" param
+                };
+                let source = self.resolve(&source_rel);
+                if !source.is_dir() {
+                    return ToolResult::err(
+                        ErrorType::Tool,
+                        "source_not_found",
+                        &format!("source_dir '{}' does not exist or is not a directory", source_rel),
+                    );
+                }
+
+                // resolve output_path
+                let output_rel = match params.get("output_path").and_then(|v| v.as_str()) {
+                    Some(p) if !p.is_empty() => p.to_string(),
+                    _ => format!("{}.zip", source_rel.trim_end_matches('/')),
+                };
+                let output = self.resolve(&output_rel);
+                if let Some(parent) = output.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        return ToolResult::err(ErrorType::Env, "mkdir_failed", &e.to_string());
+                    }
+                }
+
+                // build exclude prefix list (relative to source_dir)
+                let default_excludes = vec!["target/".to_string(), ".git/".to_string()];
+                let excludes: Vec<String> = params
+                    .get("exclude")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| s.trim_start_matches("./").to_string())
+                            .collect()
+                    })
+                    .unwrap_or(default_excludes);
+
+                // collect all files under source
+                let all_files = self.walk_files(&source, 20, 50_000);
+
+                // create the zip
+                let zip_file = match std::fs::File::create(&output) {
+                    Ok(f) => f,
+                    Err(e) => return ToolResult::err(ErrorType::Env, "zip_create_failed", &e.to_string()),
+                };
+                let mut zip_writer = zip::ZipWriter::new(zip_file);
+                let zip_opts = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated)
+                    .unix_permissions(0o644);
+
+                let mut entries: Vec<String> = Vec::new();
+
+                for file_path in &all_files {
+                    // compute path relative to source_dir
+                    let rel = match file_path.strip_prefix(&source) {
+                        Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                        Err(_) => continue,
+                    };
+
+                    // apply excludes
+                    let excluded = excludes.iter().any(|ex| {
+                        let ex_norm = ex.trim_end_matches('/');
+                        rel == ex_norm
+                            || rel.starts_with(&format!("{}/", ex_norm))
+                            || rel.starts_with(ex.as_str())
+                    });
+                    if excluded {
+                        continue;
+                    }
+
+                    let Ok(bytes) = std::fs::read(file_path) else { continue };
+
+                    // entry name inside the zip is source_dir/relative
+                    let entry_name = format!("{}/{}", source_rel.trim_end_matches('/'), rel);
+                    if zip_writer.start_file(&entry_name, zip_opts).is_err() {
+                        continue;
+                    }
+                    use std::io::Write;
+                    if zip_writer.write_all(&bytes).is_err() {
+                        continue;
+                    }
+                    entries.push(entry_name);
+                }
+
+                if let Err(e) = zip_writer.finish() {
+                    return ToolResult::err(ErrorType::Env, "zip_finish_failed", &e.to_string());
+                }
+
+                let size_bytes = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
+                if size_bytes == 0 {
+                    return ToolResult::err(
+                        ErrorType::Tool,
+                        "zip_empty",
+                        "zip file was created but has size 0",
+                    );
+                }
+
+                let out_rel = self.rel(&output);
+                ToolResult::ok(
+                    json!({
+                        "path": out_rel,
+                        "entries": entries,
+                        "entry_count": entries.len(),
+                        "size_bytes": size_bytes,
+                    }),
+                    Some(json!({
+                        "type": "filesystem_zip",
+                        "path": out_rel,
+                        "entry_count": entries.len(),
+                        "size_bytes": size_bytes,
+                    })),
                 )
             }
 

@@ -11,6 +11,7 @@
 //! shows dependency injection: what gets constructed and how it’s shared.
 
 mod api;
+mod coder;
 mod config;
 mod grounding;
 mod llm;

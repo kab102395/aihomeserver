@@ -14,6 +14,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+// Coder types (re-exported here so nodes can access them from state directly)
+pub use crate::coder::{CodingIntent, ExecutionManifest};
+
 // ==================== TOOL RESULT ====================
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -301,6 +304,14 @@ pub struct SystemState {
     /// When true, skip the human gate for high-risk tasks.
     /// Set via the admin toggle in the UI.
     pub admin_mode: bool,
+    /// Detected coding intent — set by CodingClassifier if the request is a code task.
+    /// None for non-coding requests.
+    #[serde(default)]
+    pub coding_intent: Option<CodingIntent>,
+    /// Execution manifest produced by the planner for coding tasks.
+    /// Drives the artifact verifier and targeted repair.
+    #[serde(default)]
+    pub execution_manifest: Option<ExecutionManifest>,
     /// Answers from the planning questionnaire, keyed by question id.
     /// Injected into the planner prompt as hard constraints.
     pub planning_answers: HashMap<String, String>,
@@ -349,6 +360,8 @@ impl SystemState {
             termination_met: false,
             failure_taxonomy: Vec::new(),
             admin_mode: false,
+            coding_intent: None,
+            execution_manifest: None,
             planning_answers: HashMap::new(),
             workspace_path: "./workspace".into(),
             capabilities: serde_json::json!({}),
@@ -523,6 +536,17 @@ pub enum SseEvent {
         /// Relative path within the workspace
         path: String,
     },
+    /// Emitted for coding tasks — shows project status in the UI reasoning panel
+    ProjectCard {
+        project_name: String,
+        language: String,
+        profile: String,
+        /// "building" | "verified" | "partial" | "failed"
+        status: String,
+        files_written: usize,
+        build_passed: Option<bool>,
+        package_path: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -548,6 +572,8 @@ pub struct SseFailureInfo {
 /// Discrete states in the orchestrator’s finite state machine.
 pub enum OrchestratorNode {
     Intake,
+    /// Keyword-based coding intent detection — sits between Intake and Planner.
+    CodingClassifier,
     Planner,
     Executor,
     ToolExecution,

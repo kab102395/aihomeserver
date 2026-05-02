@@ -365,6 +365,74 @@ fn build_context(state: &SystemState) -> String {
         ));
     }
 
+    // ── Coding task injection ─────────────────────────────────────────────────
+    // If CodingClassifier detected a coding task, inject the adapter manifest and
+    // mandatory coding plan contract so the planner generates a verifiable plan.
+    if let Some(ci) = &state.coding_intent {
+        let profile = state
+            .artifacts
+            .get("adapter_profile")
+            .and_then(|v| v.as_str())
+            .unwrap_or("cli");
+        let adapter_json = state
+            .artifacts
+            .get("adapter_manifest_json")
+            .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
+            .unwrap_or_default();
+
+        ctx.push_str("\n=== CODING TASK DETECTED ===\n");
+        ctx.push_str(&format!("Language:    {}\n", ci.language.as_deref().unwrap_or("unknown")));
+        ctx.push_str(&format!("Profile:     {}\n", profile));
+        ctx.push_str(&format!("Intent:      {}\n", ci.intent));
+        ctx.push_str(&format!("Deliverable: {}\n", ci.deliverable));
+        ctx.push_str(&format!("Requires build:   {}\n", ci.requires_build));
+        ctx.push_str(&format!("Requires package: {}\n", ci.requires_package));
+        if !adapter_json.is_empty() {
+            ctx.push_str(&format!("\nLanguage adapter manifest:\n{}\n", adapter_json));
+        }
+        if let Some(adapter) = crate::coder::adapter_for_intent(ci) {
+            ctx.push_str(&format!("\n{}\n", adapter.manifest().system_prompt_addition));
+        }
+
+        ctx.push_str(r#"
+CODING PLAN CONTRACT (MANDATORY — follow exactly):
+1. FIRST STEP: filesystem list/find to inspect workspace (for modify_existing) OR skip for new projects.
+2. MANIFEST STEP: tool_binding=null, output_key="coding_execution_manifest", output_format="json"
+   The LLM must output a JSON object with these fields:
+   {
+     "project_name": "...",
+     "project_root": "...",        // relative to workspace, e.g. "snake_rust"
+     "language": "...",
+     "profile": "...",
+     "intent": "...",
+     "deliverable": "...",
+     "required_files": ["Cargo.toml", "src/main.rs", ...],   // relative to project_root
+     "write_plan": [{"path": "...", "purpose": "..."}],      // full relative paths from workspace root
+     "verification_plan": ["check_project", "build_release"],// recipe names from adapter
+     "expected_artifacts": ["snake_rust/Cargo.toml", "snake_rust/src/main.rs", "snake_rust_source.zip"]
+   }
+3. FILE WRITE STEPS: one filesystem step per file. Use action="write" (creates parent dirs).
+4. VERIFICATION STEPS: shell steps using the exact commands from verification_recipes.
+   Shell cwd MUST be set to the project_root inside the workspace.
+5. PACKAGE STEP (if requires_package): filesystem action="zip_dir" with:
+   {"action":"zip_dir","source_dir":"<project_root>","output_path":"<name>.zip","exclude":["target/",".git/"]}
+6. ANSWER STEP: final LLM step summarizing paths, build status, and download link.
+
+FILESYSTEM ACTIONS SUPPORTED: write, read, mkdir, list, find, grep, delete, zip_dir
+DO NOT USE: create_file, create_dir, save, touch (these return unsupported_action)
+
+risk_score for new coding projects: 4-6 (needs verification but not destructive)
+"#);
+        ctx.push_str("=== END CODING CONTRACT ===\n\n");
+
+        // Also inject execution manifest if already loaded (from replan)
+        if let Some(manifest) = &state.execution_manifest {
+            if let Ok(mj) = serde_json::to_string_pretty(manifest) {
+                ctx.push_str(&format!("\nExisting execution manifest (from prior attempt):\n{}\n", mj));
+            }
+        }
+    }
+
     // Inject knowledge base entries — what the AI already knows about relevant topics
     if !state.knowledge_context.is_empty() {
         ctx.push_str("\n=== KNOWLEDGE BASE (pre-researched topics) ===\n");

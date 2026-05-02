@@ -2,9 +2,12 @@ use anyhow::Result;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use std::collections::HashMap;
+
 use crate::{
+    coder::{manifest::ArtifactVerification, verify},
     llm::ollama::OllamaClient,
-    nodes::{critic, executor, finalization, intake, planner, repair, tool_execution},
+    nodes::{classifier, critic, executor, finalization, intake, planner, repair, tool_execution},
     state::{OrchestratorNode, RiskLevel, SystemState},
     tools::ToolRegistry,
 };
@@ -58,6 +61,11 @@ impl Orchestrator {
             node = match node {
                 OrchestratorNode::Intake => {
                     state = intake::run(state).await?;
+                    OrchestratorNode::CodingClassifier
+                }
+
+                OrchestratorNode::CodingClassifier => {
+                    state = classifier::run(state).await?;
                     OrchestratorNode::Planner
                 }
 
@@ -127,6 +135,41 @@ impl Orchestrator {
 
                 OrchestratorNode::ToolExecution => {
                     state = tool_execution::run(state, &self.tools).await?;
+                    // For coding tasks: run mechanical artifact verification so critic has
+                    // a deterministic ground truth rather than just LLM judgement.
+                    if state.coding_intent.is_some() {
+                        if let Some(manifest) = &state.execution_manifest.clone() {
+                            let build_codes = collect_build_exit_codes(&state);
+                            let verif = verify(manifest, &state.workspace_path, &build_codes);
+                            let files_written = count_files_written(&state);
+                            // Emit ProjectCard SSE so UI shows live project status
+                            let pkg_path = manifest.expected_artifacts.iter()
+                                .find(|p| p.ends_with(".zip"))
+                                .and_then(|p| {
+                                    let full = std::path::Path::new(&state.workspace_path).join(p);
+                                    if full.exists() { Some(p.clone()) } else { None }
+                                });
+                            if let Some(tx) = &state.sse_tx {
+                                let _ = tx.send(crate::state::SseEvent::ProjectCard {
+                                    project_name: manifest.project_name.clone(),
+                                    language: manifest.language.clone(),
+                                    profile: manifest.profile.clone(),
+                                    status: verif.status.clone(),
+                                    files_written,
+                                    build_passed: verif.build_passed,
+                                    package_path: pkg_path,
+                                });
+                            }
+                            // Store as artifact for critic to read
+                            if let Ok(v) = serde_json::to_value(&verif) {
+                                state.artifacts.insert("artifact_verification".to_string(), v);
+                            }
+                        } else {
+                            // Try to extract execution manifest from artifacts
+                            // (planner writes it as coding_execution_manifest)
+                            self.try_load_execution_manifest(&mut state);
+                        }
+                    }
                     OrchestratorNode::Critic
                 }
 
@@ -213,6 +256,26 @@ impl Orchestrator {
         Ok(state)
     }
 
+    /// Try to deserialize the execution manifest from `coding_execution_manifest` artifact.
+    fn try_load_execution_manifest(&self, state: &mut SystemState) {
+        if state.execution_manifest.is_some() {
+            return;
+        }
+        if let Some(val) = state.artifacts.get("coding_execution_manifest") {
+            if let Ok(manifest) = serde_json::from_value::<crate::coder::ExecutionManifest>(val.clone()) {
+                state.log_meta(
+                    "orchestrator",
+                    "Loaded execution manifest from artifact",
+                    serde_json::json!({
+                        "project": manifest.project_name,
+                        "files": manifest.required_files.len(),
+                    }),
+                );
+                state.execution_manifest = Some(manifest);
+            }
+        }
+    }
+
     /// Decide which node to run next after a critic pass.
     ///
     /// The critic can:
@@ -270,4 +333,31 @@ impl Orchestrator {
 
         OrchestratorNode::Repair
     }
+}
+
+// ── Helper free functions ─────────────────────────────────────────────────────
+
+/// Scan artifacts for shell result exit codes from build/test steps.
+/// Keys that end in "_result" and have a numeric exit_code are included.
+fn collect_build_exit_codes(state: &SystemState) -> HashMap<String, i64> {
+    state
+        .artifacts
+        .iter()
+        .filter(|(k, _)| k.ends_with("_result"))
+        .filter_map(|(k, v)| {
+            v.get("exit_code")
+                .and_then(|ec| ec.as_i64())
+                .map(|ec| (k.clone(), ec))
+        })
+        .collect()
+}
+
+/// Count how many FileWritten SSE events have been emitted (proxy for files written).
+/// We use the event log since SSE events themselves aren't persisted.
+fn count_files_written(state: &SystemState) -> usize {
+    state
+        .event_log
+        .iter()
+        .filter(|e| e.event_type == "file_written")
+        .count()
 }

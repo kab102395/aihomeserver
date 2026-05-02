@@ -1193,6 +1193,41 @@ body {
 .reasoning-line.r-replan  { color: #9a5a9a; }
 .reasoning-line.r-file-written { color: #4a7abf; }
 
+/* Project card — shown during coding task execution */
+.project-card {
+  background: var(--bg-elevated, #1e2228);
+  border: 1px solid var(--border, #333);
+  border-left: 3px solid #4a8abf;
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 6px 0;
+  font-size: 13px;
+}
+.pc-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pc-lang {
+  background: #2a3a5a;
+  color: #7ab0e0;
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.pc-status {
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.pc-success { background: #1a3a2a; color: #4a9a5a; }
+.pc-partial  { background: #3a3010; color: #c09030; }
+.pc-failed   { background: #3a1010; color: #c04a4a; }
+.pc-building { background: #1a2a3a; color: #4a7abf; }
+.pc-stats { color: var(--text-dim, #888); font-size: 12px; margin-top: 3px; }
+.pc-stats a { color: #4a8abf; text-decoration: none; }
+.pc-stats a:hover { text-decoration: underline; }
+
 /* Collapsible reasoning toggle on completed turns */
 .reasoning-toggle {
   font-size: 11px;
@@ -2644,6 +2679,22 @@ async function sendWithAnswers(text, answers) {
             // Keep the file tree updated as files are created/edited.
             scheduleFileTreeRefresh();
             renderRunState(runId);
+          } else if (currentEventType === 'project_card') {
+            // Coding task status card — shown in reasoning panel during project builds
+            const statusClass = data.status === 'success' ? 'pc-success'
+              : data.status === 'partial' ? 'pc-partial'
+              : data.status === 'failed' ? 'pc-failed'
+              : 'pc-building';
+            const buildBadge = data.build_passed === true ? ' · Build ✓'
+              : data.build_passed === false ? ' · Build ✗' : '';
+            const downloadLink = data.package_path
+              ? ` · <a href="/workspace/download?path=${encodeURIComponent(data.package_path)}" target="_blank">Download ZIP</a>`
+              : '';
+            const card = document.createElement('div');
+            card.className = 'project-card';
+            card.innerHTML = `<div class="pc-header"><span class="pc-lang">${esc(data.language||'')}</span> <strong>${esc(data.project_name||'')}</strong> <span class="pc-status ${statusClass}">${esc(data.status||'')}</span></div><div class="pc-stats">${data.files_written||0} files written${buildBadge}${downloadLink}</div>`;
+            reasoningEl.appendChild(card);
+            reasoningEl.scrollTop = reasoningEl.scrollHeight;
           } else if (currentEventType === 'terminal_cmd') {
             appendTerminalCmd(data.step, data.command, data.cwd);
           } else if (currentEventType === 'terminal_out') {
