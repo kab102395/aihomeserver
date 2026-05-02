@@ -206,6 +206,10 @@ fn decompose_search_queries(user_request: &str) -> Vec<String> {
     let game = if is_dota { "Dota 2" } else { "" };
     let mut queries: Vec<String> = Vec::new();
 
+    // Use actual current year so queries don't age-bias toward old content.
+    let this_year = chrono::Local::now().format("%Y").to_string();
+    let last_year = (chrono::Local::now().format("%Y").to_string().parse::<u32>().unwrap_or(2025) - 1).to_string();
+
     if let Some(v) = &version {
         if !game.is_empty() {
             queries.push(format!("{game} {v} patch notes changes"));
@@ -238,11 +242,11 @@ fn decompose_search_queries(user_request: &str) -> Vec<String> {
                 queries.push(format!("{t} {v} release notes what's new"));
                 queries.push(format!("{t} {v} changelog new features"));
                 queries.push(format!("{t} {v} release blog announcement"));
-                queries.push(format!("{t} latest stable version release 2024 2025"));
+                queries.push(format!("{t} latest stable version release {last_year} {this_year}"));
             } else {
                 queries.push(format!("{t} latest release what's new"));
                 queries.push(format!("{t} recent versions changelog"));
-                queries.push(format!("{t} release notes blog 2024 2025"));
+                queries.push(format!("{t} release notes blog {last_year} {this_year}"));
                 queries.push(format!("{t} new features updates site:reddit.com"));
             }
         } else {
@@ -261,7 +265,7 @@ fn decompose_search_queries(user_request: &str) -> Vec<String> {
             if let Some(v) = &version {
                 queries.push(format!("{v} release notes changelog"));
             }
-            queries.push(format!("{} recent updates 2024 2025", cleaned.trim()));
+            queries.push(format!("{} recent updates {last_year} {this_year}", cleaned.trim()));
         }
     }
 
