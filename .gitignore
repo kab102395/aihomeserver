@@ -5,6 +5,9 @@
 /workspace/
 /data/
 /desktop/node_modules/
+/desktop/dist/
+/desktop/out/
+/desktop/release/
 config.json
 
 # Local databases / caches
