@@ -40,6 +40,7 @@ anyhow = "1"
 thiserror = "1"
 async-trait = "0.1"
 zip = "2"
+scraper = "0.19"
 
 # Logging
 tracing = "0.1"

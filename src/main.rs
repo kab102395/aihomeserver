@@ -20,6 +20,7 @@ mod metrics;
 mod nodes;
 mod orchestrator;
 mod state;
+mod worker;
 mod tools;
 
 use anyhow::Result;
@@ -41,10 +42,11 @@ use crate::{
     metrics::RuntimeMetrics,
     orchestrator::Orchestrator,
     tools::{
-        filesystem::FilesystemTool, git::GitTool, http_fetch::HttpFetchTool,
+        browser::BrowserTool, filesystem::FilesystemTool, git::GitTool, http_fetch::HttpFetchTool,
         parallel_search::ParallelSearchTool, save_knowledge::SaveKnowledgeTool, shell::ShellTool,
         web_search::WebSearchTool, ToolRegistry,
     },
+    worker::WorkerClient,
 };
 
 fn in_container() -> bool {
@@ -127,6 +129,18 @@ async fn main() -> Result<()> {
     if let Ok(url) = std::env::var("SEARCH_URL") {
         cfg.search_url = url;
     }
+    if let Ok(url) = std::env::var("WORKER_URL") {
+        cfg.worker_url = url;
+    }
+    if let Ok(token) = std::env::var("WORKER_TOKEN") {
+        cfg.worker_token = token;
+    }
+    if let Ok(key) = std::env::var("API_KEY") {
+        cfg.api_key = key;
+    }
+    if let Ok(mode) = std::env::var("EXECUTION_MODE") {
+        cfg.execution_mode = mode;
+    }
     if let Ok(ws) = std::env::var("WORKSPACE") {
         cfg.workspace_path = ws;
     }
@@ -182,17 +196,40 @@ async fn main() -> Result<()> {
 
     // ── Tool layer ────────────────────────────────────────────────────────────
     let metrics = Arc::new(RuntimeMetrics::new());
+    let worker_client = if cfg.worker_url.trim().is_empty() {
+        None
+    } else {
+        match WorkerClient::new(cfg.worker_url.clone(), cfg.worker_token.clone()) {
+            Ok(client) => {
+                if let Ok(health) = client.health().await {
+                    info!(
+                        "Worker online: {} (workspace={})",
+                        health.ok,
+                        health.workspace.unwrap_or_default()
+                    );
+                } else {
+                    info!("Worker configured but health check failed: {}", cfg.worker_url);
+                }
+                Some(client)
+            }
+            Err(e) => {
+                info!("Worker client disabled: {}", e);
+                None
+            }
+        }
+    };
 
     let mut tools = ToolRegistry::new();
     tools.set_metrics(Arc::clone(&metrics));
     tools.register(FilesystemTool::new(&cfg.workspace_path)?);
-    tools.register(ShellTool);
+    tools.register(ShellTool::new(worker_client.clone(), cfg.execution_mode.clone()));
     tools.register(GitTool::new(&cfg.workspace_path));
     let sources_db_path = data_dir.join("sources.db").to_string_lossy().into_owned();
     let sources = Arc::new(SourceCacheStore::new(&sources_db_path).await?);
     tools.register(HttpFetchTool::new(Some(Arc::clone(&sources))));
     tools.register(WebSearchTool::new(Arc::clone(&config)));
     tools.register(ParallelSearchTool::new(Arc::clone(&config)));
+    tools.register(BrowserTool::new(worker_client));
 
     // ── Knowledge base ────────────────────────────────────────────────────────
     let knowledge_db_path = data_dir.join("knowledge.db").to_string_lossy().into_owned();
@@ -209,6 +246,8 @@ async fn main() -> Result<()> {
     tools.alias("search", "web_search");
     tools.alias("multi_search", "parallel_search");
     tools.alias("batch_search", "parallel_search");
+    tools.alias("open_browser", "browser");
+    tools.alias("browse", "browser");
 
     info!("Registered tools: {:?}", tools.list());
 
@@ -229,10 +268,14 @@ async fn main() -> Result<()> {
     // ── In-memory task/approval stores ───────────────────────────────────────
     let task_store: TaskStore = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let approval_gates: ApprovalGates = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    let cancel_store: crate::api::server::CancelStore =
+        Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
     info!("Memory ready (episodic.db)");
 
     // ── HTTP API ──────────────────────────────────────────────────────────────
+    // Everything the handlers and background runs need is bundled here once and shared
+    // through Axum state instead of being recreated per request.
     let app_state = AppState {
         orchestrator,
         memory,
@@ -243,6 +286,7 @@ async fn main() -> Result<()> {
         task_store,
         repo_root,
         approval_gates,
+        cancel_store,
         config,
         metrics,
     };

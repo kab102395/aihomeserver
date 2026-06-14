@@ -14,10 +14,12 @@ use super::learn_docs::embedded_doc;
 use super::{learn::LEARN_HTML, ui::CHAT_HTML};
 use axum::{
     extract::{Multipart, Path, State},
-    http::{header, StatusCode},
+    http::{header, Request, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
+        Response,
     },
     routing::{delete, get, post},
     Json, Router,
@@ -43,6 +45,7 @@ use crate::{
 };
 
 fn request_looks_sensitive(user_request: &str) -> bool {
+    // Keep passwords, tokens, and private keys out of auto-saved knowledge.
     let s = user_request.to_lowercase();
     let needles = [
         "password",
@@ -89,6 +92,49 @@ fn collect_source_urls(artifacts: &std::collections::HashMap<String, serde_json:
     urls
 }
 
+async fn auth_middleware(
+    State(app): State<AppState>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let api_key = {
+        let cfg = app.config.read().await;
+        cfg.api_key.trim().to_string()
+    };
+
+    if api_key.is_empty() {
+        return next.run(req).await;
+    }
+
+    let path = req.uri().path().to_string();
+    if path.starts_with("/health") {
+        return next.run(req).await;
+    }
+
+    let authed = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s == format!("Bearer {api_key}"))
+        .unwrap_or(false)
+        || req
+            .headers()
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s == api_key)
+            .unwrap_or(false);
+
+    if !authed {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        )
+            .into_response();
+    }
+
+    next.run(req).await
+}
+
 async fn maybe_autosave_kb(
     kb: std::sync::Arc<tokio::sync::Mutex<KnowledgeStore>>,
     cfg: &ServerConfig,
@@ -96,6 +142,8 @@ async fn maybe_autosave_kb(
     artifacts: &std::collections::HashMap<String, serde_json::Value>,
     answer: &str,
 ) {
+    // Auto-save is intentionally conservative: only store useful, non-sensitive
+    // answers that are big enough to be worth reusing later.
     let mode = cfg.auto_kb_mode.trim().to_lowercase();
     if mode == "off" {
         return;
@@ -206,6 +254,8 @@ pub enum TaskStatusPayload {
 pub type TaskStore = Arc<RwLock<HashMap<Uuid, TaskStatusPayload>>>;
 /// One-shot approval gates keyed by `task_id` (human-in-the-loop).
 pub type ApprovalGates = Arc<RwLock<HashMap<Uuid, tokio::sync::oneshot::Sender<bool>>>>;
+/// Cancellation tokens keyed by task_id (Stop button).
+pub type CancelStore = Arc<RwLock<HashMap<Uuid, tokio_util::sync::CancellationToken>>>;
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
@@ -233,6 +283,8 @@ pub struct AppState {
     pub repo_root: std::path::PathBuf,
     /// Pending human-approval gates keyed by task_id.
     pub approval_gates: ApprovalGates,
+    /// Cancellation tokens for active tasks.
+    pub cancel_store: CancelStore,
     /// Live server config — shared with OllamaClient so model/URL changes
     /// propagate immediately. Persisted to config.json on every POST /settings.
     pub config: Arc<RwLock<ServerConfig>>,
@@ -332,6 +384,7 @@ pub fn router(state: AppState) -> Router {
         .route("/run", post(run_task))
         .route("/run/stream", post(run_stream))
         .route("/task/:id/status", get(get_task_status))
+        .route("/task/:id/cancel", post(cancel_task))
         .route("/task/:id/approve", post(approve_task))
         .route("/task/:id/reject", post(reject_task))
         .route("/task/:id", get(get_task))
@@ -387,6 +440,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/health/deep", get(health_deep))
         .route("/metrics", get(metrics))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
 }
 
@@ -1661,6 +1715,18 @@ async fn run_stream(
         let mut store = app.task_store.write().await;
         store.insert(task_id, TaskStatusPayload::Running);
     }
+    // Register cancellation token for Stop button.
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    {
+        let mut store = app.cancel_store.write().await;
+        store.insert(task_id, cancel_token.clone());
+    }
+
+    // Let UI know the task id immediately so it can show a Stop button.
+    let _ = sse_tx.send(crate::state::SseEvent::RunStarted {
+        task_id: task_id.to_string(),
+        session_id: session_id.to_string(),
+    });
 
     let app2 = app.clone();
     let request_text = req.request.clone();
@@ -1736,7 +1802,10 @@ async fn run_stream(
             "auto_kb_min_chars": auto_kb_min_chars,
         });
 
-        let result = app2.orchestrator.run(initial).await;
+        let result = app2
+            .orchestrator
+            .run_with_cancel(initial, cancel_token)
+            .await;
 
         match result {
             Ok(final_state) => {
@@ -1852,10 +1921,15 @@ async fn run_stream(
                 });
             }
         }
+
+        // Cleanup cancellation token after completion.
+        let mut store = app2.cancel_store.write().await;
+        store.remove(&task_id);
     });
 
     let stream = UnboundedReceiverStream::new(sse_rx).map(|event| {
         let event_type = match &event {
+            SseEvent::RunStarted { .. } => "run_started",
             SseEvent::Status { .. } => "status",
             SseEvent::Token { .. } => "token",
             SseEvent::Done { .. } => "done",
@@ -1893,6 +1967,26 @@ async fn approve_task(State(app): State<AppState>, Path(id): Path<String>) -> im
     } else {
         (StatusCode::NOT_FOUND, "No pending approval for this task").into_response()
     }
+}
+
+/// POST /task/:id/cancel — cancel a running task (Stop button).
+async fn cancel_task(State(app): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    let task_id = match id.parse::<Uuid>() {
+        Ok(u) => u,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid task id").into_response(),
+    };
+
+    let token = {
+        let store = app.cancel_store.read().await;
+        store.get(&task_id).cloned()
+    };
+
+    if let Some(t) = token {
+        t.cancel();
+        return Json(serde_json::json!({ "ok": true })).into_response();
+    }
+
+    (StatusCode::NOT_FOUND, "Task not running").into_response()
 }
 
 /// POST /task/:id/reject — resolve a pending high-risk gate (rejected).

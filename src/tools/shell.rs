@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::state::{ErrorType, ToolResult};
+use crate::{
+    state::{ErrorType, ToolResult},
+    worker::{WorkerClient, WorkerShellRequest},
+};
 
 use super::Tool;
 
@@ -73,7 +76,19 @@ fn looks_like_posix_shell(command: &str) -> bool {
 /// Safety note:
 /// - The orchestration layer can require human approval for high-risk plans.
 /// - This tool adds an extra guardrail by rejecting obviously wrong shell syntax for the OS.
-pub struct ShellTool;
+pub struct ShellTool {
+    worker: Option<WorkerClient>,
+    execution_mode: String,
+}
+
+impl ShellTool {
+    pub fn new(worker: Option<WorkerClient>, execution_mode: impl Into<String>) -> Self {
+        Self {
+            worker,
+            execution_mode: execution_mode.into(),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for ShellTool {
@@ -84,6 +99,48 @@ impl Tool for ShellTool {
 
     /// Execute a command in the server’s shell (PowerShell on Windows, `sh -lc` on POSIX).
     async fn execute(&self, params: Value) -> ToolResult {
+        let remote_requested = self.execution_mode.trim().eq_ignore_ascii_case("remote")
+            || self.execution_mode.trim().eq_ignore_ascii_case("auto");
+        if remote_requested {
+            if let Some(worker) = &self.worker {
+                if worker.is_enabled() {
+                    let command = match params["command"].as_str() {
+                        Some(c) if !c.is_empty() => c.to_string(),
+                        _ => {
+                            return ToolResult::err(
+                                ErrorType::Tool,
+                                "missing_command",
+                                "params.command is required",
+                            )
+                        }
+                    };
+                    let cwd = params["cwd"].as_str().map(|s| s.to_string());
+                    let timeout_secs = params["timeout_secs"].as_u64();
+                    let task_id = params["task_id"].as_str().map(|s| s.to_string());
+                    match worker
+                        .shell(&WorkerShellRequest {
+                            command,
+                            cwd,
+                            timeout_secs,
+                            task_id,
+                        })
+                        .await
+                    {
+                        Ok(result) => return result,
+                        Err(e) => {
+                            if self.execution_mode.trim().eq_ignore_ascii_case("remote") {
+                                return ToolResult::err(
+                                    ErrorType::Env,
+                                    "worker_shell_failed",
+                                    &e.to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let command = match params["command"].as_str() {
             Some(c) if !c.is_empty() => c.to_string(),
             _ => {

@@ -149,6 +149,11 @@ USE "http_fetch" when asked to fetch, visit, retrieve, or analyze a URL or websi
   The second step output_key must be "answer".
   risk_score for fetch-only tasks: 2
 
+USE "browser" when you need richer page inspection than raw fetching.
+  params: {"action":"fetch","url":"https://example.com","max_chars":12000}
+  Use it for page titles, visible text, and link extraction when the user wants web/page analysis.
+  Prefer it for interactive browsing-style requests or when you need a worker-backed environment.
+
 USE "web_search" for a single targeted query when one search is clearly sufficient.
   params: {"query": "search terms here"}
   For SIMPLE lookups (one clear fact): 2 steps — web_search then LLM answer.

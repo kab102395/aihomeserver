@@ -4,6 +4,7 @@
 # Runtime data (local-only)
 /workspace/
 /data/
+/desktop/node_modules/
 config.json
 
 # Local databases / caches
@@ -21,6 +22,7 @@ config.json
 /.vscode/
 /.git-rewrite/
 .env
+secrets.env
 
 # OS cruft
 .DS_Store

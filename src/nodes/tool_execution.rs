@@ -202,6 +202,24 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
                     "cwd".into(),
                     serde_json::Value::String(state.workspace_path.clone()),
                 );
+                obj.insert(
+                    "task_id".into(),
+                    serde_json::Value::String(state.task_id.to_string()),
+                );
+            }
+        }
+
+        if tool_name == "browser" {
+            if let Some(obj) = p.as_object_mut() {
+                if obj.get("action").and_then(|v| v.as_str()).is_none() {
+                    obj.insert("action".into(), serde_json::Value::String("fetch".into()));
+                }
+                if obj.get("max_chars").and_then(|v| v.as_u64()).is_none() {
+                    obj.insert(
+                        "max_chars".into(),
+                        serde_json::Value::Number(serde_json::Number::from(12000u64)),
+                    );
+                }
             }
         }
 
@@ -279,6 +297,36 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
                 url.is_empty() || url == "FROM_SEARCH_RESULTS" || !url.starts_with("http");
 
             if needs_resolution {
+                // Deterministic special-cases: some research questions have stable canonical sources.
+                // This avoids the URL picker grabbing irrelevant docs pages (e.g. std::thread::spawn).
+                let action_lower = step.action.to_lowercase();
+                if action_lower.contains("rust official stable release notes index") {
+                    if let Some(obj) = p.as_object_mut() {
+                        obj.insert(
+                            "url".into(),
+                            serde_json::Value::String(
+                                "https://doc.rust-lang.org/stable/releases.html".into(),
+                            ),
+                        );
+                    }
+                } else if action_lower.contains("rust official blog release announcements") {
+                    if let Some(obj) = p.as_object_mut() {
+                        obj.insert(
+                            "url".into(),
+                            serde_json::Value::String("https://blog.rust-lang.org/releases/".into()),
+                        );
+                    }
+                }
+
+                // If we filled a deterministic URL above, skip pick_best_url.
+                let url_now = p
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if url_now.starts_with("http") {
+                    // continue to defaults (allow_reddit_fallback/max_chars) below
+                } else {
                 // Avoid re-fetching the same page across multiple http_fetch steps.
                 let mut exclude: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
@@ -321,9 +369,48 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
                 if let Some(best_url) =
                     pick_best_url_from_artifacts(&state.artifacts, hint_for_pick, &exclude)
                 {
-                    if let Some(obj) = p.as_object_mut() {
+                    // Strict gating: if we are resolving a blank/placeholder URL, only accept
+                    // URLs that look like "real pages" (not function docs mistakenly matching
+                    // a token) when the step action implies an official/source fetch.
+                    let action_lower = step.action.to_lowercase();
+                    let wants_official = action_lower.contains("official")
+                        || action_lower.contains("release notes")
+                        || action_lower.contains("changelog");
+                    if wants_official {
+                        let u = best_url.to_lowercase();
+                        let ok = if state.user_request.to_lowercase().contains("rust") {
+                            u.contains("doc.rust-lang.org/") || u.contains("blog.rust-lang.org/")
+                        } else {
+                            // Generic heuristic: avoid deep stdlib pages / API reference pages when the user asked for release notes.
+                            !u.contains("/std/") && !u.contains("/api/")
+                        };
+                        if !ok {
+                            // Force the tool to error rather than fetching nonsense.
+                            if let Some(obj) = p.as_object_mut() {
+                                obj.insert("url".into(), serde_json::Value::String(String::new()));
+                            }
+                        } else if let Some(obj) = p.as_object_mut() {
+                            obj.insert("url".into(), serde_json::Value::String(best_url));
+                        }
+                    } else if let Some(obj) = p.as_object_mut() {
                         obj.insert("url".into(), serde_json::Value::String(best_url));
                     }
+                } else {
+                    // Final fallback for Rust release-note requests.
+                    let hint_lower = hint_for_pick.to_lowercase();
+                    if hint_lower.contains("rust")
+                        && (hint_lower.contains("release") || hint_lower.contains("changelog"))
+                    {
+                        if let Some(obj) = p.as_object_mut() {
+                            obj.insert(
+                                "url".into(),
+                                serde_json::Value::String(
+                                    "https://doc.rust-lang.org/stable/releases.html".into(),
+                                ),
+                            );
+                        }
+                    }
+                }
                 }
             }
 
@@ -548,6 +635,10 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
                         .collect();
                     labels.join("\n")
                 }),
+            "browser" => tool_params
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             _ => None,
         };
         let _ = tx.send(crate::state::SseEvent::ToolCall {
@@ -717,6 +808,13 @@ fn pick_best_url_from_artifacts(
         || hint_lower.contains("item")
         || hint_lower.contains("ability");
     let wants_rust = hint_lower.contains("rust");
+    let wants_release_notes = hint_lower.contains("release")
+        || hint_lower.contains("changelog")
+        || hint_lower.contains("what changed")
+        || hint_lower.contains("what's new")
+        || hint_lower.contains("recent version")
+        || hint_lower.contains("latest version")
+        || hint_lower.contains("releases");
 
     /// Normalize a URL and extract its host domain for de-duplication/exclusion.
     ///
@@ -750,6 +848,32 @@ fn pick_best_url_from_artifacts(
 
         // Prefer high-signal sources in general
         if wants_rust {
+            // For Rust "what changed / release notes" topics, strongly prefer official rust-lang sources
+            // and avoid irrelevant "Rust docker image" pages that frequently appear in searches.
+            if wants_release_notes {
+                if u.contains("hub.docker.com") || u.contains("docker.com/layers") {
+                    return -80;
+                }
+                if u.contains("doc.rust-lang.org/stable/releases.html") {
+                    return 40;
+                }
+                if u.contains("blog.rust-lang.org") && (u.contains("announcing-rust") || u.contains("/releases")) {
+                    return 36;
+                }
+                if u.contains("blog.rust-lang.org") {
+                    return 30;
+                }
+                if u.contains("doc.rust-lang.org/") {
+                    return 28;
+                }
+                // Community sources are fine as tertiary references, but should not win over official docs.
+                if u.contains("medium.com") {
+                    return 4;
+                }
+                if u.contains("reddit.com") {
+                    return 3;
+                }
+            }
             if u.contains("doc.rust-lang.org/book") || u.contains("doc.rust-lang.org/stable/book") {
                 return 30;
             }
@@ -961,5 +1085,36 @@ mod tests {
             picked.contains("github.com/ValveSoftware/Dota2-Gameplay/issues"),
             "picked={picked}"
         );
+    }
+
+    #[test]
+    fn url_picker_avoids_dockerhub_for_rust_release_notes() {
+        let artifacts: std::collections::HashMap<String, serde_json::Value> = [(
+            "search_result_result".to_string(),
+            serde_json::json!({
+                "output": {
+                    "results": [
+                        {"url":"https://hub.docker.com/layers/library/rust/1.86.0-alpine/images/sha256-deadbeef"},
+                        {"url":"https://doc.rust-lang.org/stable/releases.html"},
+                        {"url":"https://blog.rust-lang.org/2026/01/01/Announcing-Rust-1.99.0.html"}
+                    ]
+                }
+            }),
+        )]
+        .into_iter()
+        .collect();
+
+        let exclude = std::collections::HashSet::<String>::new();
+        let picked = pick_best_url_from_artifacts(
+            &artifacts,
+            "latest Rust release notes what changed",
+            &exclude,
+        )
+        .expect("picked url");
+        assert!(
+            picked.contains("doc.rust-lang.org") || picked.contains("blog.rust-lang.org"),
+            "picked={picked}"
+        );
+        assert!(!picked.contains("hub.docker.com"), "picked={picked}");
     }
 }

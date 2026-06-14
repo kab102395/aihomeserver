@@ -4,6 +4,8 @@ services:
     build: .
     container_name: aihomeserver
     restart: unless-stopped
+    env_file:
+      - ./secrets.env
     ports:
       - "3000:3000"
     volumes:
@@ -19,6 +21,8 @@ services:
       # Point at your Ollama instance.
       # If Ollama runs on the Docker host machine use host.docker.internal:
       OLLAMA_URL: "http://host.docker.internal:11434"
+      WORKER_URL: "http://worker:3031"
+      EXECUTION_MODE: "auto"
       # Route web searches through the SearXNG container (preferred; avoids scraping)
       SEARCH_URL: "http://searxng:8080"
     extra_hosts:
@@ -26,6 +30,22 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       - searxng
+      - worker
+
+  # Remote execution worker using the same image, different role
+  worker:
+    build: .
+    container_name: aihomeserver-worker
+    restart: unless-stopped
+    volumes:
+      - ai_worker_workspace:/workspace
+    environment:
+      ROLE: worker
+      WORKER_WORKSPACE: /workspace
+      WORKER_PORT: "3031"
+      WORKER_TOKEN: ${WORKER_TOKEN:-}
+    expose:
+      - "3031"
 
   # SearXNG (self-hosted search)
   searxng:
@@ -54,4 +74,4 @@ services:
 volumes:
   ai_data:
   ai_workspace:
-
+  ai_worker_workspace:

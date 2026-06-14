@@ -34,6 +34,22 @@ pub struct ServerConfig {
     #[serde(default)]
     pub search_url: String,
 
+    /// Optional remote worker base URL. When set, shell/browser execution routes to it.
+    #[serde(default)]
+    pub worker_url: String,
+
+    /// Shared bearer token used by the coordinator when calling the worker.
+    #[serde(default)]
+    pub worker_token: String,
+
+    /// Optional API key for protecting the public HTTP API.
+    #[serde(default)]
+    pub api_key: String,
+
+    /// Execution preference: "auto" (default), "remote", or "local".
+    #[serde(default = "default_execution_mode")]
+    pub execution_mode: String,
+
     /// Auto-save assistant outputs into the Knowledge Base.
     /// Values:
     /// - "off" (default)
@@ -94,6 +110,9 @@ fn default_auto_kb_mode() -> String {
 fn default_auto_kb_min_chars() -> u32 {
     1800
 }
+fn default_execution_mode() -> String {
+    "auto".into()
+}
 
 impl Default for ServerConfig {
     /// Default config values for a local developer deployment.
@@ -114,6 +133,10 @@ impl Default for ServerConfig {
             max_steps: 20,
             risk_gate_threshold: 8,
             search_url: String::new(),
+            worker_url: String::new(),
+            worker_token: String::new(),
+            api_key: String::new(),
+            execution_mode: default_execution_mode(),
             auto_kb_mode: default_auto_kb_mode(),
             auto_kb_min_chars: default_auto_kb_min_chars(),
             num_gpu: 999,

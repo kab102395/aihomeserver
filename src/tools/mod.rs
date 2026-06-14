@@ -12,6 +12,7 @@
 
 pub mod filesystem;
 pub mod git;
+pub mod browser;
 pub mod http_fetch;
 pub mod parallel_search;
 pub mod save_knowledge;
