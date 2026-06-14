@@ -48,10 +48,17 @@ pub struct ArtifactVerification {
     pub missing_files: Vec<String>,
     /// expected_artifacts that are missing or empty
     pub missing_artifacts: Vec<String>,
-    /// Whether the build command returned exit_code=0 (None if not run yet)
+    /// Whether the build commands returned exit_code=0 (None if not run yet)
     pub build_passed: Option<bool>,
+    /// Raw exit codes captured from shell tool results (keys are *_result artifact keys)
+    #[serde(default)]
+    pub build_exit_codes: std::collections::HashMap<String, i64>,
     /// Whether the zip/package was created and non-empty (None if not applicable)
     pub package_verified: Option<bool>,
+    /// Zip size in bytes when a zip artifact exists (None if not applicable)
+    pub zip_size_bytes: Option<u64>,
+    /// Zip entry count when a zip artifact exists (None if not applicable)
+    pub zip_entry_count: Option<usize>,
     /// Human-readable notes (e.g. "cargo not available, build skipped")
     #[serde(default)]
     pub limitations: Vec<String>,

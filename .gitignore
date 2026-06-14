@@ -30,3 +30,9 @@ Thumbs.db
 
 # Personal scratch
 /plans between grok and chat gpt
+
+# Generated walkthrough/docs artifacts
+/CODE_WALKTHROUGH.pdf
+/docs/AIHOMESERVER_WALKTHROUGH.md
+/docs/AIHOMESERVER_WALKTHROUGH.pdf
+/docs/SEARCH_RELIABILITY.md

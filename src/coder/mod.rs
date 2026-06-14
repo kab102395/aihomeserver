@@ -13,9 +13,11 @@ pub mod adapter;
 pub mod adapters;
 pub mod intent;
 pub mod manifest;
+pub mod repair_planner;
 pub mod verifier;
 
 pub use adapter::{adapter_for_intent, get_adapter, AdapterManifest, LanguageAdapter};
 pub use intent::{detect_coding_intent, CodingIntent};
 pub use manifest::{ArtifactVerification, ExecutionManifest, WriteStep};
+pub use repair_planner::plan_deterministic_repair;
 pub use verifier::verify;

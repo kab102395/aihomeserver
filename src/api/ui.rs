@@ -1408,6 +1408,20 @@ body {
 }
 .btn-reject:hover { background: var(--surface); color: var(--text); }
 
+.btn-stop-run {
+  float: right;
+  margin: 2px 0 8px 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 13px;
+}
+.btn-stop-run:hover { background: var(--surface); color: var(--text); }
+.btn-stop-run:disabled { opacity: 0.5; cursor: default; }
+
 /* ── Terminal Panel ── */
 #terminal-drawer {
   position: fixed;
@@ -2612,7 +2626,32 @@ async function sendWithAnswers(text, answers) {
           let data;
           try { data = JSON.parse(line.slice(6)); } catch (_) { continue; }
 
-          if (currentEventType === 'status') {
+          if (currentEventType === 'run_started') {
+            const st = runStates.get(runId);
+            if (st) st.task_id = data.task_id;
+
+            // Add Stop button for this run (requires task_id).
+            if (data.task_id) {
+              let stopBtn = thinkEl.querySelector('.btn-stop-run');
+              if (!stopBtn) {
+                stopBtn = document.createElement('button');
+                stopBtn.className = 'btn-stop-run';
+                stopBtn.textContent = 'Stop';
+                stopBtn.onclick = async () => {
+                  stopBtn.disabled = true;
+                  try {
+                    await fetch(`/task/${data.task_id}/cancel`, { method: 'POST' });
+                    addReasoningLine('r-warn', '⏹', 'Cancel requested');
+                  } catch (_) {
+                    addReasoningLine('r-warn', '⚠', 'Cancel failed');
+                    stopBtn.disabled = false;
+                  }
+                };
+                thinkContent.insertBefore(stopBtn, thinkContent.firstChild);
+              }
+            }
+            renderRunState(runId);
+          } else if (currentEventType === 'status') {
             const statusText = phaseLabel(data.phase);
             const st = runStates.get(runId);
             if (st) st.phase = data.phase;
@@ -2765,6 +2804,9 @@ async function sendWithAnswers(text, answers) {
             renderRunState(runId);
           } else if (currentEventType === 'done') {
             doneEventReceived = true;
+            // Disable Stop button after completion.
+            const stopBtn = thinkEl.querySelector('.btn-stop-run');
+            if (stopBtn) stopBtn.disabled = true;
             if (!answerEl) {
               // Preserve CoT block if present (non-streaming path)
               let savedCoT2 = thinkContent.querySelector('.thinking-details');
@@ -2992,11 +3034,31 @@ async function sendQueuedRequest(fullRequest, answers, queuedEl, sessionId) {
           let data;
           try { data = JSON.parse(line.slice(6)); } catch (_) { continue; }
           const st = runStates.get(runId);
-          if (currentEventType === 'status') { if (st) st.phase = data.phase; renderRunState(runId); }
+          if (currentEventType === 'run_started') {
+            if (st) st.task_id = data.task_id;
+            if (data.task_id) {
+              let stopBtn = thinkEl.querySelector('.btn-stop-run');
+              if (!stopBtn) {
+                stopBtn = document.createElement('button');
+                stopBtn.className = 'btn-stop-run';
+                stopBtn.textContent = 'Stop';
+                stopBtn.onclick = async () => {
+                  stopBtn.disabled = true;
+                  try { await fetch(`/task/${data.task_id}/cancel`, { method: 'POST' }); } catch (_) { stopBtn.disabled = false; }
+                };
+                const thinkContent = thinkEl.querySelector('.think-content') || thinkEl;
+                thinkContent.insertBefore(stopBtn, thinkContent.firstChild);
+              }
+            }
+            renderRunState(runId);
+          }
+          else if (currentEventType === 'status') { if (st) st.phase = data.phase; renderRunState(runId); }
           else if (currentEventType === 'thinking_token') { if (st) { st.thinking_text = (st.thinking_text||'') + (data.text||''); } renderRunState(runId); }
           else if (currentEventType === 'token') { if (st) { st.streaming_started = true; st.full_answer = (st.full_answer||'') + (data.text||''); } renderRunState(runId); }
           else if (currentEventType === 'done') {
             doneEventReceived = true;
+            const stopBtn = thinkEl.querySelector('.btn-stop-run');
+            if (stopBtn) stopBtn.disabled = true;
             const runSessionId = data.session_id;
             if (st) {
               st.session_id = runSessionId || st.session_id;

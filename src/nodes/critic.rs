@@ -169,6 +169,78 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
     // coding task that mechanically failed (e.g. source file never written, zip missing).
     if state.coding_intent.is_some() {
         if let Some(verif) = state.artifacts.get("artifact_verification") {
+            // Only enforce deterministic verification when we're at a verification/packaging step.
+            // Otherwise we'd fail early during file-write steps because many required files and
+            // artifacts are expected to be missing until later steps execute.
+            let (is_build_step, is_zip_step) = match state.current_plan.as_ref().and_then(|p| {
+                if state.current_step >= 1 && state.current_step <= p.steps.len() {
+                    Some(&p.steps[state.current_step - 1])
+                } else {
+                    None
+                }
+            }) {
+                None => (false, false),
+                Some(step) => {
+                    let tool = step.tool_binding.as_deref().unwrap_or("").to_string();
+                    let output_key = step
+                        .output_key
+                        .clone()
+                        .unwrap_or_else(|| format!("step_{}", state.current_step));
+                    let tool_call = state.artifacts.get(&output_key);
+
+                    fn extract_action(v: Option<&serde_json::Value>) -> Option<String> {
+                        let v = v?;
+                        if let Some(p) = v.get("params") {
+                            return p
+                                .get("action")
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string());
+                        }
+                        v.get("action")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string())
+                    }
+
+                    fn extract_command(v: Option<&serde_json::Value>) -> Option<String> {
+                        let v = v?;
+                        if let Some(p) = v.get("params") {
+                            return p
+                                .get("command")
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string());
+                        }
+                        v.get("command")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string())
+                    }
+
+                    let step_action_lower = step.action.to_lowercase();
+                    let tool_call_action =
+                        extract_action(tool_call).unwrap_or_default().to_lowercase();
+                    let tool_call_cmd =
+                        extract_command(tool_call).unwrap_or_default().to_lowercase();
+
+                    let is_zip = tool == "filesystem"
+                        && (step_action_lower.contains("zip")
+                            || tool_call_action == "zip_dir"
+                            || tool_call_action == "zip");
+
+                    let is_build = tool == "shell"
+                        && (step_action_lower.contains("build")
+                            || step_action_lower.contains("compile")
+                            || tool_call_cmd.contains("cargo build")
+                            || tool_call_cmd.contains("cargo check")
+                            || tool_call_cmd.contains("go build")
+                            || tool_call_cmd.contains("go test"));
+
+                    (is_build, is_zip)
+                }
+            };
+
+            if !is_build_step && !is_zip_step {
+                // Not a verification/packaging step; don't deterministically fail yet.
+                // Tool failures are handled separately above; LLM critic will evaluate step-level output.
+            } else {
             let missing_files: Vec<String> = verif
                 .get("missing_files")
                 .and_then(|v| v.as_array())
@@ -189,14 +261,34 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
                         .collect()
                 })
                 .unwrap_or_default();
-            let build_failed = verif
-                .get("build_passed")
-                .and_then(|v| v.as_bool())
-                == Some(false);
+            // Only treat build failure as fatal when the current step is a build/verify step.
+            let build_failed = is_build_step
+                && verif
+                    .get("build_passed")
+                    .and_then(|v| v.as_bool())
+                    == Some(false);
 
-            if !missing_files.is_empty() || !missing_artifacts.is_empty() || build_failed {
+            // Only treat zip artifacts as missing when the current step is the zip step.
+            let missing_artifacts: Vec<String> = if is_zip_step {
+                missing_artifacts
+            } else {
+                missing_artifacts
+                    .into_iter()
+                    .filter(|a| {
+                        let al = a.to_lowercase();
+                        !(al.ends_with(".zip") || al.contains("zip invalid"))
+                    })
+                    .collect()
+            };
+
+            // Missing required files are only enforced at build/package time.
+            let enforce_missing_files = is_build_step || is_zip_step;
+            if (enforce_missing_files && !missing_files.is_empty())
+                || !missing_artifacts.is_empty()
+                || build_failed
+            {
                 let mut issues = Vec::new();
-                if !missing_files.is_empty() {
+                if enforce_missing_files && !missing_files.is_empty() {
                     issues.push(format!("Missing required files: {:?}", missing_files));
                 }
                 if !missing_artifacts.is_empty() {
@@ -207,8 +299,10 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
                 }
 
                 let mut recommendations = Vec::new();
-                if let Some(first_missing) = missing_files.first() {
+                if enforce_missing_files {
+                    if let Some(first_missing) = missing_files.first() {
                     recommendations.push(format!("Write missing file: {first_missing}"));
+                    }
                 }
                 if let Some(first_artifact) = missing_artifacts.first() {
                     if first_artifact.ends_with(".zip") {
@@ -254,6 +348,7 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
                     timestamp: Utc::now(),
                 });
                 return Ok(state);
+            }
             }
         }
     }

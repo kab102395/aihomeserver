@@ -146,6 +146,34 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
 
     // Tool step: repair by generating a corrected tool call JSON and overwrite output_key.
     if let Some(tool_name) = step.tool_binding.as_ref() {
+        // For coding tasks, try a deterministic repair first (no LLM):
+        // - packaging/build tool calls are generated mechanically from the manifest + verifier.
+        if state.coding_intent.is_some() {
+            if let (Some(manifest), Some(verif_val)) =
+                (state.execution_manifest.as_ref(), state.artifacts.get("artifact_verification"))
+            {
+                if let Ok(verif) =
+                    serde_json::from_value::<crate::coder::ArtifactVerification>(verif_val.clone())
+                {
+                    if let Some(tool_call) =
+                        crate::coder::plan_deterministic_repair(manifest, &verif, step)
+                    {
+                        state.log_meta(
+                            "repair",
+                            "Applied deterministic coding repair tool call",
+                            serde_json::json!({
+                                "output_key": output_key,
+                                "tool": tool_name,
+                                "step": state.current_step,
+                            }),
+                        );
+                        state.artifacts.insert(output_key, tool_call);
+                        return Ok(state);
+                    }
+                }
+            }
+        }
+
         let tool_output_key = format!("{output_key}_result");
         let last_tool_result = state
             .artifacts

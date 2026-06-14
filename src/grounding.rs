@@ -197,7 +197,7 @@ fn extract_tech_subject(user_request: &str) -> Option<String> {
 ///
 /// Connection:
 /// - Used by `enforce_grounding_contract` to add a `parallel_search` step.
-fn decompose_search_queries(user_request: &str) -> Vec<String> {
+pub(crate) fn decompose_search_queries(user_request: &str) -> Vec<String> {
     let lower = user_request.to_lowercase();
     let version = extract_version_token(&lower);
     let subjects = extract_subjects(user_request);
@@ -239,11 +239,22 @@ fn decompose_search_queries(user_request: &str) -> Vec<String> {
         if let Some(ref t) = tech {
             // Software/tech version research — generate specific, useful queries
             if let Some(v) = &version {
+                // Official-first for Rust: prefer rust-lang sources where possible.
+                if t.to_lowercase() == "rust" {
+                    queries.push(format!("Rust {v} release notes site:blog.rust-lang.org"));
+                    queries.push(format!("Rust {v} release notes site:doc.rust-lang.org"));
+                }
                 queries.push(format!("{t} {v} release notes what's new"));
                 queries.push(format!("{t} {v} changelog new features"));
                 queries.push(format!("{t} {v} release blog announcement"));
                 queries.push(format!("{t} latest stable version release {last_year} {this_year}"));
             } else {
+                // Official-first for Rust: prefer rust-lang sources where possible.
+                if t.to_lowercase() == "rust" {
+                    queries.push("Rust release notes site:blog.rust-lang.org".to_string());
+                    queries.push("Rust release notes site:doc.rust-lang.org".to_string());
+                    queries.push(format!("Rust releases {last_year} {this_year} site:blog.rust-lang.org"));
+                }
                 queries.push(format!("{t} latest release what's new"));
                 queries.push(format!("{t} recent versions changelog"));
                 queries.push(format!("{t} release notes blog {last_year} {this_year}"));
@@ -356,6 +367,21 @@ pub fn enforce_grounding_contract(
     // blindly continuing after missing/failed evidence.
     plan.risk_score = plan.risk_score.max(4);
 
+    // Special-case: Rust release notes are available from stable, official endpoints.
+    // Prefer deterministic fetches over flaky search engines (SearXNG bans/403s).
+    let lower = user_request.to_lowercase();
+    let tech = extract_tech_subject(user_request).unwrap_or_default().to_lowercase();
+    let is_rust = tech == "rust" || lower.contains(" rust");
+    let is_release_notes_like = is_rust
+        && (lower.contains("release notes")
+            || lower.contains("releases")
+            || lower.contains("recent rust")
+            || lower.contains("latest rust")
+            || lower.contains("rust 1.")
+            || lower.contains("what changed")
+            || lower.contains("what's new")
+            || lower.contains("changelog"));
+
     let search_configured = capabilities
         .get("search_url_configured")
         .and_then(|v| v.as_bool())
@@ -389,33 +415,67 @@ pub fn enforce_grounding_contract(
         )
     });
     if !has_research_tool {
-        let output_key = if plan
-            .steps
-            .iter()
-            .any(|s| s.output_key.as_deref() == Some("search_result"))
-        {
-            None
+        if is_release_notes_like {
+            // Official-first deterministic sources.
+            // `releases.html` contains a chronological index of stable release notes.
+            plan.steps.insert(
+                0,
+                StepDefinition {
+                    step_id: String::new(),
+                    action: "Fetch Rust official stable release notes index (doc.rust-lang.org)"
+                        .into(),
+                    tool_binding: Some("http_fetch".into()),
+                    input_params: serde_json::json!({ "url": "https://doc.rust-lang.org/stable/releases.html" }),
+                    output_key: Some("fetch1_result".into()),
+                    expected_output: None,
+                    output_format: None,
+                    requires_facts: false,
+                },
+            );
+            plan.steps.insert(
+                1,
+                StepDefinition {
+                    step_id: String::new(),
+                    action: "Fetch Rust official blog release announcements (blog.rust-lang.org)"
+                        .into(),
+                    tool_binding: Some("http_fetch".into()),
+                    input_params: serde_json::json!({ "url": "https://blog.rust-lang.org/" }),
+                    output_key: Some("fetch2_result".into()),
+                    expected_output: None,
+                    output_format: None,
+                    requires_facts: false,
+                },
+            );
+            renumber_steps(&mut plan.steps);
         } else {
-            Some("search_result".into())
-        };
+            let output_key = if plan
+                .steps
+                .iter()
+                .any(|s| s.output_key.as_deref() == Some("search_result"))
+            {
+                None
+            } else {
+                Some("search_result".into())
+            };
 
-        let queries = decompose_search_queries(user_request);
+            let queries = decompose_search_queries(user_request);
 
-        plan.steps.insert(
-            0,
-            StepDefinition {
-                step_id: String::new(),
-                action: "Search the web for up-to-date sources relevant to the user's request"
-                    .into(),
-                tool_binding: Some("parallel_search".into()),
-                input_params: serde_json::json!({ "queries": queries }),
-                output_key,
-                expected_output: None,
-                output_format: None,
-                requires_facts: false,
-            },
-        );
-        renumber_steps(&mut plan.steps);
+            plan.steps.insert(
+                0,
+                StepDefinition {
+                    step_id: String::new(),
+                    action: "Search the web for up-to-date sources relevant to the user's request"
+                        .into(),
+                    tool_binding: Some("parallel_search".into()),
+                    input_params: serde_json::json!({ "queries": queries }),
+                    output_key,
+                    expected_output: None,
+                    output_format: None,
+                    requires_facts: false,
+                },
+            );
+            renumber_steps(&mut plan.steps);
+        }
     }
 
     // If the plan already had a parallel_search but only searched the raw user request,

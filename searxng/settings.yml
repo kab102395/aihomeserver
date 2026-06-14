@@ -45,7 +45,9 @@ engines:
   - name: brave
     engine: brave
     shortcut: brave
-    disabled: false
+    # Brave requires an API key; without one this engine will fail and can create noisy logs.
+    # To enable: add `api_key: "<your key>"` and set `disabled: false`.
+    disabled: true
 
   - name: qwant
     engine: qwant
@@ -60,7 +62,8 @@ engines:
   - name: startpage
     engine: startpage
     shortcut: sp
-    disabled: false
+    # Startpage often blocks datacenter IPs; keep disabled unless you confirm it works.
+    disabled: true
 
   # Mojeek — independent index, doesn't block server/Docker IPs
   - name: mojeek

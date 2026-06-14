@@ -255,9 +255,8 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
         }),
     );
 
-    // Build artifact context for LLM steps:
-    // Prioritise *_result keys (tool outputs, including failures) then fill
-    // with up to 3 non-result keys so the model sees what actually happened.
+    // Build the evidence bundle the model sees for this step.
+    // Tool results come first because they are the most trustworthy record of what happened.
     // Always include `facts` if present so grounded steps don't hallucinate.
     let mut ctx_map = serde_json::Map::new();
     for (k, v) in state
@@ -470,6 +469,13 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
             if wants_json && !has_tool {
                 match serde_json::from_str::<serde_json::Value>(&out) {
                     Ok(v) => {
+                        let v = if output_key == "facts"
+                            && crate::grounding::request_needs_grounding(&state.user_request)
+                        {
+                            normalize_facts_table(v, &state.user_request)
+                        } else {
+                            v
+                        };
                         state.artifacts.insert(output_key, v);
                     }
                     Err(_) => {
@@ -525,6 +531,128 @@ fn get_string_array(v: Option<&serde_json::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Normalize the facts-table JSON shape so downstream automation can rely on required fields.
+///
+/// Why:
+/// - Models occasionally output a paragraph/string for `facts`, omit `sources`, or omit numeric
+///   `coverage_score`, which triggers repair loops even though we could recover deterministically.
+fn normalize_facts_table(v: serde_json::Value, user_request: &str) -> serde_json::Value {
+    use serde_json::json;
+    let mut obj = match v.as_object() {
+        Some(o) => o.clone(),
+        None => {
+            return json!({
+                "facts": [],
+                "sources": [],
+                "missing": ["facts output was not a JSON object"],
+                "next_queries": crate::grounding::decompose_search_queries(user_request),
+                "coverage_score": 0.0
+            });
+        }
+    };
+
+    let mut sources: Vec<String> = obj
+        .get("sources")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut missing: Vec<String> = obj
+        .get("missing")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let next_queries: Vec<String> = obj
+        .get("next_queries")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| crate::grounding::decompose_search_queries(user_request));
+
+    let coverage_score = obj
+        .get("coverage_score")
+        .and_then(|x| x.as_f64())
+        .unwrap_or_else(|| {
+            // Fall back to a conservative score based on whether any sources exist.
+            if !sources.is_empty() { 0.7 } else { 0.2 }
+        });
+
+    // Normalize `facts` into an array of {claim,url,evidence} objects.
+    let facts_val = obj.get("facts").cloned().unwrap_or_else(|| json!([]));
+    let mut facts_out: Vec<serde_json::Value> = Vec::new();
+    match facts_val {
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if let Some(o) = item.as_object() {
+                    let claim = o.get("claim").and_then(|x| x.as_str()).unwrap_or("").trim();
+                    let url = o.get("url").and_then(|x| x.as_str()).unwrap_or("").trim();
+                    let evidence = o
+                        .get("evidence")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if claim.is_empty() && url.is_empty() && evidence.is_empty() {
+                        continue;
+                    }
+                    if !url.is_empty() {
+                        sources.push(url.to_string());
+                    }
+                    facts_out.push(json!({
+                        "claim": claim,
+                        "url": url,
+                        "evidence": evidence
+                    }));
+                } else if let Some(s) = item.as_str() {
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        facts_out.push(json!({ "claim": s, "url": "", "evidence": "" }));
+                    }
+                }
+            }
+        }
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            if !s.is_empty() {
+                missing.push("facts was a paragraph, not an array; normalized to single claim".into());
+                facts_out.push(json!({ "claim": s, "url": "", "evidence": "" }));
+            }
+        }
+        _ => {
+            missing.push("facts field had unexpected type; normalized to empty array".into());
+        }
+    }
+
+    // De-dupe sources.
+    sources.sort();
+    sources.dedup();
+
+    json!({
+        "facts": facts_out,
+        "sources": sources,
+        "missing": missing,
+        "next_queries": next_queries,
+        "coverage_score": coverage_score
+    })
+}
+
 /// Renumber plan steps sequentially after programmatic insertion.
 ///
 /// Connection:
@@ -556,6 +684,15 @@ fn maybe_expand_research_loop(state: &mut SystemState, executed_step: &StepDefin
         return;
     }
     if !crate::grounding::request_needs_grounding(&state.user_request) {
+        return;
+    }
+
+    // Rust release notes have stable, official sources and do not benefit from iterative search loops.
+    // The loop can accidentally drag in irrelevant docs pages and create replan churn.
+    let req_lower = state.user_request.to_lowercase();
+    if req_lower.contains("rust")
+        && (req_lower.contains("release") || req_lower.contains("changelog") || req_lower.contains("what changed"))
+    {
         return;
     }
 

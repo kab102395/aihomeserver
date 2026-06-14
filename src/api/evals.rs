@@ -81,6 +81,180 @@ trait EvalCase: Send + Sync {
     async fn run(&self, app: &AppState, timeout_secs: Option<u64>) -> EvalCaseResult;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Full end-to-end evals (acceptance suite)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn base_state_for_e2e(app: &AppState, request: &str) -> crate::state::SystemState {
+    let mut s = crate::state::SystemState::new(request.to_string());
+    // Mirror what /run/stream injects (lightly): workspace + risk threshold + a minimal capability snapshot.
+    // This improves planner/tool selection and makes failures reproducible.
+    // Note: we intentionally don't wire SSE channels for eval runs.
+    let cfg = app.config.read().await;
+    s.workspace_path = cfg.workspace_path.clone();
+    s.risk_gate_threshold = cfg.risk_gate_threshold;
+    s.max_steps = cfg.max_steps;
+    s.capabilities = json!({
+        "workspace_ok": std::path::Path::new(&cfg.workspace_path).is_dir(),
+        "search_url_configured": !cfg.search_url.trim().is_empty(),
+        "auto_kb_mode": cfg.auto_kb_mode,
+        "auto_kb_min_chars": cfg.auto_kb_min_chars,
+    });
+    s
+}
+
+async fn run_orchestrator_with_timeout(
+    app: &AppState,
+    state: crate::state::SystemState,
+    timeout_secs: Option<u64>,
+) -> Result<crate::state::SystemState, String> {
+    let t = timeout_secs.unwrap_or(180);
+    match tokio::time::timeout(std::time::Duration::from_secs(t), app.orchestrator.run(state)).await
+    {
+        Ok(Ok(s)) => Ok(s),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("timeout after {t}s")),
+    }
+}
+
+struct E2ERustSnakeZipCase;
+
+#[async_trait]
+impl EvalCase for E2ERustSnakeZipCase {
+    fn info(&self) -> EvalCaseInfo {
+        EvalCaseInfo {
+            id: "e2e.rust.snake_zip".into(),
+            description: "E2E: Rust Snake game + zip packaging (coder pipeline)".into(),
+            tags: vec!["e2e".into(), "coder".into(), "rust".into()],
+            quick: false,
+        }
+    }
+
+    async fn run(&self, app: &AppState, timeout_secs: Option<u64>) -> EvalCaseResult {
+        let t0 = Instant::now();
+        let state = base_state_for_e2e(app, "Create an old school snake game in Rust and package it as a zip.").await;
+        let res = run_orchestrator_with_timeout(app, state, timeout_secs).await;
+        let mut ok = false;
+        let mut detail = json!({});
+        match res {
+            Ok(s) => {
+                let verif = s.artifacts.get("artifact_verification").cloned().unwrap_or(json!({}));
+                let missing_files = verif.get("missing_files").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                let missing_artifacts = verif.get("missing_artifacts").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                ok = s.termination_met && missing_files == 0 && missing_artifacts == 0;
+                detail = json!({
+                    "termination_met": s.termination_met,
+                    "steps_taken": s.current_step,
+                    "artifact_verification": verif,
+                });
+            }
+            Err(e) => {
+                detail = json!({ "error": e });
+            }
+        }
+
+        EvalCaseResult {
+            id: self.info().id,
+            ok,
+            skipped: false,
+            duration_ms: t0.elapsed().as_millis(),
+            detail,
+        }
+    }
+}
+
+struct E2EGoServerZipCase;
+
+#[async_trait]
+impl EvalCase for E2EGoServerZipCase {
+    fn info(&self) -> EvalCaseInfo {
+        EvalCaseInfo {
+            id: "e2e.go.server_zip".into(),
+            description: "E2E: Go HTTP server + zip packaging (coder pipeline)".into(),
+            tags: vec!["e2e".into(), "coder".into(), "go".into()],
+            quick: false,
+        }
+    }
+
+    async fn run(&self, app: &AppState, timeout_secs: Option<u64>) -> EvalCaseResult {
+        let t0 = Instant::now();
+        let state = base_state_for_e2e(app, "Create a minimal Go HTTP server and package it as a zip.").await;
+        let res = run_orchestrator_with_timeout(app, state, timeout_secs).await;
+        let mut ok = false;
+        let mut detail = json!({});
+        match res {
+            Ok(s) => {
+                let verif = s.artifacts.get("artifact_verification").cloned().unwrap_or(json!({}));
+                let missing_files = verif.get("missing_files").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                let missing_artifacts = verif.get("missing_artifacts").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                ok = s.termination_met && missing_files == 0 && missing_artifacts == 0;
+                detail = json!({
+                    "termination_met": s.termination_met,
+                    "steps_taken": s.current_step,
+                    "artifact_verification": verif,
+                });
+            }
+            Err(e) => {
+                detail = json!({ "error": e });
+            }
+        }
+
+        EvalCaseResult {
+            id: self.info().id,
+            ok,
+            skipped: false,
+            duration_ms: t0.elapsed().as_millis(),
+            detail,
+        }
+    }
+}
+
+struct E2ERustReleaseNotesCase;
+
+#[async_trait]
+impl EvalCase for E2ERustReleaseNotesCase {
+    fn info(&self) -> EvalCaseInfo {
+        EvalCaseInfo {
+            id: "e2e.research.rust_release_notes".into(),
+            description: "E2E: 'latest Rust versions' grounded research output".into(),
+            tags: vec!["e2e".into(), "research".into(), "grounding".into()],
+            quick: false,
+        }
+    }
+
+    async fn run(&self, app: &AppState, timeout_secs: Option<u64>) -> EvalCaseResult {
+        let t0 = Instant::now();
+        let state = base_state_for_e2e(app, "Look into the latest notes on the latest Rust versions and summarize changes and additions.").await;
+        let res = run_orchestrator_with_timeout(app, state, timeout_secs).await;
+        let mut ok = false;
+        let mut detail = json!({});
+        match res {
+            Ok(s) => {
+                let has_facts = s.artifacts.contains_key("facts");
+                let ans = s.artifacts.get("answer").and_then(|v| v.as_str()).unwrap_or("");
+                ok = s.termination_met && has_facts && ans.len() > 200;
+                detail = json!({
+                    "termination_met": s.termination_met,
+                    "steps_taken": s.current_step,
+                    "has_facts": has_facts,
+                    "answer_len": ans.len(),
+                });
+            }
+            Err(e) => {
+                detail = json!({ "error": e });
+            }
+        }
+
+        EvalCaseResult {
+            id: self.info().id,
+            ok,
+            skipped: false,
+            duration_ms: t0.elapsed().as_millis(),
+            detail,
+        }
+    }
+}
+
 /// Construct the full list of eval cases supported by this server.
 ///
 /// Connection:
@@ -99,6 +273,10 @@ fn all_cases() -> Vec<Box<dyn EvalCase>> {
         Box::new(GroundingContractCase),
         Box::new(LlmChatJsonCase),
         Box::new(LlmEmbedCase),
+        // Full end-to-end acceptance evals (slow; require LLM + toolchain + network).
+        Box::new(E2ERustSnakeZipCase),
+        Box::new(E2EGoServerZipCase),
+        Box::new(E2ERustReleaseNotesCase),
     ]
 }
 

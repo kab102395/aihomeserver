@@ -45,12 +45,33 @@ impl Orchestrator {
     /// This function returns the final `SystemState` so callers can persist artifacts,
     /// event logs, and summary answers for replay.
     pub async fn run(&self, initial_state: SystemState) -> Result<SystemState> {
+        self.run_with_cancel(initial_state, tokio_util::sync::CancellationToken::new())
+            .await
+    }
+
+    /// Run the orchestration loop with cancellation support.
+    ///
+    /// The token is triggered by the UI "Stop" button via `/task/:id/cancel`.
+    pub async fn run_with_cancel(
+        &self,
+        initial_state: SystemState,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<SystemState> {
         let mut state = initial_state;
         let mut node = OrchestratorNode::Intake;
         let mut replan_count: u32 = 0;
         const MAX_REPLANS: u32 = 3;
 
         loop {
+            if cancel.is_cancelled() {
+                state.log("cancel", "Run cancelled by user");
+                state.termination_met = false;
+                state.artifacts.insert(
+                    "answer".into(),
+                    serde_json::Value::String("Cancelled.".into()),
+                );
+                return Ok(state);
+            }
             info!(
                 task_id = %state.task_id,
                 step = state.current_step,
@@ -60,16 +81,20 @@ impl Orchestrator {
 
             node = match node {
                 OrchestratorNode::Intake => {
+                    // Intake is the "load the notebook" phase: gather the request and context
+                    // before the model tries to plan anything.
                     state = intake::run(state).await?;
                     OrchestratorNode::CodingClassifier
                 }
 
                 OrchestratorNode::CodingClassifier => {
+                    // Quick, non-LLM check for whether this is really a coding task.
                     state = classifier::run(state).await?;
                     OrchestratorNode::Planner
                 }
 
                 OrchestratorNode::Planner => {
+                    // Planner turns the request into a numbered step list.
                     state = planner::run(state, &self.llm).await?;
                     if state.current_plan.is_none() {
                         // Planning failed — go straight to finalization
@@ -81,6 +106,8 @@ impl Orchestrator {
                 }
 
                 OrchestratorNode::Executor => {
+                    // Executor is the "do the next step" phase.
+                    // For high-risk plans, pause here and ask a human before doing anything.
                     // ── High-risk human gate ──────────────────────────────────
                     if state.risk_score() >= state.risk_gate_threshold && !state.admin_mode {
                         if let (Some(gate_store), Some(sse_tx)) =
@@ -134,6 +161,8 @@ impl Orchestrator {
                 }
 
                 OrchestratorNode::ToolExecution => {
+                    // This is the moment the plan touches the real world: files, shell,
+                    // git, and network actions happen only through the tool registry.
                     state = tool_execution::run(state, &self.tools).await?;
                     // For coding tasks: run mechanical artifact verification so critic has
                     // a deterministic ground truth rather than just LLM judgement.
@@ -174,11 +203,14 @@ impl Orchestrator {
                 }
 
                 OrchestratorNode::Critic => {
+                    // Critic checks whether the last step actually worked or whether we need
+                    // a repair or a whole new plan.
                     state = critic::run(state, &self.llm).await?;
                     self.route_from_critic(&state)
                 }
 
                 OrchestratorNode::Repair => {
+                    // Repair only patches the last broken step instead of discarding the plan.
                     // Tell the UI we're retrying
                     let issues = state
                         .critic_history
@@ -208,6 +240,7 @@ impl Orchestrator {
                 }
 
                 OrchestratorNode::Replan => {
+                    // Replan means "start over, but keep the evidence we collected so far."
                     replan_count += 1;
                     warn!(
                         task_id = %state.task_id,
@@ -235,6 +268,7 @@ impl Orchestrator {
                 }
 
                 OrchestratorNode::Finalization => {
+                    // Finalization writes the result out and ends the run.
                     state = finalization::run(state).await?;
                     OrchestratorNode::Done
                 }

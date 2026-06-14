@@ -408,8 +408,16 @@ impl SystemState {
         }
         if result.success {
             if let Some(output) = &result.output {
-                self.artifacts
-                    .insert(output_key.to_string(), output.clone());
+                // Keep artifacts compact: search tools can return large result lists which
+                // overwhelm the UI and slow down critic/executor context.
+                let mut value = output.clone();
+                if output_key.contains("search")
+                    || output_key.contains("parallel_search")
+                    || output_key.contains("web_search")
+                {
+                    value = compact_search_artifact(value);
+                }
+                self.artifacts.insert(output_key.to_string(), value);
             }
             return;
         }
@@ -442,6 +450,47 @@ impl SystemState {
     }
 }
 
+fn compact_search_artifact(mut v: serde_json::Value) -> serde_json::Value {
+    // Only compact objects with a `results` array.
+    let Some(obj) = v.as_object_mut() else {
+        return v;
+    };
+    let Some(results) = obj.get_mut("results").and_then(|r| r.as_array_mut()) else {
+        return v;
+    };
+
+    // Cap result count to keep artifacts/UI reasonable.
+    const MAX_RESULTS: usize = 24;
+    if results.len() > MAX_RESULTS {
+        results.truncate(MAX_RESULTS);
+    }
+
+    // Truncate very long snippets.
+    for item in results.iter_mut() {
+        let Some(o) = item.as_object_mut() else { continue };
+        if let Some(sn) = o.get_mut("snippet").and_then(|s| s.as_str()).map(|s| s.to_string()) {
+            const MAX_SNIP: usize = 260;
+            if sn.len() > MAX_SNIP {
+                let mut t = sn;
+                t.truncate(MAX_SNIP);
+                t.push_str("…");
+                o.insert("snippet".into(), serde_json::Value::String(t));
+            }
+        }
+    }
+
+    // Provider debug can be useful but noisy; keep only when explicitly enabled.
+    let keep_debug = std::env::var("SEARCH_PROVIDER_DEBUG")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !keep_debug {
+        obj.remove("provider_debug");
+    }
+
+    v
+}
+
 // ==================== SSE EVENTS ====================
 
 #[derive(Debug, Clone, Serialize)]
@@ -451,6 +500,11 @@ impl SystemState {
 /// This is a UX layer: it does not affect correctness, but it makes the system
 /// transparent by showing plan/tool/critic transitions live.
 pub enum SseEvent {
+    /// Emitted immediately after a task is created so the UI can show a Stop button.
+    RunStarted {
+        task_id: String,
+        session_id: String,
+    },
     Status {
         phase: String,
     },
