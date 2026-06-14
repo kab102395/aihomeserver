@@ -1,4 +1,4 @@
-# aihomeserver
+﻿# aihomeserver
 
 > **A fully self-hosted AI agent server built in Rust.**  
 > Orchestrates a deterministic FSM pipeline (Plan → Execute → Critique → Repair) over local Ollama models, with real-time SSE streaming, a structured tool registry, and persistent memory.
@@ -684,3 +684,4 @@ aihomeserver/
 
 *Built with Rust · Ollama · Axum · SQLite · SearXNG*  
 *Ember Tech Solutions LLC — Kyle Barrett*
+
