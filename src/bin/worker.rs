@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
@@ -7,6 +8,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +77,8 @@ struct ShellRequest {
     timeout_secs: Option<u64>,
     #[serde(default)]
     task_id: Option<String>,
+    #[serde(default)]
+    collect_paths: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,6 +86,34 @@ struct BrowserFetchRequest {
     url: String,
     #[serde(default)]
     max_chars: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceSyncRequest {
+    #[serde(default)]
+    prefix: Option<String>,
+    files: Vec<WorkspaceFilePayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceFilePayload {
+    path: String,
+    contents_b64: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceArtifactPayload {
+    path: String,
+    contents_b64: String,
+    size: u64,
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceSyncResponse {
+    ok: bool,
+    workspace: String,
+    files_written: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -101,11 +133,174 @@ fn require_auth(headers: &axum::http::HeaderMap, token: &Option<String>) -> bool
     }
 }
 
+fn is_hidden_or_ignored(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|name| {
+            name.starts_with('.')
+                || matches!(
+                    name,
+                    "target" | "node_modules" | "__pycache__" | "workspace" | "data"
+                )
+        })
+        .unwrap_or(false)
+}
+
+fn resolve_workspace_path(root: &Path, requested: Option<&str>) -> anyhow::Result<PathBuf> {
+    let requested = requested.unwrap_or(".").trim();
+    let candidate = if requested.is_empty() || requested == "." {
+        root.to_path_buf()
+    } else {
+        let rel = Path::new(requested);
+        if rel.is_absolute() {
+            rel.to_path_buf()
+        } else {
+            root.join(rel)
+        }
+    };
+
+    let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let resolved = std::fs::canonicalize(&candidate).unwrap_or(candidate.clone());
+    if !resolved.starts_with(&root_canon) {
+        anyhow::bail!("path escapes worker workspace");
+    }
+    Ok(resolved)
+}
+
+fn clear_directory_contents(dir: &Path) -> anyhow::Result<()> {
+    if !dir.exists() {
+        std::fs::create_dir_all(dir)?;
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(path)?;
+        } else {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_requested_artifacts(root: &Path, paths: &[String]) -> Vec<WorkspaceArtifactPayload> {
+    let mut out = Vec::new();
+    for rel in paths {
+        let rel_path = Path::new(rel);
+        if rel_path.is_absolute()
+            || rel_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+        let full = root.join(rel_path);
+        let bytes = match std::fs::read(&full) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let size = bytes.len() as u64;
+        out.push(WorkspaceArtifactPayload {
+            path: rel.replace('\\', "/"),
+            contents_b64: STANDARD.encode(bytes),
+            size,
+            truncated: false,
+        });
+    }
+    out
+}
+
 async fn health(State(state): State<WorkerState>) -> impl IntoResponse {
     Json(HealthResponse {
         ok: true,
         workspace: (*state.workspace).clone(),
     })
+}
+
+async fn sync_workspace(
+    State(state): State<WorkerState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<WorkspaceSyncRequest>,
+) -> impl IntoResponse {
+    if !require_auth(&headers, &state.token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        )
+            .into_response();
+    }
+
+    let prefix = req
+        .prefix
+        .as_deref()
+        .unwrap_or(".")
+        .trim()
+        .trim_start_matches("./");
+    let target_root =
+        match resolve_workspace_path(Path::new(state.workspace.as_ref()), Some(prefix)) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+        };
+
+    if let Err(e) = clear_directory_contents(&target_root) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
+
+    let mut written = 0usize;
+    for file in req.files {
+        let rel = Path::new(&file.path);
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            || is_hidden_or_ignored(rel)
+        {
+            continue;
+        }
+        let bytes = match STANDARD.decode(file.contents_b64.as_bytes()) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let target = target_root.join(rel);
+        if let Some(parent) = target.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+        }
+        if let Err(e) = std::fs::write(&target, bytes) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+        written += 1;
+    }
+
+    (
+        StatusCode::OK,
+        Json(WorkspaceSyncResponse {
+            ok: true,
+            workspace: (*state.workspace).clone(),
+            files_written: written,
+        }),
+    )
+        .into_response()
 }
 
 async fn shell(
@@ -122,8 +317,18 @@ async fn shell(
     }
 
     let task_id = req.task_id.clone();
-    let cwd = req.cwd.unwrap_or_else(|| (*state.workspace).clone());
-    let cwd_for_output = cwd.clone();
+    let cwd = match resolve_workspace_path(Path::new(state.workspace.as_ref()), req.cwd.as_deref())
+    {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    let cwd_for_output = cwd.to_string_lossy().to_string();
     let command = req.command.clone();
     let command_for_output = command.clone();
     let timeout_secs = req.timeout_secs.unwrap_or(30);
@@ -148,12 +353,20 @@ async fn shell(
     .await;
 
     let result = match out {
-        Err(_) => ToolResult::err(ErrorType::Timeout, "command_timeout", &format!("timed out after {timeout_secs}s")),
+        Err(_) => ToolResult::err(
+            ErrorType::Timeout,
+            "command_timeout",
+            &format!("timed out after {timeout_secs}s"),
+        ),
         Ok(Err(e)) => ToolResult::err(ErrorType::Env, "spawn_failed", &e.to_string()),
         Ok(Ok(out)) => {
             let stdout = String::from_utf8_lossy(&out.stdout).to_string();
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
             let exit_code = out.status.code().unwrap_or(-1);
+            let collected_artifacts = collect_requested_artifacts(
+                Path::new(state.workspace.as_ref()),
+                &req.collect_paths,
+            );
             if exit_code == 0 {
                 ToolResult::ok(
                     serde_json::json!({
@@ -163,15 +376,45 @@ async fn shell(
                         "command": command_for_output,
                         "cwd": cwd_for_output,
                         "task_id": task_id,
+                        "workspace": {
+                            "root": (*state.workspace).clone(),
+                            "collected_artifacts": collected_artifacts,
+                        }
                     }),
                     Some(serde_json::json!({
                         "type": "worker_shell",
                         "cwd": cwd_for_output,
-                        "exit_code": exit_code
+                        "exit_code": exit_code,
+                        "collected_artifact_count": req.collect_paths.len(),
                     })),
                 )
             } else {
-                ToolResult::err(ErrorType::Tool, &format!("exit_{exit_code}"), &stderr)
+                ToolResult {
+                    success: false,
+                    error_type: ErrorType::Tool,
+                    error_code: Some(format!("exit_{exit_code}")),
+                    trace: Some(stderr.clone()),
+                    output: Some(serde_json::json!({
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "exit_code": exit_code,
+                        "command": command_for_output,
+                        "cwd": cwd_for_output,
+                        "task_id": task_id,
+                        "workspace": {
+                            "root": (*state.workspace).clone(),
+                            "collected_artifacts": collected_artifacts,
+                        }
+                    })),
+                    checkpoint: Some(serde_json::json!({
+                        "type": "worker_shell",
+                        "cwd": cwd_for_output,
+                        "exit_code": exit_code,
+                        "collected_artifact_count": req.collect_paths.len(),
+                    })),
+                    observed_state_hash: None,
+                    timestamp: chrono::Utc::now(),
+                }
             }
         }
     };
@@ -202,7 +445,14 @@ async fn browser_fetch(
     let resp = match client.get(&req.url).send().await {
         Ok(r) => r,
         Err(e) => {
-            return (StatusCode::OK, Json(ToolResult::err(ErrorType::Tool, "browser_fetch_error", &e.to_string())))
+            return (
+                StatusCode::OK,
+                Json(ToolResult::err(
+                    ErrorType::Tool,
+                    "browser_fetch_error",
+                    &e.to_string(),
+                )),
+            )
                 .into_response()
         }
     };
@@ -211,7 +461,14 @@ async fn browser_fetch(
     let html = match resp.text().await {
         Ok(t) => t,
         Err(e) => {
-            return (StatusCode::OK, Json(ToolResult::err(ErrorType::Tool, "browser_read_error", &e.to_string())))
+            return (
+                StatusCode::OK,
+                Json(ToolResult::err(
+                    ErrorType::Tool,
+                    "browser_read_error",
+                    &e.to_string(),
+                )),
+            )
                 .into_response()
         }
     };
@@ -263,7 +520,9 @@ async fn browser_fetch(
 async fn main() -> anyhow::Result<()> {
     let workspace = std::env::var("WORKER_WORKSPACE").unwrap_or_else(|_| "./workspace".into());
     std::fs::create_dir_all(&workspace)?;
-    let token = std::env::var("WORKER_TOKEN").ok().filter(|s| !s.trim().is_empty());
+    let token = std::env::var("WORKER_TOKEN")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     let state = WorkerState {
         workspace: Arc::new(workspace),
         token,
@@ -271,6 +530,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/workspace/sync", post(sync_workspace))
         .route("/shell", post(shell))
         .route("/browser/fetch", post(browser_fetch))
         .with_state(state);

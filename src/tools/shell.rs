@@ -1,9 +1,13 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 
 use crate::{
     state::{ErrorType, ToolResult},
-    worker::{WorkerClient, WorkerShellRequest},
+    worker::{
+        collect_workspace_files, write_workspace_artifacts, WorkerClient, WorkerShellRequest,
+        WorkspaceSyncRequest,
+    },
 };
 
 use super::Tool;
@@ -26,6 +30,32 @@ fn default_cwd() -> String {
     std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".into())
+}
+
+fn resolve_local_cwd(workspace_root: &Path, requested: Option<&str>) -> PathBuf {
+    let requested = requested.unwrap_or(".");
+    let candidate = if requested.trim().is_empty() || requested.trim() == "." {
+        workspace_root.to_path_buf()
+    } else {
+        let rel = Path::new(requested);
+        if rel.is_absolute() {
+            if rel.starts_with(workspace_root) {
+                rel.to_path_buf()
+            } else {
+                workspace_root.to_path_buf()
+            }
+        } else {
+            workspace_root.join(rel)
+        }
+    };
+
+    if candidate.is_dir() {
+        candidate
+    } else if workspace_root.is_dir() {
+        workspace_root.to_path_buf()
+    } else {
+        PathBuf::from(".")
+    }
 }
 
 #[cfg(not(windows))]
@@ -99,6 +129,20 @@ impl Tool for ShellTool {
 
     /// Execute a command in the server’s shell (PowerShell on Windows, `sh -lc` on POSIX).
     async fn execute(&self, params: Value) -> ToolResult {
+        let workspace_root = params
+            .get("workspace_root")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(default_cwd()));
+        let cwd_requested = params.get("cwd").and_then(|v| v.as_str());
+        let local_cwd = resolve_local_cwd(&workspace_root, cwd_requested);
+        let sync_prefix = local_cwd
+            .strip_prefix(&workspace_root)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| ".".into());
+
         let remote_requested = self.execution_mode.trim().eq_ignore_ascii_case("remote")
             || self.execution_mode.trim().eq_ignore_ascii_case("auto");
         if remote_requested {
@@ -114,19 +158,89 @@ impl Tool for ShellTool {
                             )
                         }
                     };
-                    let cwd = params["cwd"].as_str().map(|s| s.to_string());
                     let timeout_secs = params["timeout_secs"].as_u64();
                     let task_id = params["task_id"].as_str().map(|s| s.to_string());
-                    match worker
-                        .shell(&WorkerShellRequest {
-                            command,
-                            cwd,
-                            timeout_secs,
-                            task_id,
+                    let collect_paths = params
+                        .get("collect_paths")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+
+                    let files = match collect_workspace_files(&local_cwd) {
+                        Ok(files) => files,
+                        Err(e) => {
+                            return ToolResult::err(
+                                ErrorType::Env,
+                                "worker_sync_failed",
+                                &e.to_string(),
+                            )
+                        }
+                    };
+                    if let Err(e) = worker
+                        .sync_workspace(&WorkspaceSyncRequest {
+                            prefix: Some(sync_prefix.clone()),
+                            files,
                         })
                         .await
                     {
-                        Ok(result) => return result,
+                        return ToolResult::err(
+                            ErrorType::Env,
+                            "worker_sync_failed",
+                            &e.to_string(),
+                        );
+                    }
+
+                    match worker
+                        .shell(&WorkerShellRequest {
+                            command,
+                            cwd: Some(sync_prefix.clone()),
+                            timeout_secs,
+                            task_id,
+                            collect_paths,
+                        })
+                        .await
+                    {
+                        Ok(result) => {
+                            if let Some(workspace) = result
+                                .output
+                                .as_ref()
+                                .and_then(|o| o.get("workspace"))
+                                .and_then(|w| w.get("collected_artifacts"))
+                                .and_then(|a| a.as_array())
+                            {
+                                match serde_json::from_value::<
+                                    Vec<crate::worker::WorkspaceArtifactPayload>,
+                                >(serde_json::Value::Array(
+                                    workspace.clone(),
+                                )) {
+                                    Ok(artifacts) => {
+                                        if let Err(e) =
+                                            write_workspace_artifacts(&workspace_root, &artifacts)
+                                        {
+                                            return ToolResult::err(
+                                                ErrorType::Env,
+                                                "artifact_sync_failed",
+                                                &e.to_string(),
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        return ToolResult::err(
+                                            ErrorType::Env,
+                                            "artifact_sync_failed",
+                                            &e.to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                            return result;
+                        }
                         Err(e) => {
                             if self.execution_mode.trim().eq_ignore_ascii_case("remote") {
                                 return ToolResult::err(
@@ -161,16 +275,8 @@ impl Tool for ShellTool {
             .as_str()
             .map(|s| s.to_string())
             .unwrap_or_else(default_cwd);
-        let cwd = if std::path::Path::new(&cwd_requested).is_dir() {
-            cwd_requested.clone()
-        } else {
-            let fallback = default_cwd();
-            if std::path::Path::new(&fallback).is_dir() {
-                fallback
-            } else {
-                ".".into()
-            }
-        };
+        let cwd = resolve_local_cwd(&workspace_root, Some(&cwd_requested));
+        let cwd = cwd.to_string_lossy().to_string();
 
         // Fail fast on OS/shell mismatch so the repair loop can correct the command.
         #[cfg(not(windows))]

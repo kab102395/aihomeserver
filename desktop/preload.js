@@ -1,1 +1,5 @@
-// Intentionally empty: the app uses the hosted web UI directly.
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('aihomeserverLauncher', {
+  openWorkerFolder: (kind) => ipcRenderer.invoke('open-worker-folder', kind),
+});

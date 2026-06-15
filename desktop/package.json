@@ -9,6 +9,7 @@
     "start": "electron .",
     "pack": "electron-builder --dir",
     "dist": "electron-builder --win nsis portable",
+    "dist:both": "electron-builder --win nsis portable",
     "dist:installer": "electron-builder --win nsis",
     "dist:portable": "electron-builder --win portable"
   },
@@ -25,7 +26,14 @@
     "icon": "icon.png",
     "files": [
       "main.js",
-      "preload.js"
+      "preload.js",
+      "hyperv.js"
+    ],
+    "extraResources": [
+      {
+        "from": "../scripts/hyperv-worker.ps1",
+        "to": "scripts/hyperv-worker.ps1"
+      }
     ],
     "win": {
       "signAndEditExecutable": false,

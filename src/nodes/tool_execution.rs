@@ -209,6 +209,35 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
             }
         }
 
+        if is_shell {
+            if let Some(obj) = p.as_object_mut() {
+                if obj.get("workspace_root").and_then(|v| v.as_str()).is_none() {
+                    obj.insert(
+                        "workspace_root".into(),
+                        serde_json::Value::String(state.workspace_path.clone()),
+                    );
+                }
+
+                if obj
+                    .get("collect_paths")
+                    .and_then(|v| v.as_array())
+                    .is_none()
+                {
+                    if let Some(manifest) = &state.execution_manifest {
+                        let paths: Vec<serde_json::Value> = manifest
+                            .expected_artifacts
+                            .iter()
+                            .cloned()
+                            .map(serde_json::Value::String)
+                            .collect();
+                        if !paths.is_empty() {
+                            obj.insert("collect_paths".into(), serde_json::Value::Array(paths));
+                        }
+                    }
+                }
+            }
+        }
+
         if tool_name == "browser" {
             if let Some(obj) = p.as_object_mut() {
                 if obj.get("action").and_then(|v| v.as_str()).is_none() {
@@ -313,7 +342,9 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
                     if let Some(obj) = p.as_object_mut() {
                         obj.insert(
                             "url".into(),
-                            serde_json::Value::String("https://blog.rust-lang.org/releases/".into()),
+                            serde_json::Value::String(
+                                "https://blog.rust-lang.org/releases/".into(),
+                            ),
                         );
                     }
                 }
@@ -327,90 +358,94 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
                 if url_now.starts_with("http") {
                     // continue to defaults (allow_reddit_fallback/max_chars) below
                 } else {
-                // Avoid re-fetching the same page across multiple http_fetch steps.
-                let mut exclude: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for (k, v) in &state.artifacts {
-                    if !k.ends_with("_result") {
-                        continue;
-                    }
-                    // Tool results are stored as the raw output object.
-                    // Older code wrapped outputs under {output:{...}}; support both shapes.
-                    let url = v
-                        .get("output")
-                        .and_then(|o| o.get("url"))
-                        .or_else(|| v.get("url"))
-                        .and_then(|x| x.as_str());
-                    if let Some(u) = url {
-                        exclude.insert(crate::memory::sources::normalize_url(u));
-                    }
-                }
-
-                // Cross-run de-dupe: also exclude URLs fetched recently in past tasks.
-                if let Some(arr) = state
-                    .capabilities
-                    .get("recent_source_urls_normalized")
-                    .and_then(|v| v.as_array())
-                {
-                    for item in arr.iter().filter_map(|v| v.as_str()) {
-                        let t = item.trim();
-                        if !t.is_empty() {
-                            exclude.insert(t.to_string());
+                    // Avoid re-fetching the same page across multiple http_fetch steps.
+                    let mut exclude: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for (k, v) in &state.artifacts {
+                        if !k.ends_with("_result") {
+                            continue;
+                        }
+                        // Tool results are stored as the raw output object.
+                        // Older code wrapped outputs under {output:{...}}; support both shapes.
+                        let url = v
+                            .get("output")
+                            .and_then(|o| o.get("url"))
+                            .or_else(|| v.get("url"))
+                            .and_then(|x| x.as_str());
+                        if let Some(u) = url {
+                            exclude.insert(crate::memory::sources::normalize_url(u));
                         }
                     }
-                }
 
-                let hint_for_pick = if url.is_empty() || url == "FROM_SEARCH_RESULTS" {
-                    state.user_request.as_str()
-                } else {
-                    url.as_str()
-                };
+                    // Cross-run de-dupe: also exclude URLs fetched recently in past tasks.
+                    if let Some(arr) = state
+                        .capabilities
+                        .get("recent_source_urls_normalized")
+                        .and_then(|v| v.as_array())
+                    {
+                        for item in arr.iter().filter_map(|v| v.as_str()) {
+                            let t = item.trim();
+                            if !t.is_empty() {
+                                exclude.insert(t.to_string());
+                            }
+                        }
+                    }
 
-                if let Some(best_url) =
-                    pick_best_url_from_artifacts(&state.artifacts, hint_for_pick, &exclude)
-                {
-                    // Strict gating: if we are resolving a blank/placeholder URL, only accept
-                    // URLs that look like "real pages" (not function docs mistakenly matching
-                    // a token) when the step action implies an official/source fetch.
-                    let action_lower = step.action.to_lowercase();
-                    let wants_official = action_lower.contains("official")
-                        || action_lower.contains("release notes")
-                        || action_lower.contains("changelog");
-                    if wants_official {
-                        let u = best_url.to_lowercase();
-                        let ok = if state.user_request.to_lowercase().contains("rust") {
-                            u.contains("doc.rust-lang.org/") || u.contains("blog.rust-lang.org/")
-                        } else {
-                            // Generic heuristic: avoid deep stdlib pages / API reference pages when the user asked for release notes.
-                            !u.contains("/std/") && !u.contains("/api/")
-                        };
-                        if !ok {
-                            // Force the tool to error rather than fetching nonsense.
-                            if let Some(obj) = p.as_object_mut() {
-                                obj.insert("url".into(), serde_json::Value::String(String::new()));
+                    let hint_for_pick = if url.is_empty() || url == "FROM_SEARCH_RESULTS" {
+                        state.user_request.as_str()
+                    } else {
+                        url.as_str()
+                    };
+
+                    if let Some(best_url) =
+                        pick_best_url_from_artifacts(&state.artifacts, hint_for_pick, &exclude)
+                    {
+                        // Strict gating: if we are resolving a blank/placeholder URL, only accept
+                        // URLs that look like "real pages" (not function docs mistakenly matching
+                        // a token) when the step action implies an official/source fetch.
+                        let action_lower = step.action.to_lowercase();
+                        let wants_official = action_lower.contains("official")
+                            || action_lower.contains("release notes")
+                            || action_lower.contains("changelog");
+                        if wants_official {
+                            let u = best_url.to_lowercase();
+                            let ok = if state.user_request.to_lowercase().contains("rust") {
+                                u.contains("doc.rust-lang.org/")
+                                    || u.contains("blog.rust-lang.org/")
+                            } else {
+                                // Generic heuristic: avoid deep stdlib pages / API reference pages when the user asked for release notes.
+                                !u.contains("/std/") && !u.contains("/api/")
+                            };
+                            if !ok {
+                                // Force the tool to error rather than fetching nonsense.
+                                if let Some(obj) = p.as_object_mut() {
+                                    obj.insert(
+                                        "url".into(),
+                                        serde_json::Value::String(String::new()),
+                                    );
+                                }
+                            } else if let Some(obj) = p.as_object_mut() {
+                                obj.insert("url".into(), serde_json::Value::String(best_url));
                             }
                         } else if let Some(obj) = p.as_object_mut() {
                             obj.insert("url".into(), serde_json::Value::String(best_url));
                         }
-                    } else if let Some(obj) = p.as_object_mut() {
-                        obj.insert("url".into(), serde_json::Value::String(best_url));
-                    }
-                } else {
-                    // Final fallback for Rust release-note requests.
-                    let hint_lower = hint_for_pick.to_lowercase();
-                    if hint_lower.contains("rust")
-                        && (hint_lower.contains("release") || hint_lower.contains("changelog"))
-                    {
-                        if let Some(obj) = p.as_object_mut() {
-                            obj.insert(
-                                "url".into(),
-                                serde_json::Value::String(
-                                    "https://doc.rust-lang.org/stable/releases.html".into(),
-                                ),
-                            );
+                    } else {
+                        // Final fallback for Rust release-note requests.
+                        let hint_lower = hint_for_pick.to_lowercase();
+                        if hint_lower.contains("rust")
+                            && (hint_lower.contains("release") || hint_lower.contains("changelog"))
+                        {
+                            if let Some(obj) = p.as_object_mut() {
+                                obj.insert(
+                                    "url".into(),
+                                    serde_json::Value::String(
+                                        "https://doc.rust-lang.org/stable/releases.html".into(),
+                                    ),
+                                );
+                            }
                         }
                     }
-                }
                 }
             }
 
@@ -472,7 +507,10 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
                                     if let Some(chaps) =
                                         book.get("chapters").and_then(|c| c.as_array())
                                     {
-                                        obj.insert("chapters".into(), serde_json::Value::Array(chaps.clone()));
+                                        obj.insert(
+                                            "chapters".into(),
+                                            serde_json::Value::Array(chaps.clone()),
+                                        );
                                     }
                                 }
                             }
@@ -571,7 +609,9 @@ pub async fn run(mut state: SystemState, tools: &Arc<ToolRegistry>) -> Result<Sy
                     urls.dedup();
                     obj.insert(
                         "sources".into(),
-                        serde_json::Value::Array(urls.into_iter().map(serde_json::Value::String).collect()),
+                        serde_json::Value::Array(
+                            urls.into_iter().map(serde_json::Value::String).collect(),
+                        ),
                     );
                 }
             }
@@ -857,7 +897,9 @@ fn pick_best_url_from_artifacts(
                 if u.contains("doc.rust-lang.org/stable/releases.html") {
                     return 40;
                 }
-                if u.contains("blog.rust-lang.org") && (u.contains("announcing-rust") || u.contains("/releases")) {
+                if u.contains("blog.rust-lang.org")
+                    && (u.contains("announcing-rust") || u.contains("/releases"))
+                {
                     return 36;
                 }
                 if u.contains("blog.rust-lang.org") {
@@ -983,12 +1025,12 @@ fn pick_best_url_from_artifacts(
         s
     };
 
-        // Prefer not-yet-fetched URLs, but never fail outright if everything is excluded.
-        let best_new = candidates
-            .iter()
-            .filter(|u| !exclude.contains(&crate::memory::sources::normalize_url(u)))
-            .max_by_key(score_key)
-            .cloned();
+    // Prefer not-yet-fetched URLs, but never fail outright if everything is excluded.
+    let best_new = candidates
+        .iter()
+        .filter(|u| !exclude.contains(&crate::memory::sources::normalize_url(u)))
+        .max_by_key(score_key)
+        .cloned();
 
     if best_new.is_some() {
         return best_new;

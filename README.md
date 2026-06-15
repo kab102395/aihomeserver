@@ -547,6 +547,12 @@ docker compose up --build
 - `searxng` is only accessible to the agent container (not exposed to the host network)
 - Ollama is reached via `http://host.docker.internal:11434` (Docker host networking)
 - Workspace files are persisted to a Docker volume
+- On Windows, the desktop launcher can provision a Hyper-V worker VM and point the coordinator at it automatically.
+- If you want the Docker worker instead of Hyper-V, start the worker profile explicitly:
+
+```bash
+docker compose --profile worker up --build
+```
 
 **NVIDIA GPU support:**
 
