@@ -5,6 +5,7 @@ const https = require('node:https');
 const path = require('node:path');
 
 const DEFAULT_URL = process.env.AIHOMESERVER_URL || 'http://127.0.0.1:3000';
+const APP_NAME = 'AI Home Server';
 const AUTO_START_DOCKER = process.env.AIHOMESERVER_AUTO_START_DOCKER !== '0';
 const COMPOSE_DIR = process.env.AIHOMESERVER_COMPOSE_DIR || path.join(__dirname, '..');
 const COMPOSE_FILES = (process.env.AIHOMESERVER_COMPOSE_FILES || 'docker-compose.yml,docker-compose.dev.yml')
@@ -79,7 +80,7 @@ function createWindow() {
     width: 1600,
     height: 1000,
     backgroundColor: '#111111',
-    title: 'aihomeserver',
+    title: APP_NAME,
     autoHideMenuBar: true,
     webPreferences: {
       contextIsolation: true,
@@ -98,7 +99,7 @@ function loadStartingPage(win, message, detail = 'The desktop app is waiting for
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>aihomeserver</title>
+  <title>${APP_NAME}</title>
     <style>
       body {
         margin: 0;
@@ -146,7 +147,7 @@ async function bootstrap() {
   win.hide();
   await loadStartingPage(
     win,
-    'Starting aihomeserver',
+    `Starting ${APP_NAME}`,
     AUTO_START_DOCKER
       ? 'The desktop app is starting the local Docker stack and waiting for the web server to come online.'
       : 'The desktop app is waiting for an already-running web server to become available.'
@@ -176,19 +177,19 @@ async function bootstrap() {
 
   await loadStartingPage(
     win,
-    AUTO_START_DOCKER ? 'aihomeserver is not responding yet' : 'aihomeserver is not running'
+    AUTO_START_DOCKER ? `${APP_NAME} is not responding yet` : `${APP_NAME} is not running`
   );
 }
 
 app.whenReady().then(() => {
   bootstrap().catch((error) => {
-    dialog.showErrorBox('aihomeserver desktop launcher failed', error.stack || error.message);
+    dialog.showErrorBox(`${APP_NAME} desktop launcher failed`, error.stack || error.message);
   });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       bootstrap().catch((error) => {
-        dialog.showErrorBox('aihomeserver desktop launcher failed', error.stack || error.message);
+        dialog.showErrorBox(`${APP_NAME} desktop launcher failed`, error.stack || error.message);
       });
     }
   });

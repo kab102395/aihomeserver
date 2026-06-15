@@ -2,6 +2,8 @@
   "name": "aihomeserver-desktop",
   "private": true,
   "version": "0.1.0",
+  "description": "Desktop launcher for AI Home Server",
+  "author": "kab102395",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -16,10 +18,11 @@
   },
   "build": {
     "appId": "com.kab102395.aihomeserver.desktop",
-    "productName": "aihomeserver",
+    "productName": "AI Home Server",
     "directories": {
       "output": "dist"
     },
+    "icon": "icon.png",
     "files": [
       "main.js",
       "preload.js"
@@ -32,12 +35,16 @@
       ]
     },
     "nsis": {
+      "artifactName": "AI Home Server Setup ${version}.${ext}",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "perMachine": false,
       "packElevateHelper": false
+    },
+    "portable": {
+      "artifactName": "AI Home Server Portable ${version}.${ext}"
     }
   }
 }
