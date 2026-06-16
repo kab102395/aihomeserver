@@ -22,7 +22,11 @@
       "Bash(powershell -Command \"Get-Process aihomeserver -ErrorAction SilentlyContinue | Select-Object Id,Name; Stop-Process -Name aihomeserver -Force -ErrorAction SilentlyContinue; Write-Host 'done'\")",
       "Bash(curl -s -X POST http://localhost:8080/run -H 'Content-Type: application/json' -d '{\"request\": \"write a file called hello.txt containing Hello from aihomeserver!\"}')",
       "Bash(powershell -Command \"Stop-Process -Name aihomeserver -Force -ErrorAction SilentlyContinue; Write-Host 'killed'\")",
-      "Bash(powershell -Command \"Get-NetTCPConnection -LocalPort 8080 -ErrorAction SilentlyContinue | Select-Object OwningProcess; Stop-Process -Id \\(Get-NetTCPConnection -LocalPort 8080 -ErrorAction SilentlyContinue\\).OwningProcess -Force -ErrorAction SilentlyContinue; Write-Host 'done'\")"
+      "Bash(powershell -Command \"Get-NetTCPConnection -LocalPort 8080 -ErrorAction SilentlyContinue | Select-Object OwningProcess; Stop-Process -Id \\(Get-NetTCPConnection -LocalPort 8080 -ErrorAction SilentlyContinue\\).OwningProcess -Force -ErrorAction SilentlyContinue; Write-Host 'done'\")",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\kab10\\\\aihomeserver\\\\src\" -Recurse -File)",
+      "Bash(Select-Object FullName)",
+      "Bash(ConvertTo-Csv -NoTypeInformation)",
+      "Bash(Format-List)"
     ]
   }
 }

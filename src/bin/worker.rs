@@ -122,15 +122,33 @@ struct HealthResponse {
     workspace: String,
 }
 
-fn require_auth(headers: &axum::http::HeaderMap, token: &Option<String>) -> bool {
+enum AuthStatus {
+    Allowed,
+    NoHeader,
+    Mismatch,
+}
+
+fn check_auth(headers: &axum::http::HeaderMap, token: &Option<String>) -> AuthStatus {
     match token {
-        None => true,
-        Some(expected) => headers
+        None => AuthStatus::Allowed,
+        Some(expected) => match headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s == format!("Bearer {expected}"))
-            .unwrap_or(false),
+        {
+            None => AuthStatus::NoHeader,
+            Some(s) if s == format!("Bearer {expected}") => AuthStatus::Allowed,
+            Some(_) => AuthStatus::Mismatch,
+        },
     }
+}
+
+fn reject_unauthorized(reason: &str) -> axum::response::Response {
+    eprintln!("[worker] auth rejected: {reason}");
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({ "error": "unauthorized" })),
+    )
+        .into_response()
 }
 
 fn is_hidden_or_ignored(path: &Path) -> bool {
@@ -223,12 +241,10 @@ async fn sync_workspace(
     headers: axum::http::HeaderMap,
     Json(req): Json<WorkspaceSyncRequest>,
 ) -> impl IntoResponse {
-    if !require_auth(&headers, &state.token) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "unauthorized" })),
-        )
-            .into_response();
+    match check_auth(&headers, &state.token) {
+        AuthStatus::Allowed => {}
+        AuthStatus::NoHeader => return reject_unauthorized("no Authorization header"),
+        AuthStatus::Mismatch => return reject_unauthorized("token mismatch"),
     }
 
     let prefix = req
@@ -308,12 +324,10 @@ async fn shell(
     headers: axum::http::HeaderMap,
     Json(req): Json<ShellRequest>,
 ) -> impl IntoResponse {
-    if !require_auth(&headers, &state.token) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "unauthorized" })),
-        )
-            .into_response();
+    match check_auth(&headers, &state.token) {
+        AuthStatus::Allowed => {}
+        AuthStatus::NoHeader => return reject_unauthorized("no Authorization header"),
+        AuthStatus::Mismatch => return reject_unauthorized("token mismatch"),
     }
 
     let task_id = req.task_id.clone();
@@ -427,12 +441,10 @@ async fn browser_fetch(
     headers: axum::http::HeaderMap,
     Json(req): Json<BrowserFetchRequest>,
 ) -> impl IntoResponse {
-    if !require_auth(&headers, &state.token) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "unauthorized" })),
-        )
-            .into_response();
+    match check_auth(&headers, &state.token) {
+        AuthStatus::Allowed => {}
+        AuthStatus::NoHeader => return reject_unauthorized("no Authorization header"),
+        AuthStatus::Mismatch => return reject_unauthorized("token mismatch"),
     }
 
     let client = reqwest::Client::builder()
@@ -525,8 +537,14 @@ async fn main() -> anyhow::Result<()> {
         .filter(|s| !s.trim().is_empty());
     let state = WorkerState {
         workspace: Arc::new(workspace),
-        token,
+        token: token.clone(),
     };
+
+    let auth_desc = match &token {
+        None => "none (open access)".to_string(),
+        Some(t) => format!("configured (len={}, fp={}...)", t.len(), &t[..t.len().min(8)]),
+    };
+    eprintln!("[worker] auth: {auth_desc}");
 
     let app = Router::new()
         .route("/health", get(health))

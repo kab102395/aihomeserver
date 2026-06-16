@@ -36,14 +36,26 @@ fn in_container() -> bool {
 /// - The executor asks the LLM to emit a *single* JSON object describing the tool call.
 /// - The tool_execution node parses and executes that call, so this prompt is the
 ///   schema contract between reasoning and side effects.
-fn system_prompt_tool(workspace_path: &str) -> String {
+fn system_prompt_tool(workspace_path: &str, has_remote_worker: bool) -> String {
     let os = std::env::consts::OS;
-    let shell_hint = if os == "windows" {
-        "PowerShell (powershell -NoProfile -NonInteractive -Command ...)"
-    } else {
-        "POSIX sh (sh -lc ...)"
-    };
     let in_container = in_container();
+
+    let shell_section = if has_remote_worker {
+        r#"SHELL TOOL RULES:
+- Shell commands run INSIDE the Ubuntu 24.04 Linux VM worker — NOT in the coordinator process or Docker container.
+- Always use POSIX/bash syntax: &&, ||, |, $(), backticks, head, tail, grep, sed, awk, curl, etc.
+- Never use PowerShell syntax (Get-ChildItem, Select-Object, $env:VAR, Write-Host).
+- The VM has: bash, python3, curl, wget, git, apt, standard POSIX tools.
+- Prefer simple commands. Truncate long output with `| head -n 50`.
+- Do NOT use `docker exec` — the VM is not a Docker container."#
+    } else {
+        r#"SHELL TOOL RULES:
+- The shell tool runs commands in the coordinator process environment (Linux sh -lc or Windows PowerShell).
+- Use syntax appropriate to the runtime OS shown in RUNTIME CONTEXT above.
+- On Linux/macOS: avoid PowerShell cmdlets (Select-Object, Get-ChildItem, $env:VAR).
+- On Windows: avoid bash-only syntax ($(), backticks, GNU flags).
+- Prefer simple commands. Truncate with `| head -n 20` (Linux) or `| Select-Object -First 20` (Windows)."#
+    };
 
     format!(
         r#"You are a tool call generator.
@@ -51,21 +63,12 @@ Output ONLY a JSON object describing the tool call. No prose, no markdown.
 {{ "tool": "tool_name", "params": {{ ... }} }}
 
 RUNTIME CONTEXT:
-- runtime_os: {os}
-- shell_backend: {shell_hint}
-- in_container: {in_container}
+- coordinator_os: {os}
+- coordinator_in_container: {in_container}
+- has_remote_vm_worker: {has_remote_worker}
 - workspace_path: {workspace_path}
 
-SHELL TOOL RULES:
-- The shell tool runs commands on the SAME OS/environment as this server process.
-  If the server runs inside Docker, your shell commands run inside that container.
-- Do NOT use `docker exec ...` unless you are certain the `docker` CLI exists AND you need to target a *different* container.
-- Use syntax appropriate to the runtime OS.
-  - On Linux/macOS: avoid PowerShell-only cmdlets like `Select-Object`, `Get-ChildItem`, `$env:VAR`.
-  - On Windows: avoid bash-only command substitution like `$()`, backticks, and GNU-only flags.
-- Prefer simple commands and avoid unnecessary pipes. If you must truncate output:
-  - Linux/macOS: `| head -n 20`
-  - Windows: `| Select-Object -First 20`
+{shell_section}
 
 FILESYSTEM TOOL RULES:
 - The filesystem tool is rooted at `workspace_path`. Paths are relative to that root.
@@ -338,9 +341,22 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
         }
     }
 
+    let has_remote_worker = state
+        .capabilities
+        .get("execution_mode")
+        .and_then(|v| v.as_str())
+        .map(|m| m.eq_ignore_ascii_case("remote") || m.eq_ignore_ascii_case("auto"))
+        .unwrap_or(false)
+        || state
+            .capabilities
+            .get("worker_url")
+            .and_then(|v| v.as_str())
+            .map(|u| !u.trim().is_empty())
+            .unwrap_or(false);
+
     let system_prompt = if has_tool {
         // For coding tool steps, append adapter-specific rules
-        let base = system_prompt_tool(&state.workspace_path);
+        let base = system_prompt_tool(&state.workspace_path, has_remote_worker);
         if state.coding_intent.is_some() {
             let adapter_addition = state
                 .artifacts

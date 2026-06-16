@@ -199,21 +199,58 @@ async fn main() -> Result<()> {
     let worker_client = if cfg.worker_url.trim().is_empty() {
         None
     } else {
+        let token_desc = if cfg.worker_token.trim().is_empty() {
+            "none (open access)".to_string()
+        } else {
+            let fp = &cfg.worker_token[..cfg.worker_token.len().min(8)];
+            format!("configured (len={}, fp={fp}...)", cfg.worker_token.len())
+        };
+        info!("Worker URL: {} | token: {}", cfg.worker_url, token_desc);
+
         match WorkerClient::new(cfg.worker_url.clone(), cfg.worker_token.clone()) {
             Ok(client) => {
-                if let Ok(health) = client.health().await {
-                    info!(
-                        "Worker online: {} (workspace={})",
-                        health.ok,
-                        health.workspace.unwrap_or_default()
-                    );
-                } else {
-                    info!("Worker configured but health check failed: {}", cfg.worker_url);
+                match client.health().await {
+                    Ok(health) => {
+                        info!(
+                            "Worker health: ok={} workspace={}",
+                            health.ok,
+                            health.workspace.unwrap_or_default()
+                        );
+                        // Only probe authenticated execution when a token is configured.
+                        // An open-access worker skips this; a token-protected worker must
+                        // accept the probe or coordinator startup will log the mismatch.
+                        if !cfg.worker_token.trim().is_empty() {
+                            let probe = crate::worker::WorkerShellRequest {
+                                command: "echo aihomeserver-auth-probe".into(),
+                                cwd: Some(".".into()),
+                                timeout_secs: Some(10),
+                                task_id: None,
+                                collect_paths: vec![],
+                            };
+                            match client.shell(&probe).await {
+                                Ok(result) if result.success => {
+                                    info!("Worker auth probe: ok");
+                                }
+                                Ok(result) => {
+                                    info!(
+                                        "Worker auth probe failed: error_type={:?} trace={:?}",
+                                        result.error_type, result.trace
+                                    );
+                                }
+                                Err(e) => {
+                                    info!("Worker auth probe error: {e}");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        info!("Worker health check failed: {e}");
+                    }
                 }
                 Some(client)
             }
             Err(e) => {
-                info!("Worker client disabled: {}", e);
+                info!("Worker client disabled: {e}");
                 None
             }
         }

@@ -1052,12 +1052,14 @@ async fn run_task(State(app): State<AppState>, Json(req): Json<RunRequest>) -> i
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "unknown".into());
-        let (search_url, auto_kb_mode, auto_kb_min_chars) = {
+        let (search_url, auto_kb_mode, auto_kb_min_chars, execution_mode, worker_url) = {
             let cfg = app2.config.read().await;
             (
                 cfg.search_url.clone(),
                 cfg.auto_kb_mode.clone(),
                 cfg.auto_kb_min_chars,
+                cfg.execution_mode.clone(),
+                cfg.worker_url.clone(),
             )
         };
         let recent_sources = if crate::grounding::request_needs_grounding(&request_text) {
@@ -1078,6 +1080,8 @@ async fn run_task(State(app): State<AppState>, Json(req): Json<RunRequest>) -> i
             "recent_source_urls_normalized": recent_sources,
             "auto_kb_mode": auto_kb_mode,
             "auto_kb_min_chars": auto_kb_min_chars,
+            "execution_mode": execution_mode,
+            "worker_url": worker_url,
         });
 
         let result = app2.orchestrator.run(initial).await;
@@ -1783,12 +1787,14 @@ async fn run_stream(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "unknown".into());
-        let (search_url, auto_kb_mode, auto_kb_min_chars) = {
+        let (search_url, auto_kb_mode, auto_kb_min_chars, execution_mode, worker_url) = {
             let cfg = app2.config.read().await;
             (
                 cfg.search_url.clone(),
                 cfg.auto_kb_mode.clone(),
                 cfg.auto_kb_min_chars,
+                cfg.execution_mode.clone(),
+                cfg.worker_url.clone(),
             )
         };
         initial.capabilities = serde_json::json!({
@@ -1800,6 +1806,8 @@ async fn run_stream(
             "search_url_configured": !search_url.trim().is_empty(),
             "auto_kb_mode": auto_kb_mode,
             "auto_kb_min_chars": auto_kb_min_chars,
+            "execution_mode": execution_mode,
+            "worker_url": worker_url,
         });
 
         let result = app2

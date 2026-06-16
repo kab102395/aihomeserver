@@ -35,8 +35,9 @@ fn in_container() -> bool {
 }
 
 const SYSTEM_PROMPT: &str = r#"You are the planning brain of aihomeserver — a local AI assistant running on Kyle's home server.
-You have full access to the local machine: filesystem, shell, git, and the web.
-You remember past conversations and learn from previous tasks via semantic memory.
+You have a sandboxed Ubuntu 24.04 Linux VM (the "worker") where you can freely run shell commands, install packages, build code, and browse the web.
+The worker VM has: bash, python3, standard POSIX tools, and internet access.
+You also have access to: filesystem (workspace), git, web search, and web fetch.
 When asked "what can you do", "what tools do you have", or similar — plan a single LLM-only step that answers from the identity above.
 
 Your job is to decide whether a request needs tool use or can be answered directly by an LLM.
@@ -123,14 +124,14 @@ USE "filesystem" when you need to inspect or modify files in the workspace.
   prefer writing files into the workspace (one file per script) via the filesystem tool,
   then return an "answer" step that points to the created file paths.
 
-USE "shell" only when explicitly asked to run a command or script.
+USE "shell" to run commands in the Ubuntu 24.04 VM sandbox.
   {"command":"the command","timeout_secs":30,"cwd":"optional"}
-  IMPORTANT: The shell tool runs PowerShell on Windows and sh -lc on Linux/macOS.
-  Use syntax appropriate to the runtime OS shown in the planning context ("Runtime OS: ...").
-  Prefer chaining with semicolons (portable): cmd1 ; cmd2
-  If you must truncate output:
-    - Linux/macOS: ... | head -n 20
-    - Windows:     ... | Select-Object -First 20
+  IMPORTANT: Shell commands ALWAYS run inside the Ubuntu 24.04 Linux VM worker — never on the coordinator host or Docker container.
+  Always use POSIX/bash syntax: &&, |, $(), backticks, head, tail, grep, etc.
+  Never use PowerShell syntax (Get-ChildItem, Select-Object, $env:) — the VM is Linux.
+  Use shell proactively for: running code, inspecting the VM environment, installing packages,
+  building projects, fetching URLs with curl, checking system state.
+  You do NOT need to be "explicitly asked" — if a task is better done by running a command, use shell.
 
 USE "git" only when explicitly asked about git history, status, or commits.
   {"action":"status"} / {"action":"log","n":10} / {"action":"commit","message":"msg"}
@@ -362,7 +363,28 @@ fn build_context(state: &SystemState) -> String {
         Utc::now().to_rfc3339()
     ));
     ctx.push_str(&format!("In container: {}\n", in_container()));
-    ctx.push_str("Shell tool backend: PowerShell on Windows; sh -lc on Linux/macOS.\n");
+    // Determine whether a remote worker VM is active from capabilities JSON.
+    // When execution_mode=remote, shell commands run inside the VM, not the coordinator.
+    let has_remote_worker = state
+        .capabilities
+        .get("execution_mode")
+        .and_then(|v| v.as_str())
+        .map(|m| m.eq_ignore_ascii_case("remote") || m.eq_ignore_ascii_case("auto"))
+        .unwrap_or(false)
+        || state
+            .capabilities
+            .get("worker_url")
+            .and_then(|v| v.as_str())
+            .map(|u| !u.trim().is_empty())
+            .unwrap_or(false);
+
+    if has_remote_worker {
+        ctx.push_str("Execution environment: Shell commands run INSIDE the Ubuntu 24.04 Linux VM worker. ");
+        ctx.push_str("NOT inside the coordinator Docker container. Always use POSIX/bash syntax.\n");
+        ctx.push_str("The VM has: bash, python3, curl, wget, git, standard POSIX tools, and internet access.\n");
+    } else {
+        ctx.push_str("Shell tool backend: sh -lc on Linux/macOS; PowerShell on Windows.\n");
+    }
     if !state.capabilities.is_null() {
         ctx.push_str(&format!(
             "Runtime capabilities (preflight): {}\n",
