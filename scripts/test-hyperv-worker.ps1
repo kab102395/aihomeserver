@@ -11,7 +11,15 @@ param(
     [string]$ImageVersion = '24.04',
     [string]$WorkspacePath = '/workspace',
     [switch]$Reset,
-    [switch]$KeepRunning
+    [switch]$KeepRunning,
+
+    # Token source (pick exactly one; default is standalone — generate fresh token):
+    # -WorkerToken <value>   : use the supplied literal token
+    # -TokenFile <path>      : read token from the given file (e.g. launcher's worker-token.txt)
+    # -UseLauncherToken      : read from the default Electron app-data path
+    [string]$WorkerToken = '',
+    [string]$TokenFile = '',
+    [switch]$UseLauncherToken
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,11 +44,41 @@ function Invoke-WorkerScript {
     )
 
     $scriptPath = Join-Path $PSScriptRoot 'hyperv-worker.ps1'
-    $output = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $scriptPath @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw ($output | Out-String)
+    $stdoutPath = [System.IO.Path]::GetTempFileName()
+    $stderrPath = [System.IO.Path]::GetTempFileName()
+    try {
+        $argumentList = @(
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            $scriptPath
+        ) + $Arguments
+        $process = Start-Process powershell.exe -PassThru -WindowStyle Hidden -ArgumentList $argumentList -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -Wait
+
+        $stdout = if (Test-Path $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue } else { '' }
+        $stderr = if (Test-Path $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue } else { '' }
+
+        $lastJsonLine = ($stdout -split "`n" |
+            Where-Object { $_.Trim().StartsWith('{') } |
+            Select-Object -Last 1)
+        $succeededByContract = $false
+        if ($lastJsonLine) {
+            try {
+                $parsed = $lastJsonLine | ConvertFrom-Json
+                $succeededByContract = ($parsed.ok -eq $true)
+            } catch {}
+        }
+
+        if (-not $succeededByContract -and $process.ExitCode -ne 0) {
+            throw (($stdout + "`n" + $stderr).Trim())
+        }
+
+        return (($stdout + "`n" + $stderr).Trim())
+    } finally {
+        Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
     }
-    return $output
 }
 
 function Invoke-WorkerScriptTracked {
@@ -82,10 +120,28 @@ function Invoke-WorkerScriptTracked {
             Write-Step "$StepName is still running..."
         }
 
+        $process.WaitForExit()
+
         $stdout = if (Test-Path $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue } else { '' }
         $stderr = if (Test-Path $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue } else { '' }
-        if ($process.ExitCode -ne 0) {
-            throw (($stdout + "`n" + $stderr).Trim())
+
+        # The contract signal is the last JSON line in stdout containing "ok":true.
+        # Treat that as success regardless of exit code: PowerShell propagates
+        # $LASTEXITCODE from native commands (e.g. wsl --unmount in a finally block)
+        # as the process exit code even when the script itself ran to completion.
+        $lastJsonLine = ($stdout -split "`n" |
+            Where-Object { $_.Trim().StartsWith('{') } |
+            Select-Object -Last 1)
+        $succeededByContract = $false
+        if ($lastJsonLine) {
+            try {
+                $parsed = $lastJsonLine | ConvertFrom-Json
+                $succeededByContract = ($parsed.ok -eq $true)
+            } catch {}
+        }
+
+        if (-not $succeededByContract -and $process.ExitCode -ne 0) {
+            throw "Exit $($process.ExitCode)`n$(($stdout + "`n" + $stderr).Trim())"
         }
         return $stdout
     } finally {
@@ -143,6 +199,26 @@ function Reset-WorkerState {
     }
 }
 
+function Invoke-WorkerPost {
+    param(
+        [string]$BaseUrl,
+        [string]$Path,
+        [hashtable]$Body,
+        [string]$Token
+    )
+
+    $headers = @{ 'Content-Type' = 'application/json' }
+    if ($Token) {
+        $headers['Authorization'] = "Bearer $Token"
+    }
+    $json = $Body | ConvertTo-Json -Depth 8 -Compress
+    $resp = Invoke-WebRequest -Uri "$BaseUrl$Path" -Method Post -Headers $headers -Body $json -UseBasicParsing -TimeoutSec 30
+    if ($resp.StatusCode -lt 200 -or $resp.StatusCode -ge 300) {
+        throw "$Path returned HTTP $($resp.StatusCode)"
+    }
+    return $resp.Content | ConvertFrom-Json
+}
+
 function Ensure-HealthyWorker {
     param(
         [string]$VmIp,
@@ -162,6 +238,112 @@ function Ensure-HealthyWorker {
     }
 
     Write-Host $health.Content
+}
+
+function Test-ShellRoundTrip {
+    param(
+        [string]$VmIp,
+        [int]$WorkerPort,
+        [string]$Token
+    )
+
+    $baseUrl = "http://$VmIp`:$WorkerPort"
+    $sentinel = "aihomeserver-test-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+
+    Write-Step "Shell round-trip: echo sentinel value"
+    $result = Invoke-WorkerPost -BaseUrl $baseUrl -Path '/shell' -Token $Token -Body @{
+        command      = "echo $sentinel"
+        cwd          = '.'
+        timeout_secs = 15
+    }
+
+    if (-not $result.success) {
+        throw "Shell command failed: error_type=$($result.error_type) trace=$($result.trace)"
+    }
+    $stdout = $result.output.stdout.Trim()
+    if ($stdout -ne $sentinel) {
+        throw "Shell stdout mismatch: expected '$sentinel', got '$stdout'"
+    }
+    Write-Host "  stdout: $stdout  [ok]"
+
+    Write-Step "Shell round-trip: exit code propagation"
+    $failResult = Invoke-WorkerPost -BaseUrl $baseUrl -Path '/shell' -Token $Token -Body @{
+        command      = 'exit 42'
+        cwd          = '.'
+        timeout_secs = 10
+    }
+    if ($failResult.success) {
+        throw "Expected success=false for exit 42, got success=true"
+    }
+    if ($failResult.error_code -ne 'exit_42') {
+        throw "Expected error_code=exit_42, got $($failResult.error_code)"
+    }
+    Write-Host "  exit_code propagation: exit_42  [ok]"
+}
+
+function Test-WorkspaceSync {
+    param(
+        [string]$VmIp,
+        [int]$WorkerPort,
+        [string]$Token
+    )
+
+    $baseUrl = "http://$VmIp`:$WorkerPort"
+    $testContent = "hello from host $(Get-Date -Format 'o')"
+    $contentsB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($testContent))
+
+    Write-Step "Workspace sync: push a file to /workspace"
+    $syncResult = Invoke-WorkerPost -BaseUrl $baseUrl -Path '/workspace/sync' -Token $Token -Body @{
+        files = @(
+            @{ path = 'e2e-test/probe.txt'; contents_b64 = $contentsB64 }
+        )
+    }
+    if (-not $syncResult.ok) {
+        throw "workspace/sync returned ok=false"
+    }
+    if ($syncResult.files_written -ne 1) {
+        throw "Expected files_written=1, got $($syncResult.files_written)"
+    }
+    Write-Host "  files_written: $($syncResult.files_written)  [ok]"
+
+    Write-Step "Workspace sync: verify file content via shell"
+    $readResult = Invoke-WorkerPost -BaseUrl $baseUrl -Path '/shell' -Token $Token -Body @{
+        command      = 'cat e2e-test/probe.txt'
+        cwd          = '.'
+        timeout_secs = 10
+    }
+    if (-not $readResult.success) {
+        throw "cat probe.txt failed: $($readResult.trace)"
+    }
+    $actual = $readResult.output.stdout.Trim()
+    if ($actual -ne $testContent) {
+        throw "probe.txt content mismatch: expected '$testContent', got '$actual'"
+    }
+    Write-Host "  file content verified  [ok]"
+
+    Write-Step "Workspace sync: collect artifact back via collect_paths"
+    $collectResult = Invoke-WorkerPost -BaseUrl $baseUrl -Path '/shell' -Token $Token -Body @{
+        command       = 'echo done'
+        cwd           = '.'
+        timeout_secs  = 10
+        collect_paths = @('e2e-test/probe.txt')
+    }
+    if (-not $collectResult.success) {
+        throw "collect_paths shell call failed: $($collectResult.trace)"
+    }
+    $artifacts = $collectResult.output.workspace.collected_artifacts
+    if (-not $artifacts -or $artifacts.Count -eq 0) {
+        throw "No artifacts returned in collect_paths response"
+    }
+    $artifact = $artifacts | Where-Object { $_.path -eq 'e2e-test/probe.txt' } | Select-Object -First 1
+    if (-not $artifact) {
+        throw "e2e-test/probe.txt not found in collected_artifacts"
+    }
+    $decoded = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($artifact.contents_b64))
+    if ($decoded -ne $testContent) {
+        throw "Artifact content mismatch: expected '$testContent', got '$decoded'"
+    }
+    Write-Host "  artifact round-trip verified  [ok]"
 }
 
 function Write-Diagnostics {
@@ -211,7 +393,35 @@ if ($Reset) {
     Reset-WorkerState -VmName $VmName -SwitchName $SwitchName -VmGateway $VmGateway
 }
 
-$workerToken = ([guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'))
+# ── Token resolution ──────────────────────────────────────────────────────────
+# Standalone mode (default): generate a fresh token and fully own the bootstrap.
+# Attached modes: read the persisted launcher token so auth matches the live app.
+$resolvedToken = ''
+if ($WorkerToken) {
+    $resolvedToken = $WorkerToken.Trim()
+    Write-Step "Token: supplied via -WorkerToken (fp=$($resolvedToken.Substring(0, [Math]::Min(8, $resolvedToken.Length)))...)"
+} elseif ($TokenFile) {
+    if (-not (Test-Path $TokenFile)) {
+        throw "Token file not found: $TokenFile"
+    }
+    $resolvedToken = (Get-Content -LiteralPath $TokenFile -Raw).Trim()
+    Write-Step "Token: loaded from $TokenFile (fp=$($resolvedToken.Substring(0, [Math]::Min(8, $resolvedToken.Length)))...)"
+} elseif ($UseLauncherToken) {
+    $launcherTokenPath = Join-Path $env:APPDATA 'aihomeserver\worker-token.txt'
+    if (-not (Test-Path $launcherTokenPath)) {
+        throw "Launcher token file not found: $launcherTokenPath (launch the app at least once to create it)"
+    }
+    $resolvedToken = (Get-Content -LiteralPath $launcherTokenPath -Raw).Trim()
+    Write-Step "Token: loaded from launcher app-data (fp=$($resolvedToken.Substring(0, [Math]::Min(8, $resolvedToken.Length)))...)"
+} else {
+    $resolvedToken = ([guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'))
+    Write-Step "Token: generated fresh for standalone run (fp=$($resolvedToken.Substring(0, [Math]::Min(8, $resolvedToken.Length)))...)"
+}
+
+if (-not $resolvedToken) {
+    throw 'Worker token is empty; cannot run authenticated tests'
+}
+$workerToken = $resolvedToken
 
 Write-Step 'Bootstrapping worker VM'
     try {
@@ -247,6 +457,23 @@ $statusOutput = Invoke-WorkerScript -Arguments @(
 Write-Host $statusOutput
 
 Ensure-HealthyWorker -VmIp $VmIp -WorkerPort $WorkerPort
+
+Write-Step 'Verifying authenticated access (auth probe)'
+$authProbeResult = Invoke-WorkerPost -BaseUrl "http://$VmIp`:$WorkerPort" -Path '/shell' -Token $workerToken -Body @{
+    command      = 'echo aihomeserver-auth-probe'
+    cwd          = '.'
+    timeout_secs = 10
+}
+if (-not $authProbeResult.success) {
+    $errorType = $authProbeResult.error_type
+    $errorMsg  = $authProbeResult.trace
+    throw "Auth probe FAILED (error_type=$errorType): $errorMsg`nToken fp=$($workerToken.Substring(0, [Math]::Min(8, $workerToken.Length)))..."
+}
+Write-Host "  Auth probe: success  [ok]"
+
+Test-ShellRoundTrip -VmIp $VmIp -WorkerPort $WorkerPort -Token $workerToken
+
+Test-WorkspaceSync -VmIp $VmIp -WorkerPort $WorkerPort -Token $workerToken
 
 if (-not $KeepRunning) {
     Write-Step 'Stopping worker VM'

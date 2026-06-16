@@ -3,13 +3,18 @@ const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
 const { spawn, spawnSync } = require('node:child_process');
 const http = require('node:http');
 const https = require('node:https');
+const net = require('node:net');
 const path = require('node:path');
-const { bootstrapHyperV, ensureWorkerToken } = require('./hyperv');
+const { bootstrapHyperV, stopHyperV, startHyperV, getHyperVStatus, exportHyperVLogs, ensureWorkerToken } = require('./hyperv');
 
 const DEFAULT_URL = process.env.AIHOMESERVER_URL || 'http://127.0.0.1:3000';
+const DEFAULT_COORDINATOR_HOST_PORT = Number(process.env.AIHOMESERVER_HOST_PORT || 3000);
 const APP_NAME = 'AI Home Server';
 const AUTO_START_DOCKER = process.env.AIHOMESERVER_AUTO_START_DOCKER !== '0';
-const COMPOSE_DIR = process.env.AIHOMESERVER_COMPOSE_DIR || path.join(__dirname, '..');
+const DEFAULT_BUNDLED_REPO_DIR = app.isPackaged
+  ? path.join(process.resourcesPath, 'repo')
+  : path.join(__dirname, '..');
+const COMPOSE_DIR = process.env.AIHOMESERVER_COMPOSE_DIR || DEFAULT_BUNDLED_REPO_DIR;
 const COMPOSE_FILES = (process.env.AIHOMESERVER_COMPOSE_FILES || 'docker-compose.yml,docker-compose.dev.yml')
   .split(',')
   .map((entry) => entry.trim())
@@ -32,8 +37,34 @@ const DEFAULT_HYPERV_IMAGE = path.join(
   DEFAULT_HYPERV_ROOT,
   'image',
   `ubuntu-${DEFAULT_VM_IMAGE_VERSION}`,
-  `ubuntu-${DEFAULT_VM_IMAGE_VERSION}-server-cloudimg-amd64.vhdx`
+  `ubuntu-${DEFAULT_VM_IMAGE_VERSION}-server-cloudimg-amd64-base.vhdx`
 );
+const LAUNCHER_LOG_DIR_NAME = 'logs';
+
+function launcherLogDir() {
+  return path.join(app.getPath('userData'), LAUNCHER_LOG_DIR_NAME);
+}
+
+function ensureLauncherLogDir() {
+  const dir = launcherLogDir();
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function appendLauncherLog(line) {
+  try {
+    const stamp = new Date().toISOString();
+    fs.appendFileSync(path.join(ensureLauncherLogDir(), 'launcher.log'), `[${stamp}] ${line}\n`);
+  } catch (_) {}
+}
+
+function composeLogPaths() {
+  const dir = ensureLauncherLogDir();
+  return {
+    stdout: path.join(dir, 'coordinator-compose.stdout.log'),
+    stderr: path.join(dir, 'coordinator-compose.stderr.log'),
+  };
+}
 
 function probeHealth(baseUrl, timeoutMs = 2000) {
   return new Promise((resolve) => {
@@ -56,6 +87,40 @@ function probeHealth(baseUrl, timeoutMs = 2000) {
   });
 }
 
+function probeWorkerAuth(token, workerUrl, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    const target = new URL('/shell', workerUrl);
+    const body = JSON.stringify({
+      command: 'echo aihomeserver-auth-probe',
+      cwd: '.',
+      timeout_secs: 5,
+    });
+    const transport = target.protocol === 'https:' ? https : http;
+    const req = transport.request(
+      target,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          'User-Agent': 'aihomeserver-desktop',
+          Authorization: `Bearer ${token}`,
+        },
+      },
+      (res) => {
+        res.resume();
+        resolve({ ok: res.statusCode === 200, status: res.statusCode });
+      }
+    );
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error('auth probe timeout'));
+    });
+    req.on('error', (err) => resolve({ ok: false, status: 0, error: err.message }));
+    req.write(body);
+    req.end();
+  });
+}
+
 function probeCacheStatus() {
   return {
     imageExists: fs.existsSync(DEFAULT_HYPERV_IMAGE),
@@ -65,23 +130,96 @@ function probeCacheStatus() {
   };
 }
 
+function findAvailablePort(preferredPort) {
+  function tryListen(port) {
+    return new Promise((resolve, reject) => {
+      const server = net.createServer();
+      server.unref();
+      server.on('error', reject);
+      server.listen(port, '0.0.0.0', () => {
+        const address = server.address();
+        const chosenPort = typeof address === 'object' && address ? address.port : port;
+        server.close(() => resolve(chosenPort));
+      });
+    });
+  }
+
+  return tryListen(preferredPort).catch(() => tryListen(0));
+}
+
+function isPortAllocationError(message) {
+  const text = String(message || '').toLowerCase();
+  return text.includes('port is already allocated') || text.includes('bind for') || text.includes('failed to set up container networking');
+}
+
 function isRunningAsAdministrator() {
   if (process.platform !== 'win32') {
     return true;
   }
 
+  // Exit code 0 = admin, 1 = not admin. Avoids reading stdout with stdio:'ignore'.
   const check = spawnSync(
     'powershell.exe',
     [
       '-NoProfile',
       '-NonInteractive',
       '-Command',
-      '[bool]([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)',
+      'if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 0 } else { exit 1 }',
     ],
     { stdio: 'ignore' }
   );
 
   return check.status === 0;
+}
+
+function isHyperVAvailable() {
+  if (process.platform !== 'win32') return false;
+  // Get-VM lives in the Hyper-V module; if it's absent, Hyper-V isn't installed.
+  const check = spawnSync(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-Command',
+     'if (Get-Command Get-VM -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }'],
+    { stdio: 'ignore' }
+  );
+  return check.status === 0;
+}
+
+function categorizeHyperVError(error) {
+  const msg = (error.stack || error.message || '').toLowerCase();
+  if (msg.includes('get-vm') && msg.includes('not recognized')) {
+    return {
+      title: 'Hyper-V is not available',
+      body: 'The Hyper-V Windows feature is not enabled on this machine. Enable it via "Turn Windows features on or off" or run:\n\nEnable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All\n\nThen restart and relaunch the app.',
+    };
+  }
+  if (msg.includes('wsl is not installed') || msg.includes('wsl --mount') || msg.includes('the installed wsl does not support')) {
+    return {
+      title: 'WSL 2 mount support is required',
+      body: 'The Hyper-V worker bootstrap now provisions the VM disk offline and requires WSL 2 with `wsl --mount` support. Install or upgrade WSL, then relaunch the app.\n\n' + (error.message || ''),
+    };
+  }
+  if (msg.includes('did not report healthy') || msg.includes('worker_port_open')) {
+    return {
+      title: 'Worker VM did not come online',
+      body: 'The VM started but the worker process did not respond to health checks in time. Check the worker logs for startup errors.\n\n' + (error.message || ''),
+    };
+  }
+  if (msg.includes('did not become healthy and authenticated') || msg.includes('worker auth probe') || msg.includes('/shell returned 401')) {
+    return {
+      title: 'Worker bootstrap/service startup failed',
+      body: 'The VM booted, but the installed worker service did not come up with the expected authenticated state. Check the exported worker logs for guest startup or token wiring errors.\n\n' + (error.message || ''),
+    };
+  }
+  if (msg.includes('access is denied') || msg.includes('elevation') || msg.includes('administrator')) {
+    return {
+      title: 'Administrator rights required',
+      body: 'The Hyper-V bootstrap requires elevation. Right-click the app and choose "Run as administrator".',
+    };
+  }
+  return {
+    title: 'Hyper-V worker unavailable, falling back to Docker worker',
+    body: `The VM bootstrap failed.\n\n${error.stack || error.message}`,
+  };
 }
 
 function psQuote(value) {
@@ -110,24 +248,60 @@ function composeCommand() {
 
 function startLocalDockerStack(extraEnv = {}) {
   const { command, args } = composeCommand();
+  const logs = composeLogPaths();
+  fs.writeFileSync(logs.stdout, '', 'utf8');
+  fs.writeFileSync(logs.stderr, '', 'utf8');
+  appendLauncherLog(`Starting coordinator stack from ${COMPOSE_DIR} with command: ${command} ${args.join(' ')} (host port ${extraEnv.AIHOMESERVER_HOST_PORT || 'default'})`);
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: COMPOSE_DIR,
       detached: false,
-      stdio: 'ignore',
+      stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
       env: { ...process.env, ...extraEnv },
     });
+    const stdoutStream = fs.createWriteStream(logs.stdout, { flags: 'a' });
+    const stderrStream = fs.createWriteStream(logs.stderr, { flags: 'a' });
+
+    child.stdout.on('data', (chunk) => stdoutStream.write(chunk));
+    child.stderr.on('data', (chunk) => stderrStream.write(chunk));
 
     child.on('error', reject);
     child.on('exit', (code) => {
+      stdoutStream.end();
+      stderrStream.end();
+      appendLauncherLog(`docker compose exited with code ${code}`);
       if (code === 0) {
         resolve();
         return;
       }
-      reject(new Error(`docker compose exited with code ${code}`));
+      reject(
+        new Error(
+          `docker compose exited with code ${code}. Logs: ${logs.stdout} and ${logs.stderr}`
+        )
+      );
     });
   });
+}
+
+async function startLocalDockerStackWithRetry(baseEnv = {}, maxAttempts = 5) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const chosenPort = baseEnv.AIHOMESERVER_HOST_PORT || String(await findAvailablePort(0));
+    const env = { ...baseEnv, AIHOMESERVER_HOST_PORT: String(chosenPort) };
+    appendLauncherLog(`Coordinator startup attempt ${attempt}/${maxAttempts} using host port ${env.AIHOMESERVER_HOST_PORT}`);
+    try {
+      await startLocalDockerStack(env);
+      return { hostPort: Number(env.AIHOMESERVER_HOST_PORT) };
+    } catch (error) {
+      lastError = error;
+      appendLauncherLog(`Coordinator startup attempt ${attempt} failed: ${error.message}`);
+      if (!isPortAllocationError(error.message) || attempt === maxAttempts) {
+        throw error;
+      }
+    }
+  }
+  throw lastError || new Error('Coordinator startup failed without a reported error');
 }
 
 async function waitForServerReady(baseUrl, timeoutMs = 180000) {
@@ -161,8 +335,69 @@ function createWindow() {
 
 ipcMain.handle('open-worker-folder', async (_event, kind) => {
   const target = kind === 'logs' ? path.join(DEFAULT_HYPERV_ROOT, 'logs') : DEFAULT_HYPERV_ROOT;
+  if (kind === 'logs') {
+    try {
+      await exportHyperVLogs({
+        vmName: DEFAULT_VM_NAME,
+        vmIp: DEFAULT_VM_IP,
+        workerPort: DEFAULT_VM_PORT,
+        rootDir: DEFAULT_HYPERV_ROOT,
+      });
+    } catch (error) {
+      fs.mkdirSync(target, { recursive: true });
+      fs.writeFileSync(
+        path.join(target, 'export-error.txt'),
+        `${new Date().toISOString()}\n${error.stack || error.message}\n`,
+        'utf8'
+      );
+    }
+  }
   await shell.openPath(target);
   return target;
+});
+
+ipcMain.handle('open-launcher-log-folder', async () => {
+  const target = ensureLauncherLogDir();
+  await shell.openPath(target);
+  return target;
+});
+
+ipcMain.handle('get-vm-state', async () => {
+  try {
+    const status = await getHyperVStatus({
+      vmName: DEFAULT_VM_NAME,
+      vmIp: DEFAULT_VM_IP,
+      workerPort: DEFAULT_VM_PORT,
+    });
+    const workerHealthy = status.worker_port_open
+      ? await probeHealth(`http://${DEFAULT_VM_IP}:${DEFAULT_VM_PORT}`, 2000)
+      : false;
+    return { ...status, worker_healthy: workerHealthy };
+  } catch (error) {
+    return { ok: false, vm_state: 'Error', worker_healthy: false, error: error.message };
+  }
+});
+
+ipcMain.handle('stop-vm', async () => {
+  try {
+    return await stopHyperV(DEFAULT_VM_NAME);
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+});
+
+ipcMain.handle('start-vm', async () => {
+  try {
+    return await startHyperV({
+      vmName: DEFAULT_VM_NAME,
+      vmIp: DEFAULT_VM_IP,
+      vmGateway: DEFAULT_VM_GATEWAY,
+      switchName: DEFAULT_VM_SWITCH,
+      workerPort: DEFAULT_VM_PORT,
+    });
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
 });
 
 function escapeHtml(value) {
@@ -368,14 +603,64 @@ function loadStartingPage(win, options) {
         ${renderStatusRow('Ready', readyState, 'Launcher can open the app when all systems are healthy')}
       </div>
       <div class="actions">
-        <button class="btn" type="button" onclick="window.aihomeserverLauncher.openWorkerFolder('logs')">Open worker logs</button>
+        <button class="btn" type="button" onclick="window.aihomeserverLauncher.openWorkerFolder('logs')">Open exported worker logs</button>
         <button class="btn" type="button" onclick="window.aihomeserverLauncher.openWorkerFolder('root')">Open worker root</button>
+        <button class="btn" type="button" onclick="window.aihomeserverLauncher.openLauncherLogFolder()">Open coordinator logs</button>
+        <button class="btn" id="btn-stop-vm" type="button" onclick="vmAction('stop')" style="display:none">Stop VM</button>
+        <button class="btn" id="btn-start-vm" type="button" onclick="vmAction('start')" style="display:none">Start VM</button>
       </div>
       <div class="footer">
-        <code>${DEFAULT_URL}</code>
+        <code>${escapeHtml(coordinatorUrl)}</code>
       </div>
     </div>
   </body>
+  <script>
+    const vmRow = document.querySelector('.row:nth-child(1) .row-state');
+    const workerRow = document.querySelector('.row:nth-child(3) .row-state');
+    const btnStop = document.getElementById('btn-stop-vm');
+    const btnStart = document.getElementById('btn-start-vm');
+
+    function makeBadge(state) {
+      const label = String(state || 'pending');
+      return '<span class="badge badge-' + label + '">' + label + '</span>';
+    }
+
+    function applyVmStatus(status) {
+      const vmState = (status.vm_state || 'unknown').toLowerCase();
+      vmRow.innerHTML = makeBadge(vmState);
+      workerRow.innerHTML = makeBadge(status.worker_healthy ? 'running' : 'unreachable');
+      btnStop.style.display = vmState === 'running' ? 'inline-flex' : 'none';
+      btnStart.style.display = (vmState === 'off' || vmState === 'stopped' || vmState === 'missing') ? 'inline-flex' : 'none';
+    }
+
+    async function vmAction(action) {
+      btnStop.disabled = true;
+      btnStart.disabled = true;
+      try {
+        if (action === 'stop') {
+          vmRow.innerHTML = makeBadge('stopping');
+          await window.aihomeserverLauncher.stopVm();
+        } else {
+          vmRow.innerHTML = makeBadge('starting');
+          await window.aihomeserverLauncher.startVm();
+        }
+      } catch (e) {
+        console.error('VM action failed', e);
+      }
+      btnStop.disabled = false;
+      btnStart.disabled = false;
+    }
+
+    async function pollVmState() {
+      try {
+        const status = await window.aihomeserverLauncher.getVmState();
+        applyVmStatus(status);
+      } catch (_) {}
+    }
+
+    pollVmState();
+    setInterval(pollVmState, 5000);
+  </script>
 </html>`;
 
   return win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
@@ -397,6 +682,10 @@ async function bootstrap() {
 
   const win = createWindow();
   win.hide();
+  const coordinatorPort = process.env.AIHOMESERVER_URL
+    ? Number(new URL(DEFAULT_URL).port || (new URL(DEFAULT_URL).protocol === 'https:' ? 443 : 80))
+    : await findAvailablePort(0);
+  let coordinatorUrl = process.env.AIHOMESERVER_URL || `http://127.0.0.1:${coordinatorPort}`;
   const initialRuntimeLabel = shouldTryHyperV ? 'hyperv' : AUTO_START_DOCKER ? 'docker' : 'manual';
   await loadStartingPage(win, {
     title: `Starting ${APP_NAME}`,
@@ -406,7 +695,7 @@ async function bootstrap() {
         ? 'The launcher is starting the local Docker stack and waiting for the coordinator and worker to answer health checks.'
         : 'The launcher is waiting for an already-running server and worker to become available.',
     runtimeLabel: initialRuntimeLabel,
-    coordinatorUrl: DEFAULT_URL,
+    coordinatorUrl,
     workerUrl: 'pending',
     vmState: shouldTryHyperV ? 'starting' : 'running',
     coordinatorState: 'pending',
@@ -418,8 +707,14 @@ async function bootstrap() {
   const workerToken = await ensureWorkerToken(app.getPath('userData'));
   const dockerWorkerUrl = 'http://127.0.0.1:3031';
   const coordinatorWorkerUrl = 'http://worker:3031';
+  // When the VM worker is active, the coordinator container reaches it via the
+  // host portproxy (netsh portproxy set by the PS script). Docker containers on
+  // Windows can reach the Windows host at host.docker.internal, which the
+  // portproxy then forwards to the VM on the Hyper-V internal switch.
+  const hypervCoordinatorWorkerUrl = `http://host.docker.internal:${DEFAULT_VM_PORT}`;
   let workerHealthUrl = dockerWorkerUrl;
   let dockerEnv = {
+    AIHOMESERVER_HOST_PORT: String(coordinatorPort),
     WORKER_TOKEN: workerToken,
     WORKER_URL: coordinatorWorkerUrl,
     EXECUTION_MODE: 'remote',
@@ -427,7 +722,25 @@ async function bootstrap() {
   };
   let runtimeLabel = 'docker';
 
-  if (shouldTryHyperV) {
+  if (shouldTryHyperV && !isHyperVAvailable()) {
+    const hypervMsg = 'The Hyper-V Windows feature is not available on this machine.\n\nEnable it via "Turn Windows features on or off" → "Hyper-V", then restart.\n\nFalling back to the Docker worker.';
+    if (RUNTIME_MODE === 'hyperv') {
+      throw new Error(hypervMsg);
+    }
+    dialog.showErrorBox('Hyper-V not available', hypervMsg);
+    await loadStartingPage(win, {
+      title: `${APP_NAME} launcher`,
+      detail: 'Hyper-V is not available on this machine. Using the Docker worker instead.',
+      runtimeLabel: 'docker',
+      coordinatorUrl,
+      workerUrl: dockerWorkerUrl,
+      vmState: 'failed',
+      coordinatorState: 'starting',
+      workerState: 'starting',
+      readyState: 'pending',
+    });
+    dockerEnv.COMPOSE_PROFILES = 'worker';
+  } else if (shouldTryHyperV) {
     try {
       const vm = await bootstrapHyperV({
         vmName: DEFAULT_VM_NAME,
@@ -448,7 +761,7 @@ async function bootstrap() {
         title: `${APP_NAME} launcher`,
         detail: 'The VM bootstrapped successfully. The launcher is now starting the coordinator stack and waiting for health checks.',
         runtimeLabel: 'hyperv',
-        coordinatorUrl: DEFAULT_URL,
+        coordinatorUrl,
         workerUrl: workerHealthUrl,
         vmState: 'running',
         coordinatorState: 'starting',
@@ -456,8 +769,11 @@ async function bootstrap() {
         readyState: 'pending',
       });
       dockerEnv = {
+        AIHOMESERVER_HOST_PORT: String(coordinatorPort),
         WORKER_TOKEN: workerToken,
-        WORKER_URL: workerHealthUrl,
+        // Coordinator container reaches the VM via the host portproxy; the
+        // raw VM IP (192.168.250.10) is unreachable from inside Docker on Windows.
+        WORKER_URL: hypervCoordinatorWorkerUrl,
         EXECUTION_MODE: 'remote',
         COMPOSE_PROFILES: '',
       };
@@ -466,15 +782,13 @@ async function bootstrap() {
       if (RUNTIME_MODE === 'hyperv') {
         throw error;
       }
-      dialog.showErrorBox(
-        'Hyper-V worker unavailable, falling back to Docker worker',
-        `The VM bootstrap failed, so the desktop app is switching to the Docker worker fallback.\n\n${error.stack || error.message}`
-      );
+      const { title, body } = categorizeHyperVError(error);
+      dialog.showErrorBox(title, body + '\n\nFalling back to the Docker worker.');
       await loadStartingPage(win, {
         title: `${APP_NAME} launcher`,
         detail: 'Hyper-V bootstrap failed, so the launcher is using the Docker worker fallback instead.',
         runtimeLabel: 'docker',
-        coordinatorUrl: DEFAULT_URL,
+        coordinatorUrl,
         workerUrl: dockerWorkerUrl,
         vmState: 'failed',
         coordinatorState: 'starting',
@@ -487,30 +801,63 @@ async function bootstrap() {
     dockerEnv.COMPOSE_PROFILES = 'worker';
   }
 
-  if (!AUTO_START_DOCKER) {
-    const ready = await waitForServerReady(DEFAULT_URL, 5000);
-    const workerReady = await waitForServerReady(workerHealthUrl, 5000);
-    if (ready && workerReady) {
+  // Helper: run the auth probe and open the app, or surface a clear auth-failure
+  // page. Used by every "services already running" fast-path so none can bypass
+  // the authenticated execution check.
+  async function openIfAuthOk(detail) {
+    const authProbe = await probeWorkerAuth(workerToken, workerHealthUrl);
+    if (!authProbe.ok) {
+      const authDetail = authProbe.status === 401
+        ? `Worker /shell returned 401 — token mismatch. Fingerprint: ${workerToken.slice(0, 8)}...`
+        : `Worker auth probe failed (HTTP ${authProbe.status || 0}): ${authProbe.error || 'no response'}`;
       await loadStartingPage(win, {
-        title: `${APP_NAME} ready`,
-        detail: 'The server and worker are already running and healthy.',
+        title: `${APP_NAME} worker auth failed`,
+        detail: authDetail,
         runtimeLabel,
-        coordinatorUrl: DEFAULT_URL,
+        coordinatorUrl,
         workerUrl: workerHealthUrl,
         vmState: runtimeLabel === 'hyperv' ? 'running' : 'manual',
         coordinatorState: 'running',
-        workerState: 'running',
-        readyState: 'ready',
+        workerState: 'failed',
+        readyState: 'failed',
       });
-      await win.loadURL(DEFAULT_URL);
-      win.show();
+      return false;
+    }
+    await loadStartingPage(win, {
+      title: `${APP_NAME} ready`,
+      detail,
+      runtimeLabel,
+      coordinatorUrl,
+      workerUrl: workerHealthUrl,
+      vmState: runtimeLabel === 'hyperv' ? 'running' : 'manual',
+      coordinatorState: 'running',
+      workerState: 'running',
+      readyState: 'ready',
+    });
+    await win.loadURL(coordinatorUrl);
+    win.show();
+    return true;
+  }
+
+  const existingServerReady = await waitForServerReady(coordinatorUrl, 5000);
+  const existingWorkerReady = await waitForServerReady(workerHealthUrl, 5000);
+  if (existingServerReady && existingWorkerReady) {
+    await openIfAuthOk('The coordinator and worker are already running. Verified authenticated access.');
+    return;
+  }
+
+  if (!AUTO_START_DOCKER) {
+    const ready = await waitForServerReady(coordinatorUrl, 5000);
+    const workerReady = await waitForServerReady(workerHealthUrl, 5000);
+    if (ready && workerReady) {
+      await openIfAuthOk('The server and worker are already running. Verified authenticated access.');
       return;
     }
     await loadStartingPage(win, {
       title: `${APP_NAME} is not running`,
-      detail: `Expected a server at ${DEFAULT_URL} and a worker at ${workerHealthUrl}.`,
+      detail: `Expected a server at ${coordinatorUrl} and a worker at ${workerHealthUrl}.`,
       runtimeLabel,
-      coordinatorUrl: DEFAULT_URL,
+      coordinatorUrl,
       workerUrl: workerHealthUrl,
       vmState: runtimeLabel === 'hyperv' ? 'running' : 'manual',
       coordinatorState: 'failed',
@@ -521,18 +868,21 @@ async function bootstrap() {
   }
 
   try {
-    await startLocalDockerStack(dockerEnv);
+    const composeStart = await startLocalDockerStackWithRetry(dockerEnv);
+    if (!process.env.AIHOMESERVER_URL && composeStart?.hostPort) {
+      coordinatorUrl = `http://127.0.0.1:${composeStart.hostPort}`;
+    }
   } catch (error) {
     throw new Error(`Failed to start the coordinator stack from ${COMPOSE_DIR}: ${error.message}`);
   }
 
-  const serverReady = await waitForServerReady(DEFAULT_URL, runtimeLabel === 'hyperv' ? 1800000 : 300000);
+  const serverReady = await waitForServerReady(coordinatorUrl, runtimeLabel === 'hyperv' ? 1800000 : 300000);
   if (!serverReady) {
     await loadStartingPage(win, {
       title: `${APP_NAME} is not responding yet`,
-      detail: `The coordinator did not come online at ${DEFAULT_URL}.`,
+      detail: `The coordinator did not come online at ${coordinatorUrl}.`,
       runtimeLabel,
-      coordinatorUrl: DEFAULT_URL,
+      coordinatorUrl,
       workerUrl: workerHealthUrl,
       vmState: runtimeLabel === 'hyperv' ? 'running' : 'manual',
       coordinatorState: 'failed',
@@ -548,7 +898,7 @@ async function bootstrap() {
       title: `${APP_NAME} worker is not responding yet`,
       detail: `The coordinator is up, but the worker has not answered health checks at ${workerHealthUrl}.`,
       runtimeLabel,
-      coordinatorUrl: DEFAULT_URL,
+      coordinatorUrl,
       workerUrl: workerHealthUrl,
       vmState: runtimeLabel === 'hyperv' ? 'running' : 'manual',
       coordinatorState: 'running',
@@ -558,19 +908,7 @@ async function bootstrap() {
     return;
   }
 
-  await loadStartingPage(win, {
-    title: `${APP_NAME} ready`,
-    detail: 'The coordinator and worker are healthy. The application is opening now.',
-    runtimeLabel,
-    coordinatorUrl: DEFAULT_URL,
-    workerUrl: workerHealthUrl,
-    vmState: runtimeLabel === 'hyperv' ? 'running' : 'manual',
-    coordinatorState: 'running',
-    workerState: 'running',
-    readyState: 'ready',
-  });
-  await win.loadURL(DEFAULT_URL);
-  win.show();
+  await openIfAuthOk('The coordinator and worker are healthy and authenticated. The application is opening now.');
 }
 
 app.whenReady().then(() => {

@@ -20,5 +20,4 @@ ENV WORKSPACE=/workspace
 
 EXPOSE 3000
 
-CMD ["cargo", "run", "--release"]
-
+CMD ["cargo", "run", "--release", "--bin", "aihomeserver"]

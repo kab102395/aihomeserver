@@ -1,7 +1,6 @@
 services:
   worker:
     build: .
-    container_name: aihomeserver-worker
     restart: unless-stopped
     ports:
       - "3031:3031"

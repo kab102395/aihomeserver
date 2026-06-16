@@ -31,6 +31,30 @@
     ],
     "extraResources": [
       {
+        "from": "..",
+        "to": "repo",
+        "filter": [
+          "Cargo.toml",
+          "Cargo.lock",
+          ".dockerignore",
+          ".env.example",
+          "README.md",
+          "DESIGN.md",
+          "NEXT_STEPS_2026-04-22.md",
+          "PROGRESS_2026-04-22.md",
+          "UI_FEATURES_ROADMAP_2026-04-22.md",
+          "Dockerfile",
+          "Dockerfile.dev",
+          "docker-compose.yml",
+          "docker-compose.dev.yml",
+          "docker-compose.worker.yml",
+          "secrets.env",
+          "src/**/*",
+          "scripts/**/*",
+          "searxng/**/*"
+        ]
+      },
+      {
         "from": "../scripts/hyperv-worker.ps1",
         "to": "scripts/hyperv-worker.ps1"
       }

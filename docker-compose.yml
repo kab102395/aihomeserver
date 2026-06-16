@@ -2,12 +2,14 @@ services:
   # aihomeserver
   aihomeserver:
     build: .
-    container_name: aihomeserver
     restart: unless-stopped
     env_file:
       - ./secrets.env
     ports:
-      - "3000:3000"
+      - target: 3000
+        published: "${AIHOMESERVER_HOST_PORT:-3000}"
+        host_ip: 127.0.0.1
+        protocol: tcp
     volumes:
       - ai_data:/data
       - ai_workspace:/data/workspace
@@ -34,7 +36,6 @@ services:
   # Remote execution worker using the same image, different role
   worker:
     build: .
-    container_name: aihomeserver-worker
     restart: unless-stopped
     profiles:
       - worker
@@ -53,15 +54,10 @@ services:
   # SearXNG (self-hosted search)
   searxng:
     image: searxng/searxng:latest
-    container_name: searxng
     restart: unless-stopped
     # Reachable by `aihomeserver` in the Docker network at http://searxng:8080
     expose:
       - "8080"
-    # Also exposed on the host so native (non-Docker) runs can use SearXNG too.
-    # Set SEARCH_URL=http://localhost:8888 when running aihomeserver outside Docker.
-    ports:
-      - "8888:8080"
     volumes:
       - ./searxng:/etc/searxng:rw
     environment:

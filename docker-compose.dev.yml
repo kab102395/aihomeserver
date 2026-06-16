@@ -6,10 +6,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.dev
-    container_name: aihomeserver-dev
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - target: 3000
+        published: "${AIHOMESERVER_HOST_PORT:-3000}"
+        host_ip: 127.0.0.1
+        protocol: tcp
     volumes:
       - ai_data:/data
       - ./:/workspace:rw
@@ -26,4 +28,3 @@ services:
 
 volumes:
   ai_data:
-
