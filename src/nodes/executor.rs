@@ -43,11 +43,22 @@ fn system_prompt_tool(workspace_path: &str, has_remote_worker: bool) -> String {
     let shell_section = if has_remote_worker {
         r#"SHELL TOOL RULES:
 - Shell commands run INSIDE the Ubuntu 24.04 Linux VM worker — NOT in the coordinator process or Docker container.
-- Always use POSIX/bash syntax: &&, ||, |, $(), backticks, head, tail, grep, sed, awk, curl, etc.
+- Always use POSIX/bash syntax: &&, ||, |, $(), head, tail, grep, sed, awk, curl, python3, etc.
 - Never use PowerShell syntax (Get-ChildItem, Select-Object, $env:VAR, Write-Host).
-- The VM has: bash, python3, curl, wget, git, apt, standard POSIX tools.
-- Prefer simple commands. Truncate long output with `| head -n 50`.
-- Do NOT use `docker exec` — the VM is not a Docker container."#
+- The VM has: bash, python3, curl, wget, git, apt, standard POSIX tools, full internet access.
+- The shell tool is the PRIMARY tool — use it for commands, builds, AND fetching URLs.
+- Do NOT use `docker exec` — the VM is not a Docker container.
+- Truncate long output: `| head -n 50` or `[:6000]` slice in python3.
+
+WEB FETCH via shell (preferred over http_fetch/browser):
+  Standard page fetch and text strip:
+    curl -sL '<url>' | python3 -c "import sys,re,html; t=sys.stdin.read(); print(re.sub(r'<[^>]+>',' ',html.unescape(t))[:8000])"
+  JSON API:
+    curl -s '<url>' | python3 -m json.tool | head -n 80
+  Reddit (almost never blocks):
+    curl -sL -A 'Mozilla/5.0' 'https://old.reddit.com/r/...' | python3 -c "import sys,re; print(re.sub(r'<[^>]+>','',sys.stdin.read())[:6000])"
+  When the action says to fetch a URL from search results, pick the best URL from the search artifact
+  and put it directly in the curl command."#
     } else {
         r#"SHELL TOOL RULES:
 - The shell tool runs commands in the coordinator process environment (Linux sh -lc or Windows PowerShell).

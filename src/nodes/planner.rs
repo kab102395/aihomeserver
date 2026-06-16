@@ -143,17 +143,25 @@ CODING / PROJECT WORKFLOW (strongly preferred for non-trivial code tasks):
     If the toolchain isn't available (e.g. `cargo` missing in a slim runtime container),
     plan a dev/test docker mode or skip validation and state what would be run.
 
-USE "http_fetch" when asked to fetch, visit, retrieve, or analyze a URL or website.
+USE "shell" (with curl) as the PRIMARY tool for fetching URLs when a VM worker is available.
+  This is preferred over http_fetch or browser because the VM has full internet access and curl
+  gives you raw control — you can pipe, filter, process, and save output in one step.
+  Examples:
+    {"command":"curl -sL 'https://example.com' | python3 -c \"import sys,re,html; t=sys.stdin.read(); print(re.sub(r'<[^>]+>',' ',html.unescape(t))[:8000])\"","timeout_secs":30}
+    {"command":"curl -sL 'https://api.example.com/data' | python3 -m json.tool | head -n 60","timeout_secs":30}
+    {"command":"curl -s -A 'Mozilla/5.0' 'https://old.reddit.com/r/...' | python3 -c \"import sys,re; print(re.sub(r'<[^>]+>','',sys.stdin.read())[:6000])\"","timeout_secs":30}
+  Use shell+curl for: fetching articles, downloading data, scraping pages, following redirects.
+  Fall back to http_fetch only if shell is explicitly unavailable or fails repeatedly.
+
+USE "http_fetch" as a fallback for URL fetching when shell/curl is not appropriate.
   params: {"url":"https://example.com"}
   Plan: step 1 fetches (tool_binding="http_fetch"), step 2 analyzes with LLM (tool_binding=null).
   The second step action should reference the fetch result: "Analyze the fetched page content and answer the user's question"
   The second step output_key must be "answer".
   risk_score for fetch-only tasks: 2
 
-USE "browser" when you need richer page inspection than raw fetching.
+USE "browser" only as a last resort when both shell+curl and http_fetch have failed or are blocked.
   params: {"action":"fetch","url":"https://example.com","max_chars":12000}
-  Use it for page titles, visible text, and link extraction when the user wants web/page analysis.
-  Prefer it for interactive browsing-style requests or when you need a worker-backed environment.
 
 USE "web_search" for a single targeted query when one search is clearly sufficient.
   params: {"query": "search terms here"}
@@ -176,20 +184,22 @@ USE "parallel_search" for RESEARCH questions — it runs multiple queries simult
 
   For RESEARCH tasks, plan these steps:
     1. parallel_search — all decomposed queries in one shot   output_key: "search_result"
-    2. http_fetch — most relevant URL from search results     output_key: "fetch1_result"
+    2. shell — curl the most relevant URL from search results output_key: "fetch1_result"
+       Use: {"command":"curl -sL '<url>' | python3 -c \"import sys,re,html; t=sys.stdin.read(); print(re.sub(r'<[^>]+>',' ',html.unescape(t))[:8000])\"","timeout_secs":30}
        RELIABLE sources (prefer in this order):
          old.reddit.com threads  ← best, almost never blocks
          liquipedia.net
          dota2.fandom.com/wiki
          steamcommunity.com/app/570/discussions
        AVOID: dotabuff.com, stratz.com, anything behind login
-    3. http_fetch — second reliable URL, different type       output_key: "fetch2_result"
+    3. shell — curl a second reliable URL, different type     output_key: "fetch2_result"
        Mix source types: wiki + Reddit, or guide site + patch notes
     4. LLM synthesis step — "Using all search results and fetched pages, write a comprehensive
        detailed answer covering every aspect the user asked about"   output_key: "answer"
 
-  For http_fetch steps set url to "" — the system auto-picks the best URL from search artifacts.
-  Do NOT put a real URL in http_fetch params — the URL resolver handles it automatically.
+  For shell fetch steps: pick the best URL from the search_result artifact and put it directly
+  in the curl command. If you don't have a specific URL yet, use http_fetch with url="" as fallback
+  (the system auto-picks the best URL from search artifacts in that case).
   risk_score for research tasks: 1
 
 USE "save_knowledge" after researching a topic to store it permanently for future chats.
@@ -208,7 +218,7 @@ TEXTBOOK / CURRICULUM MODE:
   "make a textbook"), plan a curriculum-style research run that results in MULTIPLE KB chapters.
   Pattern:
     1. parallel_search — official docs + authoritative tutorials (output_key: "search_result")
-    2. http_fetch — 2–4 high-quality sources, diverse domains (output_key: "fetch1_result", "fetch2_result", ...)
+    2. shell (curl) — 2–4 high-quality sources, diverse domains (output_key: "fetch1_result", "fetch2_result", ...)
     3. LLM-only synthesis — produce a structured "book" as JSON (output_key: "kb_textbook", output_format: "json"):
        {
          "book_title": "...",
@@ -244,11 +254,11 @@ AUTO-KB MODE (configurable; see runtime capabilities):
     even a 2-month-old knowledge entry may be outdated for a live game.
 
   RESEARCH + SAVE plan pattern (6 steps):
-    1. parallel_search — decomposed queries          output_key: "search_result"
-    2. http_fetch — reliable URL #1                  output_key: "fetch1_result"
-    3. http_fetch — reliable URL #2 (Reddit preferred) output_key: "fetch2_result"
-    4. LLM: "Synthesize into comprehensive answer"   output_key: "answer"
-    5. save_knowledge — persist the research         output_key: "knowledge_saved"
+    1. parallel_search — decomposed queries                   output_key: "search_result"
+    2. shell — curl reliable URL #1 | python3 strip html      output_key: "fetch1_result"
+    3. shell — curl reliable URL #2 (Reddit preferred)        output_key: "fetch2_result"
+    4. LLM: "Synthesize into comprehensive answer"            output_key: "answer"
+    5. save_knowledge — persist the research                  output_key: "knowledge_saved"
 
 IMPORTANT: tool_binding must ALWAYS be a plain string (the tool name) or null. NEVER put an object in tool_binding.
   CORRECT:   "tool_binding": "web_search"
@@ -379,9 +389,15 @@ fn build_context(state: &SystemState) -> String {
             .unwrap_or(false);
 
     if has_remote_worker {
-        ctx.push_str("Execution environment: Shell commands run INSIDE the Ubuntu 24.04 Linux VM worker. ");
-        ctx.push_str("NOT inside the coordinator Docker container. Always use POSIX/bash syntax.\n");
-        ctx.push_str("The VM has: bash, python3, curl, wget, git, standard POSIX tools, and internet access.\n");
+        ctx.push_str("Execution environment: Ubuntu 24.04 Linux VM worker (remote). ");
+        ctx.push_str("Shell commands run INSIDE this VM — NOT the coordinator Docker container. ");
+        ctx.push_str("Always use POSIX/bash syntax.\n");
+        ctx.push_str("VM tools available: bash, python3, curl, wget, git, apt, standard POSIX tools, full internet access.\n");
+        ctx.push_str("PRIMARY TOOL STRATEGY: Use 'shell' as the default tool for ALL execution tasks:\n");
+        ctx.push_str("  - Running commands, scripts, builds → shell\n");
+        ctx.push_str("  - Fetching URLs, downloading content → shell + curl\n");
+        ctx.push_str("  - Web research (after parallel_search finds URLs) → shell + curl | python3\n");
+        ctx.push_str("  - Only fall back to http_fetch/browser if curl fails or is blocked.\n");
     } else {
         ctx.push_str("Shell tool backend: sh -lc on Linux/macOS; PowerShell on Windows.\n");
     }
