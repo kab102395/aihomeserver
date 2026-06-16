@@ -10,7 +10,9 @@ RUN apt-get update && apt-get install -y \
 COPY Cargo.toml Cargo.lock ./
 COPY *.md ./
 
-RUN mkdir src && echo "fn main(){}" > src/main.rs && \
+RUN mkdir -p src/bin && \
+    echo "fn main(){}" > src/main.rs && \
+    echo "fn main(){}" > src/bin/worker.rs && \
     cargo build --release --bin aihomeserver --bin worker && \
     rm -rf src
 
