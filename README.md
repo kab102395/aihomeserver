@@ -32,56 +32,107 @@ Developed and maintained by **Kyle Barrett** · [Ember Tech Solutions LLC](mailt
 
 ## What It Is
 
-`aihomeserver` is a local-first AI agent server that runs entirely on your own hardware. There is no cloud dependency beyond the model provider (Ollama, which itself runs locally). It is written in Rust for correctness, determinism, and performance on constrained home hardware.
+`aihomeserver` is a local-first AI code agent stack that runs on your own hardware. The current product shape is:
 
-**What it is not:** a thin wrapper around a chat API. Every request runs through a structured orchestration loop that plans, executes tools, verifies results mechanically, critiques with a second LLM pass, and repairs or replans on failure — all with full auditability through a persistent artifact log.
+- an Electron desktop launcher
+- a Rust coordinator running on the host
+- an Ubuntu worker VM for the active execution surface
+- a VM-backed workspace for shell, filesystem, and browser tasks
+- local Ollama models for planning, execution, critique, and repair
+
+There is no required cloud agent backend. The intended runtime is:
+
+- host machine for UI, orchestration, packaging, and configuration
+- VM for task execution and browser automation
+
+**What it is not:** a thin wrapper around a chat API. Every request still runs through a structured orchestration loop that plans, executes tools, verifies results mechanically, critiques with a second pass, and repairs or replans on failure.
 
 **Primary use cases today:**
-- Research-backed Q&A with grounding enforcement (no hallucinated citations)
-- Coding project generation with artifact verification (file existence, build checks, zip packaging)
-- Workspace file management (read, write, search, diff, zip)
-- Git operations within the workspace
-- Curated knowledge base that grows over time
+- VM-first coding tasks with exact file/output verification
+- Research-backed Q&A with grounding enforcement
+- Browser automation probes and extraction diagnostics
+- Workspace file management against the active VM workspace
+- Git and repo operations from the coordinator side
+- Curated knowledge and replayable execution history
 
-**Hardware it runs on (reference):**
+**Current product emphasis:**
+- one active task computer instead of split host/remote semantics
+- honest blocked-site detection instead of invented extraction
+- deterministic browser-task output contracts
+- fast desktop reloads without reprovisioning the VM on every iteration
+
+**Reference hardware:**
 - NVIDIA RTX 5070 Ti (16 GB VRAM), 64 GB RAM
-- Models: `qwen3:14b` (fast), configurable critic model
-- OS: Windows with WSL / Docker for Linux containers
+- Windows host
+- Hyper-V Ubuntu worker VM
+- Ollama local models
 
 ---
 
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        aihomeserver process                             │
-│                                                                         │
-│   Axum HTTP Server                                                      │
-│   ├── POST /run (blocking)                                              │
-│   ├── POST /run/stream (SSE)              ┌──────────────────────────┐  │
-│   ├── REST workspace / git / KB / evals  │      Orchestrator        │  │
-│   └── Embedded Web UI                    │  (deterministic FSM)     │  │
-│                                          │                          │  │
-│   Tool Registry ─────────────────────────│──► ToolExecution node    │  │
-│   Memory (SQLite) ───────────────────────│──► Intake / Finalization │  │
-│   OllamaClient ──────────────────────────│──► Planner/Executor/     │  │
-│   Coder Pipeline ────────────────────────│    Critic/Repair nodes   │  │
-│                                          └──────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────┘
-         │                              │
-         ▼                              ▼
-   Ollama (local)                 SQLite DBs
-   (qwen3:14b or                  (episodic, conversation,
-    any Ollama model)              semantic, knowledge, sources)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                             Windows Host                                     │
+│                                                                              │
+│  Electron Desktop Launcher                                                   │
+│  ├── boots coordinator container/runtime                                     │
+│  ├── provisions or reconnects Hyper-V worker VM                              │
+│  ├── probes worker auth/health/capabilities                                  │
+│  └── exposes fast "Rebuild App" reload path                                  │
+│                                                                              │
+│  Rust Coordinator (Axum + Orchestrator)                                      │
+│  ├── POST /run                                                               │
+│  ├── POST /run/stream                                                        │
+│  ├── workspace / git / KB / settings / evals                                 │
+│  ├── Planner / Executor / Critic / Repair / Finalization                     │
+│  ├── Tool registry with remote-aware shell/filesystem routing                │
+│  └── VM preflight sync + capability injection                                │
+└──────────────────────────────────────────────────────────────────────────────┘
+                 │                                 │
+                 ▼                                 ▼
+        Ollama (local)                     SQLite + local config
+                 │
+                 ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           Ubuntu Worker VM                                   │
+│                                                                              │
+│  Python worker API                                                           │
+│  ├── GET /health                                                             │
+│  ├── GET /capabilities                                                       │
+│  ├── POST /workspace/sync                                                    │
+│  ├── POST /shell                                                             │
+│  ├── POST /browser/fetch                                                     │
+│  └── POST /filesystem/*                                                      │
+│                                                                              │
+│  Active task workspace: /workspace                                           │
+│  Browser runtime: Playwright/Chromium when installed                         │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Three-layer design:**
+**Current design split:**
 
 | Layer | Responsibility |
 |-------|----------------|
-| **API layer** (`src/api/`) | HTTP routing, SSE fan-out, embedded UI HTML/CSS/JS, approval gate endpoints |
-| **Orchestration layer** (`src/nodes/`, `src/orchestrator.rs`) | FSM node execution, risk routing, repair/replan bounds, coder pipeline |
-| **Tool & memory layer** (`src/tools/`, `src/memory/`) | All side effects (file I/O, shell, git, HTTP, search) and persistence |
+| **Desktop layer** (`desktop/`) | Electron launcher, Hyper-V bootstrap orchestration, coordinator lifecycle, packaged app behavior |
+| **Coordinator layer** (`src/api/`, `src/nodes/`, `src/orchestrator.rs`) | FSM node execution, task lifecycle, SSE, planner/executor/critic/repair/finalization |
+| **Worker layer** (`src/bin/worker.rs`, `scripts/hyperv-worker.ps1`) | VM shell/filesystem/browser runtime, capability reporting, workspace sync, health/auth contract |
+| **Memory/tool layer** (`src/tools/`, `src/memory/`) | Side effects, persistence, replayable artifacts, long-lived knowledge |
+
+## Desktop + VM-First Model
+
+The most important current architectural change is that the active execution surface is no longer assumed to be the host workspace.
+
+When remote mode is active:
+
+- the coordinator syncs a workspace mirror into the VM
+- the worker `/workspace` becomes the active task computer
+- shell commands run in the VM
+- filesystem actions target the VM
+- browser automation runs in the VM
+- the Files tab is supposed to reflect VM state, not host repo state
+
+That is what makes the system VM-first instead of a split-brain hybrid.
 
 ---
 
@@ -171,8 +222,10 @@ src/
 ├── api/
 │   ├── mod.rs
 │   ├── server.rs            Axum router; /run, /run/stream, /task/:id/*, /workspace/*, /git/*,
-│   │                        /knowledge/*, /eval/*, /health/*, /metrics, /settings, /sessions/*
-│   ├── ui.rs                Embedded chat UI HTML/CSS/JS (CHAT_HTML const); SSE event rendering
+│   │                        /knowledge/*, /eval/*, /health/*, /metrics, /settings, /sessions/*;
+│   │                        injects worker capability snapshot and performs initial VM workspace sync
+│   ├── ui.rs                Embedded chat UI HTML/CSS/JS (CHAT_HTML const); SSE rendering;
+│   │                        VM workspace browser, settings/admin surface, worker diagnostics
 │   └── learn.rs             /learn interview-prep walkthrough UI; embedded doc browser
 │
 ├── nodes/
@@ -186,7 +239,8 @@ src/
 │   ├── executor.rs          Calls fast_model per step; generates tool call JSON or LLM answer;
 │   │                        injects GROUNDING_GUARDRAIL for requires_facts steps;
 │   │                        injects coding_manifest_prompt() for coding tasks;
-│   │                        strip_think_tags() applied to all model output
+│   │                        strip_think_tags() applied to all model output;
+│   │                        browser-task verification now prefers exact execution artifacts
 │   ├── tool_execution.rs    Dispatches tool calls from executor to ToolRegistry;
 │   │                        stores ToolResult as artifact; emits ToolCall/ToolDone SSE
 │   ├── critic.rs            Risk-gated critic; RESEARCH_CRITIC for grounded steps;
@@ -195,13 +249,14 @@ src/
 │   ├── repair.rs            Generates targeted fix prompt; CodingRepairTarget (WriteFile,
 │   │                        PatchSource, RunPackage, General) for coding tasks
 │   └── finalization.rs      Persists to episodic/conversation memory; auto-KB save;
-│                            emits final answer; source URL collection
+│                            emits final answer; browser-task final success now depends on
+│                            verified execution output, not generic completion
 │
 ├── tools/
 │   ├── mod.rs               Tool trait; ToolRegistry (register/alias/execute/list)
-│   ├── filesystem.rs        File I/O: read, write, list, find, grep, delete, move,
-│   │                        mkdir, copy, diff, stat, tree, zip_dir
-│   ├── shell.rs             Safe shell execution; OS-aware (sh on Linux, PowerShell on Windows);
+│   ├── filesystem.rs        Local or VM-backed filesystem operations depending on execution mode:
+│   │                        read, write, list, find, grep, delete, mkdir, rename, stat, tree, zip_dir
+│   ├── shell.rs             Local or worker-routed shell execution depending on execution mode;
 │   │                        syntax guard; timeout enforcement
 │   ├── git.rs               Git operations within workspace (status, log, diff, add, commit,
 │   │                        branch, checkout, clone, pull, push)
@@ -225,10 +280,15 @@ src/
 │                            strip_think_tags() — strips <think>...</think> from all model output;
 │                            Ollama options (num_gpu, num_ctx, num_predict, num_batch, num_thread)
 │
+├── worker.rs                Host-side worker client; wraps /capabilities, /shell, /workspace/sync,
+│                            /browser/fetch, and VM filesystem calls
+│
 └── coder/
     ├── mod.rs               Re-exports; pub fn verify()
-    ├── intent.rs            CodingIntent struct; detect_coding_intent() keyword heuristic
+    ├── intent.rs            CodingIntent struct; task-class heuristics for script/file/browser/repo tasks
     ├── adapter.rs           LanguageAdapter trait; AdapterManifest; get_adapter(); adapter_for_intent()
+    ├── scaffold.rs          Deterministic coding/browser scaffolds for common task shapes
+    ├── browser_contract.rs  Browser-task verification, selector summaries, classification helpers
     ├── manifest.rs          ExecutionManifest; WriteStep; ArtifactVerification
     ├── verifier.rs          verify() — pure filesystem check; zip spot-check via zip crate
     ├── repair_planner.rs    coding_repair_target(); CodingRepairTarget enum
@@ -249,12 +309,43 @@ Tools are the only mechanism through which the agent causes side effects. Every 
 | Tool name | Aliases | What it does |
 |-----------|---------|-------------|
 | `filesystem` | `file`, `fs` | Read, write, list, find, grep, delete, move, mkdir, copy, diff, stat, tree, zip_dir within workspace |
-| `shell` | `run_command`, `bash`, `exec` | Execute shell commands in the workspace; OS-aware; timeout-guarded |
+| `shell` | `run_command`, `bash`, `exec` | Execute shell commands locally or in the VM worker depending on `execution_mode`; timeout-guarded |
 | `git` | `git_tool` | git status, log, diff, add, commit, branch, checkout, clone, pull, push |
 | `web_search` | `search`, `duckduckgo_search` | Single-query search via SearXNG JSON or DDG HTML fallback |
 | `parallel_search` | `multi_search` | Multi-query parallel search with deduplication |
 | `http_fetch` | `fetch`, `curl` | HTTP GET/POST; HTML-to-text extraction; JSON passthrough |
 | `save_knowledge` | `kb_save`, `knowledge_save` | Persist curated content to the knowledge base |
+
+In remote mode, the important practical rule is:
+
+- `shell` and `filesystem` should operate against the VM workspace, not the host repo tree
+
+## Remote Worker API
+
+The worker running inside the VM exposes the following contract:
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/health` | Basic liveness |
+| `GET` | `/capabilities` | Worker feature snapshot, including browser automation readiness |
+| `POST` | `/workspace/sync` | Replace or refresh the VM task workspace mirror |
+| `POST` | `/shell` | Run shell commands inside the VM workspace |
+| `POST` | `/browser/fetch` | Simple browser-like fetch path from the VM |
+| `POST` | `/filesystem/read` | Read VM file |
+| `POST` | `/filesystem/write` | Write VM file |
+| `POST` | `/filesystem/list` | List VM tree |
+| `POST` | `/filesystem/find` | Find paths in VM workspace |
+| `POST` | `/filesystem/grep` | Search file contents in VM workspace |
+| `POST` | `/filesystem/delete` | Delete VM path |
+| `POST` | `/filesystem/mkdir` | Create VM directory |
+| `POST` | `/filesystem/rename` | Rename VM path |
+
+The `/capabilities` response is important because it tells the coordinator whether the worker actually supports:
+
+- shell
+- browser fetch
+- VM filesystem actions
+- browser automation runtime readiness
 
 **`zip_dir` filesystem action** (added in Phase 1):
 
@@ -299,25 +390,25 @@ Five independent SQLite stores, each with its own query pattern and trust model:
 
 ---
 
-## Coder Pipeline (Phase 1)
+## Coder Pipeline
 
-Phase 1 adds typed contracts for coding tasks so the agent can be mechanically verified rather than relying solely on LLM self-assessment.
+The coding path is moving away from generic chat behavior and toward explicit task contracts.
 
-### How it works
+### Current behavior
 
-1. **CodingClassifier node** (between Intake and Planner): calls `detect_coding_intent()` — a pure keyword heuristic (no LLM). Detects intents: `new_project`, `modify_existing`, `debug_existing`, `add_feature`, `package_existing`. Sets `state.coding_intent`; stores adapter manifest as artifact.
+1. **CodingClassifier node** (between Intake and Planner): uses heuristics to detect coding-oriented tasks and browser-task intent so the planner can choose a smaller, more deterministic recipe.
 
-2. **Planner injection**: when `coding_intent` is set, the planner receives a CODING PLAN CONTRACT enforcing: workspace inspection first → manifest step (output_key=`coding_execution_manifest`) → one file write step per file → verification steps using adapter recipes → zip_dir if packaging required → answer step.
+2. **Planner injection**: coding tasks get a stricter contract. Simple file/script tasks should trend toward `write -> run -> read -> answer` instead of broad freeform planning.
 
 3. **ExecutionManifest**: produced as a JSON LLM-only step. Contains: `project_root`, `required_files`, `write_plan`, `verification_plan` (ordered recipe names), `expected_artifacts` (including zip path). Auto-loaded from `coding_execution_manifest` artifact after every ToolExecution.
 
-4. **ArtifactVerifier** (after ToolExecution, when manifest is set): mechanical filesystem check — no LLM. Checks required files exist with size > 0; checks zip entries include expected source files and exclude `target/`; reads `*_result` artifacts for shell exit codes. Returns `ArtifactVerification { status, missing_files, missing_artifacts, build_passed, package_verified }`.
+4. **ArtifactVerifier**: still performs mechanical checks, but browser tasks now also rely on exact execution-artifact verification instead of narrative-only success.
 
 5. **Critic integration**: if `artifact_verification` is present with missing files or build failure, the critic produces a deterministic fail with `confidence=1.0` — no LLM call needed.
 
-6. **Targeted repair**: `coding_repair_target()` reads `ArtifactVerification` and returns `WriteFile(path)`, `PatchSource(root)`, `RunPackage(zip_path)`, or `General` — injected into the repair prompt so the model generates a targeted fix rather than a generic retry.
+6. **Targeted repair**: repair logic is trying to prefer bounded fixes over wandering retries. For browser tasks that means corrected script generation and rerun, not repeated speculative replanning.
 
-7. **ProjectCard SSE event**: emitted after each verification pass, rendered as a status card in the UI showing language, profile, files written, build status, and a download link for the zip.
+7. **ProjectCard SSE event**: still reports coding-task progress to the UI, but the bigger current product need is making the final answer reflect the last verified result instead of the first failure.
 
 ### Language adapters
 
@@ -593,6 +684,12 @@ SearXNG configuration files are in `searxng/`. The `settings.yml` enables the JS
 
 ### Agent behavior
 
+- **Browser finalization is still imperfect:** a browser task may execute correctly but still surface `unverified_browser_output` if the finalization layer does not accept the produced artifact as verified. This is an agent-layer bug, not necessarily a worker runtime failure.
+
+- **Stale browser summary contamination:** a successful normal-page run can still inherit a stale blocked-site conclusion from earlier browser attempts if finalization chooses the wrong artifact history.
+
+- **Workspace mirror behavior is still too destructive in some flows:** the VM-first sync path can replace more workspace state than intended, which is why some task-created files have appeared to disappear between runs.
+
 - **Repair loop search regression:** when `CodingRepairTarget::RunPackage` fires (zip step failed), the model sometimes regenerates a `parallel_search` step instead of a `zip_dir` call. The typed repair directive is injected but overridden by strong planner prior. A deterministic JSON generation path for zip repair is planned.
 
 - **Hallucination through repair cycles:** even with RESEARCH_CRITIC catching hallucinated specifics, the model may substitute different hallucinated facts in cycle 2+. A planned fix: inject the raw `facts` artifact verbatim into the repair prompt on cycle ≥ 2 so the model cannot generate fresh hallucinations.
@@ -614,6 +711,10 @@ SearXNG configuration files are in `searxng/`. The `settings.yml` enables the JS
 - **Context window pressure:** research tasks with multiple large HTTP fetches can fill the context window. `truncate_artifacts()` caps individual fetch artifacts at 200 characters and total artifact payload at ~4K characters, but this means detailed content may be truncated before reaching the LLM.
 
 - **Single-binary process model:** there is no worker queue, task priority, or request isolation. Concurrent requests share the same Ollama connection and tool registry. Under load, long tasks will queue behind each other.
+
+- **Stop/cancel UX is weaker than it should be:** `/task/:id/cancel` exists and the orchestrator has cancellation tokens, but the UI can still lag or feel sticky during long browser or shell tasks.
+
+- **Browser runtime persistence inside the VM is still operationally fragile:** Playwright and Chromium can work correctly once installed, but the bootstrap path has not yet made that setup as durable and automatic as it should be.
 
 ### Coder pipeline (Phase 1 known gaps)
 
@@ -661,6 +762,7 @@ High-risk tasks (risk score ≥ threshold, default 8) trigger a human approval g
 
 ```
 aihomeserver/
+├── desktop/                Electron launcher, packaging scripts, Windows app resources
 ├── src/                    Rust source (see Module Reference above)
 ├── docs/                   Design documents, worklogs, specs
 ├── scripts/                Helper scripts (eval.ps1, metrics.ps1)
@@ -685,6 +787,23 @@ aihomeserver/
 - `*.db`, `*.db-wal`, `*.db-shm` (SQLite databases)
 - `config.json` (local settings)
 - `.claude/`, `.env` (local tooling)
+
+## Desktop Launcher Notes
+
+The desktop app is now part of the real product surface, not just a thin wrapper.
+
+Important behaviors:
+
+- it can launch or reconnect to the Hyper-V worker VM
+- it sets coordinator `WORKER_URL` to a host-routable path for the container
+- it exposes desktop controls and a fast runtime rebuild path
+- packaging now verifies embedded resources so stale worker/coordinator code does not silently ship
+
+The packaging verification script is:
+
+- `desktop/scripts/verify-packaged-resources.js`
+
+This checks that the packaged app includes the current worker/coordinator surfaces instead of shipping an outdated embedded repo snapshot.
 
 ---
 
