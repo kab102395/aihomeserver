@@ -146,7 +146,32 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
 
     // Tool step: repair by generating a corrected tool call JSON and overwrite output_key.
     if let Some(tool_name) = step.tool_binding.as_ref() {
-        // For coding tasks, try a deterministic repair first (no LLM):
+        // For browser automation tasks, keep retries on the deterministic scaffold.
+        // This prevents repair cycles from drifting into ad-hoc Playwright scripts.
+        if let Some(intent) = state.coding_intent.as_ref() {
+            if intent.task_class == "browser_automation_task" {
+                if let Some(tool_call) = crate::coder::deterministic_browser_tool_call(
+                    intent,
+                    &state.user_request,
+                    step,
+                    &state.artifacts,
+                ) {
+                    state.log_meta(
+                        "repair",
+                        "Applied deterministic browser repair tool call",
+                        serde_json::json!({
+                            "output_key": output_key,
+                            "tool": tool_name,
+                            "step": state.current_step,
+                        }),
+                    );
+                    state.artifacts.insert(output_key, tool_call);
+                    return Ok(state);
+                }
+            }
+        }
+
+        // For other coding tasks, try a deterministic repair first (no LLM):
         // - packaging/build tool calls are generated mechanically from the manifest + verifier.
         if state.coding_intent.is_some() {
             if let (Some(manifest), Some(verif_val)) =

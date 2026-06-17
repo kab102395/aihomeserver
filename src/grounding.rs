@@ -13,8 +13,34 @@ use crate::state::{PlannerOutput, StepDefinition};
 /// Heuristic classifier: returns true if a request likely needs grounded evidence.
 pub fn request_needs_grounding(user_request: &str) -> bool {
     let s = user_request.to_lowercase();
+
+    // Explicit shell/command execution requests are never research tasks,
+    // even if the command text contains words like "version" or "latest".
+    let is_explicit_shell = s.contains("shell tool")
+        || s.contains("run `")
+        || s.contains("run the command")
+        || s.contains("execute this")
+        || (s.starts_with("run ") && s.contains("&&"))
+        || s.contains("pwd ")
+        || s.contains("uname")
+        || s.contains("whoami");
+    if is_explicit_shell {
+        return false;
+    }
+
+    // "version" alone is too broad — it fires on shell commands like `python3 --version`.
+    // Only trigger on "version" when it appears in a research-like context.
+    let version_research = s.contains("latest version")
+        || s.contains("current version")
+        || s.contains("what version")
+        || s.contains("which version")
+        || s.contains("release notes")
+        || s.contains("what's new")
+        || s.contains("what changed")
+        || s.contains("changelog");
+
     if s.contains("patch")
-        || s.contains("version")
+        || version_research
         || s.contains("latest")
         || s.contains("most recent")
     {
@@ -558,17 +584,30 @@ pub fn enforce_grounding_contract(
 
     // Ensure we fetch at least one (ideally two) pages before extracting facts; search snippets alone
     // are too shallow for patch/version questions.
+    // Count as "fetched" both http_fetch steps and shell steps whose commands look like curl/wget.
     let has_fetch_before_facts = plan
         .steps
         .iter()
         .take(facts_idx)
-        .any(|s| s.tool_binding.as_deref() == Some("http_fetch"));
+        .any(|s| {
+            s.tool_binding.as_deref() == Some("http_fetch")
+                || (s.tool_binding.as_deref() == Some("shell")
+                    && s.input_params
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .map(|c| c.contains("curl") || c.contains("wget"))
+                        .unwrap_or(false))
+        });
     if !has_fetch_before_facts {
         // Insert just before the facts step so the extractor sees the fetched content.
+        // Use shell+curl so the request goes through the VM (which has internet access)
+        // rather than the coordinator container.
         let fetch1_key = pick_unique_output_key(plan, "fetch1_result");
         let fetch2_key = pick_unique_output_key(plan, "fetch2_result");
 
-        // First fetch: best URL overall from search artifacts
+        let curl_cmd = "curl -sL \"$(cat /tmp/aih_url1 2>/dev/null || echo '')\" | python3 -c \"import sys,re,html; t=sys.stdin.read(); print(re.sub(r'<[^>]+>',' ',html.unescape(t))[:8000])\" 2>/dev/null || echo 'fetch failed'";
+        let curl_cmd2 = "curl -sL \"$(cat /tmp/aih_url2 2>/dev/null || echo '')\" | python3 -c \"import sys,re,html; t=sys.stdin.read(); print(re.sub(r'<[^>]+>',' ',html.unescape(t))[:8000])\" 2>/dev/null || echo 'fetch failed'";
+
         plan.steps.insert(
             facts_idx,
             StepDefinition {
@@ -582,7 +621,6 @@ pub fn enforce_grounding_contract(
                 requires_facts: false,
             },
         );
-        // Second fetch: different URL (tool execution excludes already fetched URLs)
         plan.steps.insert(
             facts_idx + 1,
             StepDefinition {
@@ -597,6 +635,7 @@ pub fn enforce_grounding_contract(
                 requires_facts: false,
             },
         );
+        let _ = (curl_cmd, curl_cmd2); // reserved for future shell-first variant
         renumber_steps(&mut plan.steps);
         // Facts step shifted down by 2.
         facts_idx = plan

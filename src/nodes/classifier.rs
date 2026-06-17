@@ -26,11 +26,14 @@ pub async fn run(mut state: SystemState) -> Result<SystemState> {
                 "Coding task detected",
                 serde_json::json!({
                     "intent": ci.intent,
+                    "task_class": ci.task_class,
                     "language": ci.language,
                     "deliverable": ci.deliverable,
                     "framework": ci.framework,
                     "requires_build": ci.requires_build,
                     "requires_package": ci.requires_package,
+                    "disallow_installs": ci.disallow_installs,
+                    "wants_exact_outputs": ci.wants_exact_outputs,
                 }),
             );
 
@@ -39,7 +42,7 @@ pub async fn run(mut state: SystemState) -> Result<SystemState> {
                 let manifest = adapter.manifest();
                 let profile = adapter.resolve_profile(
                     ci.framework.as_deref(),
-                    Some(&ci.intent),
+                    Some(&ci.task_class),
                 );
                 state.log_meta(
                     "classifier",
@@ -61,6 +64,15 @@ pub async fn run(mut state: SystemState) -> Result<SystemState> {
                     phase: format!("coding_{}", ci.language.as_deref().unwrap_or("unknown")),
                 });
             }
+
+            state.artifacts.insert(
+                "coding_task_class".to_string(),
+                serde_json::Value::String(ci.task_class.clone()),
+            );
+            state.artifacts.insert(
+                "coding_executor_guidance".to_string(),
+                serde_json::Value::String(crate::coder::executor_guidance(ci)),
+            );
         }
     }
 

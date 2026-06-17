@@ -37,6 +37,7 @@ fn in_container() -> bool {
 const SYSTEM_PROMPT: &str = r#"You are the planning brain of aihomeserver — a local AI assistant running on Kyle's home server.
 You have a sandboxed Ubuntu 24.04 Linux VM (the "worker") where you can freely run shell commands, install packages, build code, and browse the web.
 The worker VM has: bash, python3, standard POSIX tools, and internet access.
+In remote mode, the active task computer is the VM and the live task workspace is `/workspace`.
 You also have access to: filesystem (workspace), git, web search, and web fetch.
 When asked "what can you do", "what tools do you have", or similar — plan a single LLM-only step that answers from the identity above.
 
@@ -57,12 +58,39 @@ Each entry in "steps" must be an object:
   "step_id": "1",
   "action": "what to do",
   "tool_binding": "tool_name" | null,
-  "input_params": {},
+  "input_params": { <ACTUAL TOOL PARAMS — see schemas below, never leave {} for tool steps> },
   "output_key": "artifact_key",
   "expected_output": null,
   "output_format": null | "json",
   "requires_facts": false
 }
+
+CRITICAL: For any step with tool_binding != null, you MUST fill input_params with the complete,
+concrete params the tool needs. Do NOT leave input_params as {}. The executor uses input_params
+directly — if you leave them empty the step will fail with a hard error.
+
+Filesystem input_params schemas:
+  In remote mode these operate inside the VM workspace rooted at `/workspace`.
+  write: {"action":"write","path":"hello_plan.py","content":"print('hello')"}
+  read:  {"action":"read","path":"hello_plan.py"}
+  list:  {"action":"list","path":"."}
+  find:  {"action":"find","path":".","pattern":"*.py"}
+  grep:  {"action":"grep","path":"src","query":"ToolResult"}
+
+Shell input_params schema:
+  {"command":"python3 hello_plan.py","cwd":".","timeout_secs":30}
+  The "command" field is REQUIRED. Always include it with a concrete bash command string.
+
+LLM-only steps (tool_binding: null) use input_params: {}
+
+Example tool step (filesystem write):
+  {"step_id":"1","action":"Write hello_plan.py","tool_binding":"filesystem","input_params":{"action":"write","path":"hello_plan.py","content":"print('worker path ok')"},"output_key":"write_result","expected_output":null,"output_format":null,"requires_facts":false}
+
+Example tool step (shell run):
+  {"step_id":"2","action":"Run the script","tool_binding":"shell","input_params":{"command":"python3 hello_plan.py","cwd":".","timeout_secs":30},"output_key":"run_result","expected_output":null,"output_format":null,"requires_facts":false}
+
+Example tool step (filesystem read):
+  {"step_id":"3","action":"Read file for verification","tool_binding":"filesystem","input_params":{"action":"read","path":"hello_plan.py"},"output_key":"file_contents","expected_output":null,"output_format":null,"requires_facts":false}
 
 🚨 RULE #1 — SEARCH BEFORE CODE OR GUIDES (ABSOLUTE, NO EXCEPTIONS):
   If the request asks you to write code, a guide, a script, or an analysis about ANY of:
@@ -132,6 +160,9 @@ USE "shell" to run commands in the Ubuntu 24.04 VM sandbox.
   Use shell proactively for: running code, inspecting the VM environment, installing packages,
   building projects, fetching URLs with curl, checking system state.
   You do NOT need to be "explicitly asked" — if a task is better done by running a command, use shell.
+  If the user says "append", use append-safe shell syntax such as:
+    {"command":"printf '%s\\n' 'edited by shell' >> hello_vm_2.txt","cwd":".","timeout_secs":30}
+  Do NOT replace the file with `>` when the request explicitly says append.
 
 USE "git" only when explicitly asked about git history, status, or commits.
   {"action":"status"} / {"action":"log","n":10} / {"action":"commit","message":"msg"}
@@ -304,6 +335,7 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
                 &state.capabilities,
                 &mut plan,
             );
+            normalize_plan(&mut plan);
             // Auto-KB saving is handled as a post-task hook in the HTTP layer to keep responses fast.
             state.log_meta(
                 "planner",
@@ -346,6 +378,35 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
     }
 
     Ok(state)
+}
+
+fn normalize_plan(plan: &mut crate::state::PlannerOutput) {
+    if plan.steps.is_empty() {
+        return;
+    }
+
+    if !plan.expected_outputs.iter().any(|k| k == "answer") {
+        plan.expected_outputs.push("answer".to_string());
+    }
+
+    let has_answer_step = plan
+        .steps
+        .iter()
+        .any(|s| s.output_key.as_deref() == Some("answer"));
+
+    if !has_answer_step {
+        let next_step_id = (plan.steps.len() + 1).to_string();
+        plan.steps.push(crate::state::StepDefinition {
+            step_id: next_step_id,
+            action: "Using the completed tool results, provide the final answer to the user with the requested outputs and verification details".to_string(),
+            tool_binding: None,
+            output_format: None,
+            requires_facts: false,
+            input_params: serde_json::json!({}),
+            output_key: Some("answer".to_string()),
+            expected_output: None,
+        });
+    }
 }
 
 /// Build the planner input: request + injected context (history, KB, semantic examples, config).
@@ -409,8 +470,9 @@ fn build_context(state: &SystemState) -> String {
     }
 
     // ── Coding task injection ─────────────────────────────────────────────────
-    // If CodingClassifier detected a coding task, inject the adapter manifest and
-    // mandatory coding plan contract so the planner generates a verifiable plan.
+    // If CodingClassifier detected a coding task, inject task-class-specific
+    // planning rails so trivial script/file tasks stay compact while repo-wide
+    // patch work still gets a manifest-driven plan.
     if let Some(ci) = &state.coding_intent {
         let profile = state
             .artifacts
@@ -426,48 +488,28 @@ fn build_context(state: &SystemState) -> String {
         ctx.push_str("\n=== CODING TASK DETECTED ===\n");
         ctx.push_str(&format!("Language:    {}\n", ci.language.as_deref().unwrap_or("unknown")));
         ctx.push_str(&format!("Profile:     {}\n", profile));
+        ctx.push_str(&format!("Task class:  {}\n", ci.task_class));
         ctx.push_str(&format!("Intent:      {}\n", ci.intent));
         ctx.push_str(&format!("Deliverable: {}\n", ci.deliverable));
         ctx.push_str(&format!("Requires build:   {}\n", ci.requires_build));
         ctx.push_str(&format!("Requires package: {}\n", ci.requires_package));
+        ctx.push_str(&format!("Install forbidden by user: {}\n", ci.disallow_installs));
+        ctx.push_str(&format!("Needs exact outputs:       {}\n", ci.wants_exact_outputs));
         if !adapter_json.is_empty() {
             ctx.push_str(&format!("\nLanguage adapter manifest:\n{}\n", adapter_json));
         }
         if let Some(adapter) = crate::coder::adapter_for_intent(ci) {
             ctx.push_str(&format!("\n{}\n", adapter.manifest().system_prompt_addition));
         }
-
-        ctx.push_str(r#"
-CODING PLAN CONTRACT (MANDATORY — follow exactly):
-1. FIRST STEP: filesystem list/find to inspect workspace (for modify_existing) OR skip for new projects.
-2. MANIFEST STEP: tool_binding=null, output_key="coding_execution_manifest", output_format="json"
-   The LLM must output a JSON object with these fields:
-   {
-     "project_name": "...",
-     "project_root": "...",        // relative to workspace, e.g. "snake_rust"
-     "language": "...",
-     "profile": "...",
-     "intent": "...",
-     "deliverable": "...",
-     "required_files": ["Cargo.toml", "src/main.rs", ...],   // relative to project_root
-     "write_plan": [{"path": "...", "purpose": "..."}],      // full relative paths from workspace root
-     "verification_plan": ["check_project", "build_release"],// recipe names from adapter
-     "expected_artifacts": ["snake_rust/Cargo.toml", "snake_rust/src/main.rs", "snake_rust_source.zip"]
-   }
-3. FILE WRITE STEPS: one filesystem step per file. Use action="write" (creates parent dirs).
-4. VERIFICATION STEPS: shell steps using the exact commands from verification_recipes.
-   Shell cwd MUST be set to the project_root inside the workspace.
-5. PACKAGE STEP (if requires_package): filesystem action="zip_dir" with:
-   {"action":"zip_dir","source_dir":"<project_root>","output_path":"<name>.zip","exclude":["target/",".git/"]}
-6. ANSWER STEP: final LLM step summarizing paths, build status, and download link.
-
-FILESYSTEM ACTIONS SUPPORTED: write, read, mkdir, list, find, grep, delete, zip_dir
-DO NOT USE: create_file, create_dir, save, touch (these return unsupported_action)
-
-risk_score for new coding projects: 4-6 (needs verification but not destructive)
-"#);
-        ctx.push_str("=== END CODING CONTRACT ===\n\n");
+        ctx.push_str("\n=== CODING PLAN CONTRACT ===\n");
+        ctx.push_str(&crate::coder::planner_contract(ci));
+        ctx.push_str("\n=== END CODING CONTRACT ===\n\n");
         ctx.push_str("IMPORTANT: Do NOT answer this request from the knowledge base or training data.\n");
+        if crate::coder::should_use_manifest(ci) {
+            ctx.push_str("This task needs a manifest-driven coding plan because it is multi-file or repo-scale.\n");
+        } else {
+            ctx.push_str("This is a small coding task. Keep the plan compact and skip manifest overhead.\n");
+        }
         ctx.push_str("The user wants actual files created in the workspace. Use the CODING PLAN CONTRACT above.\n\n");
 
         // Also inject execution manifest if already loaded (from replan)

@@ -7,11 +7,12 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "pack": "electron-builder --dir",
-    "dist": "electron-builder --win nsis portable",
-    "dist:both": "electron-builder --win nsis portable",
-    "dist:installer": "electron-builder --win nsis",
-    "dist:portable": "electron-builder --win portable"
+    "verify:embedded": "node scripts/verify-packaged-resources.js",
+    "pack": "electron-builder --dir && npm run verify:embedded",
+    "dist": "electron-builder --win nsis portable && npm run verify:embedded",
+    "dist:both": "electron-builder --win nsis portable && npm run verify:embedded",
+    "dist:installer": "electron-builder --win nsis && npm run verify:embedded",
+    "dist:portable": "electron-builder --win portable && npm run verify:embedded"
   },
   "devDependencies": {
     "electron": "^33.2.1",

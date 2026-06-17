@@ -33,13 +33,82 @@ const RUNTIME_MODE = (process.env.AIHOMESERVER_RUNTIME || '').trim().toLowerCase
 const DEFAULT_HYPERV_ROOT =
   process.env.AIHOMESERVER_VM_ROOT ||
   path.join(process.env.ProgramData || 'C:\\ProgramData', 'AIHomeServer', 'hyperv');
-const DEFAULT_HYPERV_IMAGE = path.join(
-  DEFAULT_HYPERV_ROOT,
-  'image',
-  `ubuntu-${DEFAULT_VM_IMAGE_VERSION}`,
-  `ubuntu-${DEFAULT_VM_IMAGE_VERSION}-server-cloudimg-amd64-base.vhdx`
-);
 const LAUNCHER_LOG_DIR_NAME = 'logs';
+const DESKTOP_SETTINGS_FILE_NAME = 'desktop-settings.json';
+const launcherState = {
+  coordinatorUrl: DEFAULT_URL,
+  runtimeLabel: 'docker',
+  dockerEnv: {},
+  rebuildInFlight: false,
+  desktopSettings: null,
+};
+const DEFAULT_DESKTOP_SETTINGS = Object.freeze({
+  vmName: DEFAULT_VM_NAME,
+  vmIp: DEFAULT_VM_IP,
+  vmGateway: DEFAULT_VM_GATEWAY,
+  vmSwitch: DEFAULT_VM_SWITCH,
+  vmCpus: DEFAULT_VM_CPUS,
+  vmMemoryMb: DEFAULT_VM_MEMORY_MB,
+  vmPort: DEFAULT_VM_PORT,
+  vmImageVersion: DEFAULT_VM_IMAGE_VERSION,
+  repoUrl: DEFAULT_REPO_URL,
+  repoBranch: DEFAULT_REPO_BRANCH,
+  hypervRoot: DEFAULT_HYPERV_ROOT,
+});
+
+function desktopSettingsPath() {
+  return path.join(app.getPath('userData'), DESKTOP_SETTINGS_FILE_NAME);
+}
+
+function normalizeDesktopSettings(raw = {}) {
+  const merged = { ...DEFAULT_DESKTOP_SETTINGS, ...(raw || {}) };
+  const vmCpus = Number.parseInt(merged.vmCpus, 10);
+  const vmMemoryMb = Number.parseInt(merged.vmMemoryMb, 10);
+  const vmPort = Number.parseInt(merged.vmPort, 10);
+  return {
+    vmName: String(merged.vmName || DEFAULT_DESKTOP_SETTINGS.vmName).trim() || DEFAULT_DESKTOP_SETTINGS.vmName,
+    vmIp: String(merged.vmIp || DEFAULT_DESKTOP_SETTINGS.vmIp).trim() || DEFAULT_DESKTOP_SETTINGS.vmIp,
+    vmGateway: String(merged.vmGateway || DEFAULT_DESKTOP_SETTINGS.vmGateway).trim() || DEFAULT_DESKTOP_SETTINGS.vmGateway,
+    vmSwitch: String(merged.vmSwitch || DEFAULT_DESKTOP_SETTINGS.vmSwitch).trim() || DEFAULT_DESKTOP_SETTINGS.vmSwitch,
+    vmCpus: Number.isFinite(vmCpus) && vmCpus > 0 ? vmCpus : DEFAULT_DESKTOP_SETTINGS.vmCpus,
+    vmMemoryMb: Number.isFinite(vmMemoryMb) && vmMemoryMb > 0 ? vmMemoryMb : DEFAULT_DESKTOP_SETTINGS.vmMemoryMb,
+    vmPort: Number.isFinite(vmPort) && vmPort > 0 ? vmPort : DEFAULT_DESKTOP_SETTINGS.vmPort,
+    vmImageVersion: String(merged.vmImageVersion || DEFAULT_DESKTOP_SETTINGS.vmImageVersion).trim() || DEFAULT_DESKTOP_SETTINGS.vmImageVersion,
+    repoUrl: String(merged.repoUrl || DEFAULT_DESKTOP_SETTINGS.repoUrl).trim() || DEFAULT_DESKTOP_SETTINGS.repoUrl,
+    repoBranch: String(merged.repoBranch || DEFAULT_DESKTOP_SETTINGS.repoBranch).trim() || DEFAULT_DESKTOP_SETTINGS.repoBranch,
+    hypervRoot: String(merged.hypervRoot || DEFAULT_DESKTOP_SETTINGS.hypervRoot).trim() || DEFAULT_DESKTOP_SETTINGS.hypervRoot,
+  };
+}
+
+function getDesktopSettings() {
+  if (launcherState.desktopSettings) {
+    return launcherState.desktopSettings;
+  }
+  try {
+    const text = fs.readFileSync(desktopSettingsPath(), 'utf8');
+    launcherState.desktopSettings = normalizeDesktopSettings(JSON.parse(text));
+  } catch (_) {
+    launcherState.desktopSettings = normalizeDesktopSettings();
+  }
+  return launcherState.desktopSettings;
+}
+
+function saveDesktopSettings(nextSettings) {
+  const normalized = normalizeDesktopSettings(nextSettings);
+  fs.mkdirSync(app.getPath('userData'), { recursive: true });
+  fs.writeFileSync(desktopSettingsPath(), JSON.stringify(normalized, null, 2), 'utf8');
+  launcherState.desktopSettings = normalized;
+  return normalized;
+}
+
+function hypervImagePath(settings = getDesktopSettings()) {
+  return path.join(
+    settings.hypervRoot,
+    'image',
+    `ubuntu-${settings.vmImageVersion}`,
+    `ubuntu-${settings.vmImageVersion}-server-cloudimg-amd64-base.vhdx`
+  );
+}
 
 function launcherLogDir() {
   return path.join(app.getPath('userData'), LAUNCHER_LOG_DIR_NAME);
@@ -121,12 +190,12 @@ function probeWorkerAuth(token, workerUrl, timeoutMs = 8000) {
   });
 }
 
-function probeCacheStatus() {
+function probeCacheStatus(settings = getDesktopSettings()) {
   return {
-    imageExists: fs.existsSync(DEFAULT_HYPERV_IMAGE),
-    logsExist: fs.existsSync(path.join(DEFAULT_HYPERV_ROOT, 'logs')),
-    root: DEFAULT_HYPERV_ROOT,
-    imagePath: DEFAULT_HYPERV_IMAGE,
+    imageExists: fs.existsSync(hypervImagePath(settings)),
+    logsExist: fs.existsSync(path.join(settings.hypervRoot, 'logs')),
+    root: settings.hypervRoot,
+    imagePath: hypervImagePath(settings),
   };
 }
 
@@ -246,14 +315,19 @@ function composeCommand() {
   return { command: 'docker', args };
 }
 
-function startLocalDockerStack(extraEnv = {}) {
-  const { command, args } = composeCommand();
+function hasDevCompose() {
+  return COMPOSE_FILES.some((file) => path.basename(file).toLowerCase() === 'docker-compose.dev.yml');
+}
+
+function runComposeCommand(args, extraEnv = {}, options = {}) {
   const logs = composeLogPaths();
-  fs.writeFileSync(logs.stdout, '', 'utf8');
-  fs.writeFileSync(logs.stderr, '', 'utf8');
-  appendLauncherLog(`Starting coordinator stack from ${COMPOSE_DIR} with command: ${command} ${args.join(' ')} (host port ${extraEnv.AIHOMESERVER_HOST_PORT || 'default'})`);
+  if (options.resetLogs) {
+    fs.writeFileSync(logs.stdout, '', 'utf8');
+    fs.writeFileSync(logs.stderr, '', 'utf8');
+  }
+  appendLauncherLog(`Running docker ${args.join(' ')} from ${COMPOSE_DIR}`);
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    const child = spawn('docker', args, {
       cwd: COMPOSE_DIR,
       detached: false,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -265,23 +339,28 @@ function startLocalDockerStack(extraEnv = {}) {
 
     child.stdout.on('data', (chunk) => stdoutStream.write(chunk));
     child.stderr.on('data', (chunk) => stderrStream.write(chunk));
-
     child.on('error', reject);
     child.on('exit', (code) => {
       stdoutStream.end();
       stderrStream.end();
-      appendLauncherLog(`docker compose exited with code ${code}`);
+      appendLauncherLog(`docker ${args.join(' ')} exited with code ${code}`);
       if (code === 0) {
         resolve();
         return;
       }
       reject(
         new Error(
-          `docker compose exited with code ${code}. Logs: ${logs.stdout} and ${logs.stderr}`
+          `docker ${args.join(' ')} exited with code ${code}. Logs: ${logs.stdout} and ${logs.stderr}`
         )
       );
     });
   });
+}
+
+function startLocalDockerStack(extraEnv = {}) {
+  const { command, args } = composeCommand();
+  appendLauncherLog(`Starting coordinator stack from ${COMPOSE_DIR} with command: ${command} ${args.join(' ')} (host port ${extraEnv.AIHOMESERVER_HOST_PORT || 'default'})`);
+  return runComposeCommand(args, extraEnv, { resetLogs: true });
 }
 
 async function startLocalDockerStackWithRetry(baseEnv = {}, maxAttempts = 5) {
@@ -333,15 +412,122 @@ function createWindow() {
   return win;
 }
 
+function installDesktopControls(win) {
+  win.webContents.on('did-finish-load', () => {
+    const currentUrl = win.webContents.getURL();
+    if (!currentUrl.startsWith('http://127.0.0.1:') && !currentUrl.startsWith('http://localhost:')) {
+      return;
+    }
+
+    win.webContents.executeJavaScript(`
+      (() => {
+        if (!window.aihomeserverLauncher || document.getElementById('aihomeserver-desktop-controls')) {
+          return;
+        }
+
+        const wrap = document.createElement('div');
+        wrap.id = 'aihomeserver-desktop-controls';
+        wrap.style.position = 'fixed';
+        wrap.style.right = '18px';
+        wrap.style.bottom = '18px';
+        wrap.style.zIndex = '2147483647';
+        wrap.style.display = 'flex';
+        wrap.style.flexDirection = 'column';
+        wrap.style.gap = '8px';
+        wrap.style.alignItems = 'flex-end';
+
+        const status = document.createElement('div');
+        status.textContent = 'Desktop controls (backend only)';
+        status.style.padding = '6px 10px';
+        status.style.borderRadius = '10px';
+        status.style.background = 'rgba(12,16,24,0.9)';
+        status.style.color = '#c9d7ea';
+        status.style.font = '12px Segoe UI, sans-serif';
+        status.style.border = '1px solid rgba(255,255,255,0.12)';
+
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = 'Rebuild Coordinator';
+        button.style.padding = '10px 14px';
+        button.style.borderRadius = '12px';
+        button.style.border = '1px solid rgba(255,255,255,0.12)';
+        button.style.background = 'rgba(19,28,40,0.96)';
+        button.style.color = '#f0f6ff';
+        button.style.font = '600 13px Segoe UI, sans-serif';
+        button.style.cursor = 'pointer';
+        button.style.boxShadow = '0 12px 32px rgba(0,0,0,0.25)';
+
+        button.addEventListener('click', async () => {
+          const previous = button.textContent;
+          button.disabled = true;
+          button.textContent = 'Rebuilding...';
+          status.textContent = 'Restarting coordinator...';
+          try {
+            const result = await window.aihomeserverLauncher.rebuildApp();
+            if (!result || !result.ok) {
+              throw new Error((result && result.error) || 'Unknown rebuild failure');
+            }
+            button.textContent = 'Rebuilt';
+            status.textContent = 'Coordinator healthy';
+          } catch (error) {
+            console.error('Desktop rebuild failed', error);
+            button.textContent = 'Failed';
+            status.textContent = 'Rebuild failed';
+          } finally {
+            setTimeout(() => {
+              button.disabled = false;
+              button.textContent = previous;
+            }, 2500);
+          }
+        });
+
+        wrap.appendChild(status);
+        wrap.appendChild(button);
+        document.body.appendChild(wrap);
+      })();
+    `).catch((error) => appendLauncherLog(`Desktop control injection failed: ${error.message}`));
+  });
+}
+
+async function rebuildCurrentApp() {
+  if (launcherState.rebuildInFlight) {
+    return { ok: false, error: 'A rebuild is already in progress.' };
+  }
+  launcherState.rebuildInFlight = true;
+  try {
+    const args = hasDevCompose()
+      ? ['compose', ...COMPOSE_FILES.flatMap((file) => ['-f', file]), 'up', '-d', '--force-recreate', 'aihomeserver']
+      : ['compose', ...COMPOSE_FILES.flatMap((file) => ['-f', file]), 'up', '-d', '--build', 'aihomeserver'];
+    appendLauncherLog(
+      hasDevCompose()
+        ? 'Desktop rebuild requested: recreating dev coordinator so source and env changes are picked up.'
+        : 'Desktop rebuild requested: rebuilding coordinator image.'
+    );
+    await runComposeCommand(args, launcherState.dockerEnv, { resetLogs: false });
+    const ready = await waitForServerReady(launcherState.coordinatorUrl, 300000);
+    if (!ready) {
+      throw new Error(`Coordinator did not become healthy at ${launcherState.coordinatorUrl} after rebuild.`);
+    }
+    return {
+      ok: true,
+      mode: hasDevCompose() ? 'recreate' : 'rebuild',
+      coordinatorUrl: launcherState.coordinatorUrl,
+    };
+  } finally {
+    launcherState.rebuildInFlight = false;
+  }
+}
+
 ipcMain.handle('open-worker-folder', async (_event, kind) => {
-  const target = kind === 'logs' ? path.join(DEFAULT_HYPERV_ROOT, 'logs') : DEFAULT_HYPERV_ROOT;
+  const settings = getDesktopSettings();
+  const target = kind === 'logs' ? path.join(settings.hypervRoot, 'logs') : settings.hypervRoot;
   if (kind === 'logs') {
     try {
       await exportHyperVLogs({
-        vmName: DEFAULT_VM_NAME,
-        vmIp: DEFAULT_VM_IP,
-        workerPort: DEFAULT_VM_PORT,
-        rootDir: DEFAULT_HYPERV_ROOT,
+        vmName: settings.vmName,
+        vmIp: settings.vmIp,
+        workerPort: settings.vmPort,
+        rootDir: settings.hypervRoot,
       });
     } catch (error) {
       fs.mkdirSync(target, { recursive: true });
@@ -362,15 +548,45 @@ ipcMain.handle('open-launcher-log-folder', async () => {
   return target;
 });
 
+ipcMain.handle('open-host-repo-folder', async () => {
+  await shell.openPath(COMPOSE_DIR);
+  return COMPOSE_DIR;
+});
+
+ipcMain.handle('get-desktop-settings', async () => {
+  return { ok: true, settings: getDesktopSettings() };
+});
+
+ipcMain.handle('save-desktop-settings', async (_event, nextSettings) => {
+  const previous = getDesktopSettings();
+  const settings = saveDesktopSettings({ ...previous, ...(nextSettings || {}) });
+  const restartRequired = [
+    'vmName',
+    'vmIp',
+    'vmGateway',
+    'vmSwitch',
+    'vmCpus',
+    'vmMemoryMb',
+    'vmPort',
+    'vmImageVersion',
+    'repoUrl',
+    'repoBranch',
+    'hypervRoot',
+  ].some((key) => previous[key] !== settings[key]);
+
+  return { ok: true, settings, restartRequired };
+});
+
 ipcMain.handle('get-vm-state', async () => {
   try {
+    const settings = getDesktopSettings();
     const status = await getHyperVStatus({
-      vmName: DEFAULT_VM_NAME,
-      vmIp: DEFAULT_VM_IP,
-      workerPort: DEFAULT_VM_PORT,
+      vmName: settings.vmName,
+      vmIp: settings.vmIp,
+      workerPort: settings.vmPort,
     });
     const workerHealthy = status.worker_port_open
-      ? await probeHealth(`http://${DEFAULT_VM_IP}:${DEFAULT_VM_PORT}`, 2000)
+      ? await probeHealth(`http://${settings.vmIp}:${settings.vmPort}`, 2000)
       : false;
     return { ...status, worker_healthy: workerHealthy };
   } catch (error) {
@@ -380,7 +596,8 @@ ipcMain.handle('get-vm-state', async () => {
 
 ipcMain.handle('stop-vm', async () => {
   try {
-    return await stopHyperV(DEFAULT_VM_NAME);
+    const settings = getDesktopSettings();
+    return await stopHyperV(settings.vmName);
   } catch (error) {
     return { ok: false, error: error.message };
   }
@@ -388,13 +605,22 @@ ipcMain.handle('stop-vm', async () => {
 
 ipcMain.handle('start-vm', async () => {
   try {
+    const settings = getDesktopSettings();
     return await startHyperV({
-      vmName: DEFAULT_VM_NAME,
-      vmIp: DEFAULT_VM_IP,
-      vmGateway: DEFAULT_VM_GATEWAY,
-      switchName: DEFAULT_VM_SWITCH,
-      workerPort: DEFAULT_VM_PORT,
+      vmName: settings.vmName,
+      vmIp: settings.vmIp,
+      vmGateway: settings.vmGateway,
+      switchName: settings.vmSwitch,
+      workerPort: settings.vmPort,
     });
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+});
+
+ipcMain.handle('rebuild-app', async () => {
+  try {
+    return await rebuildCurrentApp();
   } catch (error) {
     return { ok: false, error: error.message };
   }
@@ -606,10 +832,12 @@ function loadStartingPage(win, options) {
         <button class="btn" type="button" onclick="window.aihomeserverLauncher.openWorkerFolder('logs')">Open exported worker logs</button>
         <button class="btn" type="button" onclick="window.aihomeserverLauncher.openWorkerFolder('root')">Open worker root</button>
         <button class="btn" type="button" onclick="window.aihomeserverLauncher.openLauncherLogFolder()">Open coordinator logs</button>
+        <button class="btn" id="btn-rebuild-app" type="button" onclick="rebuildApp()">Rebuild Coordinator</button>
         <button class="btn" id="btn-stop-vm" type="button" onclick="vmAction('stop')" style="display:none">Stop VM</button>
         <button class="btn" id="btn-start-vm" type="button" onclick="vmAction('start')" style="display:none">Start VM</button>
       </div>
       <div class="footer">
+        <span style="display:block;margin-bottom:8px;color:#9fb0c6">Rebuild Coordinator refreshes the backend stack from the repo. It does not rebuild this desktop executable.</span>
         <code>${escapeHtml(coordinatorUrl)}</code>
       </div>
     </div>
@@ -619,6 +847,7 @@ function loadStartingPage(win, options) {
     const workerRow = document.querySelector('.row:nth-child(3) .row-state');
     const btnStop = document.getElementById('btn-stop-vm');
     const btnStart = document.getElementById('btn-start-vm');
+    const btnRebuild = document.getElementById('btn-rebuild-app');
 
     function makeBadge(state) {
       const label = String(state || 'pending');
@@ -651,6 +880,26 @@ function loadStartingPage(win, options) {
       btnStart.disabled = false;
     }
 
+    async function rebuildApp() {
+      const previous = btnRebuild.textContent;
+      btnRebuild.disabled = true;
+      btnRebuild.textContent = 'Rebuilding...';
+      try {
+        const result = await window.aihomeserverLauncher.rebuildApp();
+        if (!result || !result.ok) {
+          throw new Error((result && result.error) || 'Unknown rebuild failure');
+        }
+        btnRebuild.textContent = 'Rebuilt';
+        setTimeout(() => { btnRebuild.textContent = previous; }, 2500);
+      } catch (e) {
+        console.error('Rebuild failed', e);
+        btnRebuild.textContent = 'Rebuild failed';
+        setTimeout(() => { btnRebuild.textContent = previous; }, 3500);
+      } finally {
+        btnRebuild.disabled = false;
+      }
+    }
+
     async function pollVmState() {
       try {
         const status = await window.aihomeserverLauncher.getVmState();
@@ -668,6 +917,7 @@ function loadStartingPage(win, options) {
 
 async function bootstrap() {
   const shouldTryHyperV = process.platform === 'win32' && RUNTIME_MODE !== 'docker';
+  const desktopSettings = getDesktopSettings();
   if (shouldTryHyperV && !isRunningAsAdministrator()) {
     const relaunched = relaunchAsAdministrator();
     if (!relaunched) {
@@ -681,6 +931,7 @@ async function bootstrap() {
   }
 
   const win = createWindow();
+  installDesktopControls(win);
   win.hide();
   const coordinatorPort = process.env.AIHOMESERVER_URL
     ? Number(new URL(DEFAULT_URL).port || (new URL(DEFAULT_URL).protocol === 'https:' ? 443 : 80))
@@ -701,6 +952,8 @@ async function bootstrap() {
     coordinatorState: 'pending',
     workerState: 'pending',
     readyState: 'pending',
+    vmName: desktopSettings.vmName,
+    vmIp: desktopSettings.vmIp,
   });
   win.show();
 
@@ -711,7 +964,7 @@ async function bootstrap() {
   // host portproxy (netsh portproxy set by the PS script). Docker containers on
   // Windows can reach the Windows host at host.docker.internal, which the
   // portproxy then forwards to the VM on the Hyper-V internal switch.
-  const hypervCoordinatorWorkerUrl = `http://host.docker.internal:${DEFAULT_VM_PORT}`;
+  const hypervCoordinatorWorkerUrl = `http://host.docker.internal:${desktopSettings.vmPort}`;
   let workerHealthUrl = dockerWorkerUrl;
   let dockerEnv = {
     AIHOMESERVER_HOST_PORT: String(coordinatorPort),
@@ -721,6 +974,9 @@ async function bootstrap() {
     COMPOSE_PROFILES: '',
   };
   let runtimeLabel = 'docker';
+  launcherState.coordinatorUrl = coordinatorUrl;
+  launcherState.runtimeLabel = runtimeLabel;
+  launcherState.dockerEnv = dockerEnv;
 
   if (shouldTryHyperV && !isHyperVAvailable()) {
     const hypervMsg = 'The Hyper-V Windows feature is not available on this machine.\n\nEnable it via "Turn Windows features on or off" → "Hyper-V", then restart.\n\nFalling back to the Docker worker.';
@@ -729,11 +985,11 @@ async function bootstrap() {
     }
     dialog.showErrorBox('Hyper-V not available', hypervMsg);
     await loadStartingPage(win, {
-      title: `${APP_NAME} launcher`,
-      detail: 'Hyper-V is not available on this machine. Using the Docker worker instead.',
-      runtimeLabel: 'docker',
-      coordinatorUrl,
-      workerUrl: dockerWorkerUrl,
+        title: `${APP_NAME} launcher`,
+        detail: 'Hyper-V is not available on this machine. Using the Docker worker instead.',
+        runtimeLabel: 'docker',
+        coordinatorUrl,
+        workerUrl: dockerWorkerUrl,
       vmState: 'failed',
       coordinatorState: 'starting',
       workerState: 'starting',
@@ -743,20 +999,21 @@ async function bootstrap() {
   } else if (shouldTryHyperV) {
     try {
       const vm = await bootstrapHyperV({
-        vmName: DEFAULT_VM_NAME,
-        repoUrl: DEFAULT_REPO_URL,
-        branch: DEFAULT_REPO_BRANCH,
-        vmIp: DEFAULT_VM_IP,
-        vmGateway: DEFAULT_VM_GATEWAY,
-        switchName: DEFAULT_VM_SWITCH,
-        vmCpus: DEFAULT_VM_CPUS,
-        vmMemoryMb: DEFAULT_VM_MEMORY_MB,
-        workerPort: DEFAULT_VM_PORT,
+        vmName: desktopSettings.vmName,
+        repoUrl: desktopSettings.repoUrl,
+        branch: desktopSettings.repoBranch,
+        vmIp: desktopSettings.vmIp,
+        vmGateway: desktopSettings.vmGateway,
+        switchName: desktopSettings.vmSwitch,
+        vmCpus: desktopSettings.vmCpus,
+        vmMemoryMb: desktopSettings.vmMemoryMb,
+        workerPort: desktopSettings.vmPort,
         workerToken,
-        imageVersion: DEFAULT_VM_IMAGE_VERSION,
+        imageVersion: desktopSettings.vmImageVersion,
         workspacePath: '/workspace',
+        rootDir: desktopSettings.hypervRoot,
       });
-      workerHealthUrl = vm.worker_url || `http://${DEFAULT_VM_IP}:${DEFAULT_VM_PORT}`;
+      workerHealthUrl = vm.worker_url || `http://${desktopSettings.vmIp}:${desktopSettings.vmPort}`;
       await loadStartingPage(win, {
         title: `${APP_NAME} launcher`,
         detail: 'The VM bootstrapped successfully. The launcher is now starting the coordinator stack and waiting for health checks.',
@@ -767,6 +1024,8 @@ async function bootstrap() {
         coordinatorState: 'starting',
         workerState: 'starting',
         readyState: 'pending',
+        vmName: desktopSettings.vmName,
+        vmIp: desktopSettings.vmIp,
       });
       dockerEnv = {
         AIHOMESERVER_HOST_PORT: String(coordinatorPort),
@@ -778,6 +1037,8 @@ async function bootstrap() {
         COMPOSE_PROFILES: '',
       };
       runtimeLabel = 'hyperv';
+      launcherState.runtimeLabel = runtimeLabel;
+      launcherState.dockerEnv = dockerEnv;
     } catch (error) {
       if (RUNTIME_MODE === 'hyperv') {
         throw error;
@@ -794,11 +1055,17 @@ async function bootstrap() {
         coordinatorState: 'starting',
         workerState: 'starting',
         readyState: 'pending',
+        vmName: desktopSettings.vmName,
+        vmIp: desktopSettings.vmIp,
       });
       dockerEnv.COMPOSE_PROFILES = 'worker';
+      launcherState.runtimeLabel = 'docker';
+      launcherState.dockerEnv = dockerEnv;
     }
   } else {
     dockerEnv.COMPOSE_PROFILES = 'worker';
+    launcherState.runtimeLabel = runtimeLabel;
+    launcherState.dockerEnv = dockerEnv;
   }
 
   // Helper: run the auth probe and open the app, or surface a clear auth-failure
@@ -820,6 +1087,8 @@ async function bootstrap() {
         coordinatorState: 'running',
         workerState: 'failed',
         readyState: 'failed',
+        vmName: desktopSettings.vmName,
+        vmIp: desktopSettings.vmIp,
       });
       return false;
     }
@@ -833,6 +1102,8 @@ async function bootstrap() {
       coordinatorState: 'running',
       workerState: 'running',
       readyState: 'ready',
+      vmName: desktopSettings.vmName,
+      vmIp: desktopSettings.vmIp,
     });
     await win.loadURL(coordinatorUrl);
     win.show();
@@ -863,6 +1134,8 @@ async function bootstrap() {
       coordinatorState: 'failed',
       workerState: 'failed',
       readyState: 'failed',
+      vmName: desktopSettings.vmName,
+      vmIp: desktopSettings.vmIp,
     });
     return;
   }
@@ -872,6 +1145,8 @@ async function bootstrap() {
     if (!process.env.AIHOMESERVER_URL && composeStart?.hostPort) {
       coordinatorUrl = `http://127.0.0.1:${composeStart.hostPort}`;
     }
+    launcherState.coordinatorUrl = coordinatorUrl;
+    launcherState.dockerEnv = dockerEnv;
   } catch (error) {
     throw new Error(`Failed to start the coordinator stack from ${COMPOSE_DIR}: ${error.message}`);
   }
@@ -888,6 +1163,8 @@ async function bootstrap() {
       coordinatorState: 'failed',
       workerState: 'starting',
       readyState: 'failed',
+      vmName: desktopSettings.vmName,
+      vmIp: desktopSettings.vmIp,
     });
     return;
   }
@@ -904,6 +1181,8 @@ async function bootstrap() {
       coordinatorState: 'running',
       workerState: 'failed',
       readyState: 'failed',
+      vmName: desktopSettings.vmName,
+      vmIp: desktopSettings.vmIp,
     });
     return;
   }

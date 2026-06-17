@@ -242,6 +242,20 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
+                        match client.capabilities().await {
+                            Ok(caps) => {
+                                info!(
+                                    "Worker capabilities: fs_write={} fs_list={} playwright_installed={} workspace={}",
+                                    caps.filesystem.write,
+                                    caps.filesystem.list,
+                                    caps.browser_automation.installed,
+                                    caps.workspace
+                                );
+                            }
+                            Err(e) => {
+                                info!("Worker capabilities probe failed: {e}");
+                            }
+                        }
                     }
                     Err(e) => {
                         info!("Worker health check failed: {e}");
@@ -258,7 +272,11 @@ async fn main() -> Result<()> {
 
     let mut tools = ToolRegistry::new();
     tools.set_metrics(Arc::clone(&metrics));
-    tools.register(FilesystemTool::new(&cfg.workspace_path)?);
+    tools.register(FilesystemTool::new(
+        &cfg.workspace_path,
+        worker_client.clone(),
+        cfg.execution_mode.clone(),
+    )?);
     tools.register(ShellTool::new(worker_client.clone(), cfg.execution_mode.clone()));
     tools.register(GitTool::new(&cfg.workspace_path));
     let sources_db_path = data_dir.join("sources.db").to_string_lossy().into_owned();
@@ -307,6 +325,8 @@ async fn main() -> Result<()> {
     let approval_gates: ApprovalGates = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let cancel_store: crate::api::server::CancelStore =
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    let abort_store: crate::api::server::AbortStore =
+        Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
     info!("Memory ready (episodic.db)");
 
@@ -324,6 +344,7 @@ async fn main() -> Result<()> {
         repo_root,
         approval_gates,
         cancel_store,
+        abort_store,
         config,
         metrics,
     };

@@ -12,6 +12,7 @@
 
 use super::learn_docs::embedded_doc;
 use super::{learn::LEARN_HTML, ui::CHAT_HTML};
+use base64::Engine as _;
 use axum::{
     extract::{Multipart, Path, State},
     http::{header, Request, StatusCode},
@@ -42,6 +43,12 @@ use crate::{
     },
     orchestrator::Orchestrator,
     state::{KnowledgeContext, PlannerOutput, StepDefinition, SystemState},
+    worker::{
+        collect_workspace_files, WorkerClient, WorkerFilesystemDeleteRequest,
+        WorkerFilesystemGrepRequest, WorkerFilesystemListRequest, WorkerFilesystemMkdirRequest,
+        WorkerFilesystemReadRequest, WorkerFilesystemRenameRequest,
+        WorkerFilesystemWriteRequest, WorkspaceSyncRequest,
+    },
 };
 
 fn request_looks_sensitive(user_request: &str) -> bool {
@@ -256,6 +263,8 @@ pub type TaskStore = Arc<RwLock<HashMap<Uuid, TaskStatusPayload>>>;
 pub type ApprovalGates = Arc<RwLock<HashMap<Uuid, tokio::sync::oneshot::Sender<bool>>>>;
 /// Cancellation tokens keyed by task_id (Stop button).
 pub type CancelStore = Arc<RwLock<HashMap<Uuid, tokio_util::sync::CancellationToken>>>;
+/// Abort handles keyed by task_id for hard-stop cancellation of background runs.
+pub type AbortStore = Arc<RwLock<HashMap<Uuid, tokio::task::AbortHandle>>>;
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
@@ -285,6 +294,8 @@ pub struct AppState {
     pub approval_gates: ApprovalGates,
     /// Cancellation tokens for active tasks.
     pub cancel_store: CancelStore,
+    /// Abort handles for active background tasks.
+    pub abort_store: AbortStore,
     /// Live server config — shared with OllamaClient so model/URL changes
     /// propagate immediately. Persisted to config.json on every POST /settings.
     pub config: Arc<RwLock<ServerConfig>>,
@@ -363,6 +374,9 @@ pub struct RunResponse {
     pub repair_cycles: u32,
     /// Total wall-clock time in ms.
     pub duration_ms: i64,
+    /// Non-blocking warning for recovered runs that succeeded after fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
     /// Event log captured during the run (useful for replay/debugging).
     pub event_log: Vec<crate::state::LogEvent>,
 }
@@ -957,12 +971,14 @@ async fn run_task(State(app): State<AppState>, Json(req): Json<RunRequest>) -> i
     };
 
     // Build initial state — inject config values
-    let (ws_path, max_steps_cfg, risk_threshold) = {
+    let (ws_path, max_steps_cfg, risk_threshold, execution_mode, worker_url) = {
         let cfg = app.config.read().await;
         (
             cfg.workspace_path.clone(),
             cfg.max_steps,
             cfg.risk_gate_threshold,
+            cfg.execution_mode.clone(),
+            cfg.worker_url.clone(),
         )
     };
     let mut initial = SystemState::new(req.request.clone());
@@ -970,7 +986,7 @@ async fn run_task(State(app): State<AppState>, Json(req): Json<RunRequest>) -> i
     initial.conversation_history = history;
     initial.semantic_context = semantic_examples;
     initial.knowledge_context = knowledge_context;
-    initial.workspace_path = ws_path;
+    initial.workspace_path = ws_path.clone();
     initial.risk_gate_threshold = risk_threshold;
     initial.max_steps = max_steps_cfg;
     if let Some(max) = req.max_steps {
@@ -1001,11 +1017,45 @@ async fn run_task(State(app): State<AppState>, Json(req): Json<RunRequest>) -> i
     // Spawn background execution
     let app2 = app.clone();
     let request_text = req.request.clone();
+    let host_workspace_root = ws_path.clone();
+    let use_remote_workspace =
+        !worker_url.trim().is_empty()
+            && (execution_mode.trim().eq_ignore_ascii_case("remote")
+                || execution_mode.trim().eq_ignore_ascii_case("auto"));
     app.metrics.record_task_started();
-    tokio::spawn(async move {
+    let task_handle = tokio::spawn(async move {
         let start = std::time::Instant::now();
 
         let mut initial = initial;
+        if use_remote_workspace {
+            match sync_workspace_mirror_to_worker(&app2, &host_workspace_root).await {
+                Ok(remote_root) => {
+                    initial.workspace_path = remote_root.clone();
+                    initial.artifacts.insert(
+                        "workspace_sync".into(),
+                        serde_json::json!({
+                            "mode": "vm",
+                            "host_workspace_root": host_workspace_root,
+                            "active_workspace_root": remote_root,
+                        }),
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Initial VM workspace sync failed: {e}");
+                    {
+                        let mut store = app2.task_store.write().await;
+                        store.insert(
+                            task_id,
+                            TaskStatusPayload::Failed {
+                                error: format!("Initial VM workspace sync failed: {e}"),
+                            },
+                        );
+                    }
+                    app2.metrics.record_task_finished(false, start.elapsed());
+                    return;
+                }
+            }
+        }
         // Preflight (quick) — store capability snapshot so planner/executor can adapt.
         let (_, preflight) = super::evals::run_eval(
             &app2,
@@ -1082,6 +1132,9 @@ async fn run_task(State(app): State<AppState>, Json(req): Json<RunRequest>) -> i
             "auto_kb_min_chars": auto_kb_min_chars,
             "execution_mode": execution_mode,
             "worker_url": worker_url,
+            "active_workspace_mode": if use_remote_workspace { "vm" } else { "host" },
+            "active_workspace_root": initial.workspace_path.clone(),
+            "host_workspace_root": host_workspace_root,
         });
 
         let result = app2.orchestrator.run(initial).await;
@@ -1089,9 +1142,10 @@ async fn run_task(State(app): State<AppState>, Json(req): Json<RunRequest>) -> i
         match result {
             Ok(final_state) => {
                 let duration_ms = start.elapsed().as_millis() as i64;
-                app2.metrics
-                    .record_task_finished(final_state.termination_met, start.elapsed());
                 let answer = extract_answer(&final_state.artifacts);
+                let success = derive_run_success(final_state.termination_met, &final_state.artifacts);
+                let warning = derive_run_warning(&final_state.artifacts, success);
+                app2.metrics.record_task_finished(success, start.elapsed());
 
                 // Save conversation turns
                 let _ = app2
@@ -1123,7 +1177,7 @@ async fn run_task(State(app): State<AppState>, Json(req): Json<RunRequest>) -> i
                     failure_count: final_state.failure_count,
                     repair_cycles: final_state.repair_cycle,
                     duration_ms,
-                    success: final_state.termination_met,
+                    success,
                     created_at: chrono::Utc::now(),
                 };
 
@@ -1143,7 +1197,7 @@ async fn run_task(State(app): State<AppState>, Json(req): Json<RunRequest>) -> i
                 });
 
                 // Embed and store in semantic memory (only successful tasks)
-                if final_state.termination_met {
+                if success {
                     let summary = answer.chars().take(500).collect::<String>();
                     match app2.orchestrator.llm.embed(&request_text).await {
                         Ok(embedding) => {
@@ -1165,12 +1219,13 @@ async fn run_task(State(app): State<AppState>, Json(req): Json<RunRequest>) -> i
                 let response = RunResponse {
                     task_id: final_state.task_id.to_string(),
                     session_id: session_id.to_string(),
-                    success: final_state.termination_met,
+                    success,
                     artifacts: serde_json::to_value(&final_state.artifacts).unwrap_or_default(),
                     steps_taken: final_state.current_step,
                     failure_count: final_state.failure_count,
                     repair_cycles: final_state.repair_cycle,
                     duration_ms,
+                    warning,
                     event_log: final_state.event_log,
                 };
 
@@ -1189,7 +1244,13 @@ async fn run_task(State(app): State<AppState>, Json(req): Json<RunRequest>) -> i
                 );
             }
         }
+        let mut aborts = app2.abort_store.write().await;
+        aborts.remove(&task_id);
     });
+    {
+        let mut aborts = app.abort_store.write().await;
+        aborts.insert(task_id, task_handle.abort_handle());
+    }
 
     (StatusCode::ACCEPTED, Json(quick)).into_response()
 }
@@ -1686,12 +1747,14 @@ async fn run_stream(
     };
 
     // Inject config values into initial state
-    let (ws_path, max_steps_cfg, risk_threshold) = {
+    let (ws_path, max_steps_cfg, risk_threshold, execution_mode, worker_url) = {
         let cfg = app.config.read().await;
         (
             cfg.workspace_path.clone(),
             cfg.max_steps,
             cfg.risk_gate_threshold,
+            cfg.execution_mode.clone(),
+            cfg.worker_url.clone(),
         )
     };
     let mut initial = crate::state::SystemState::new(req.request.clone());
@@ -1701,7 +1764,7 @@ async fn run_stream(
     initial.knowledge_context = knowledge_context;
     initial.sse_tx = Some(sse_tx.clone());
     initial.gate_store = Some(app.approval_gates.clone());
-    initial.workspace_path = ws_path;
+    initial.workspace_path = ws_path.clone();
     initial.risk_gate_threshold = risk_threshold;
     initial.max_steps = max_steps_cfg;
     if let Some(max) = req.max_steps {
@@ -1734,14 +1797,51 @@ async fn run_stream(
 
     let app2 = app.clone();
     let request_text = req.request.clone();
+    let host_workspace_root = ws_path.clone();
+    let use_remote_workspace =
+        !worker_url.trim().is_empty()
+            && (execution_mode.trim().eq_ignore_ascii_case("remote")
+                || execution_mode.trim().eq_ignore_ascii_case("auto"));
     app.metrics.record_task_started();
-    tokio::spawn(async move {
+    let task_handle = tokio::spawn(async move {
         let start = std::time::Instant::now();
         let _ = sse_tx.send(crate::state::SseEvent::Status {
             phase: "preflight".into(),
         });
 
         let mut initial = initial;
+        if use_remote_workspace {
+            match sync_workspace_mirror_to_worker(&app2, &host_workspace_root).await {
+                Ok(remote_root) => {
+                    initial.workspace_path = remote_root.clone();
+                    initial.artifacts.insert(
+                        "workspace_sync".into(),
+                        serde_json::json!({
+                            "mode": "vm",
+                            "host_workspace_root": host_workspace_root,
+                            "active_workspace_root": remote_root,
+                        }),
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Initial VM workspace sync failed: {e}");
+                    let _ = sse_tx.send(crate::state::SseEvent::Error {
+                        message: format!("Initial VM workspace sync failed: {e}"),
+                    });
+                    {
+                        let mut store = app2.task_store.write().await;
+                        store.insert(
+                            task_id,
+                            TaskStatusPayload::Failed {
+                                error: format!("Initial VM workspace sync failed: {e}"),
+                            },
+                        );
+                    }
+                    app2.metrics.record_task_finished(false, start.elapsed());
+                    return;
+                }
+            }
+        }
         let (_, preflight) = super::evals::run_eval(
             &app2,
             super::evals::EvalRunRequest {
@@ -1808,6 +1908,9 @@ async fn run_stream(
             "auto_kb_min_chars": auto_kb_min_chars,
             "execution_mode": execution_mode,
             "worker_url": worker_url,
+            "active_workspace_mode": if use_remote_workspace { "vm" } else { "host" },
+            "active_workspace_root": initial.workspace_path.clone(),
+            "host_workspace_root": host_workspace_root,
         });
 
         let result = app2
@@ -1819,7 +1922,8 @@ async fn run_stream(
             Ok(final_state) => {
                 let duration_ms = start.elapsed().as_millis() as i64;
                 let answer = extract_answer(&final_state.artifacts);
-                let success = final_state.termination_met;
+                let success = derive_run_success(final_state.termination_met, &final_state.artifacts);
+                let warning = derive_run_warning(&final_state.artifacts, success);
                 app2.metrics.record_task_finished(success, start.elapsed());
 
                 let _ = app2
@@ -1898,6 +2002,7 @@ async fn run_stream(
                     failure_count: final_state.failure_count,
                     repair_cycles: final_state.repair_cycle,
                     duration_ms,
+                    warning: warning.clone(),
                     event_log: final_state.event_log,
                 };
                 {
@@ -1911,6 +2016,7 @@ async fn run_stream(
                     success,
                     answer,
                     duration_ms,
+                    warning,
                     failure: failure_info,
                 });
             }
@@ -1933,7 +2039,13 @@ async fn run_stream(
         // Cleanup cancellation token after completion.
         let mut store = app2.cancel_store.write().await;
         store.remove(&task_id);
+        let mut aborts = app2.abort_store.write().await;
+        aborts.remove(&task_id);
     });
+    {
+        let mut aborts = app.abort_store.write().await;
+        aborts.insert(task_id, task_handle.abort_handle());
+    }
 
     let stream = UnboundedReceiverStream::new(sse_rx).map(|event| {
         let event_type = match &event {
@@ -1988,13 +2100,41 @@ async fn cancel_task(State(app): State<AppState>, Path(id): Path<String>) -> imp
         let store = app.cancel_store.read().await;
         store.get(&task_id).cloned()
     };
+    let abort_handle = {
+        let store = app.abort_store.read().await;
+        store.get(&task_id).cloned()
+    };
+
+    if token.is_none() && abort_handle.is_none() {
+        return (StatusCode::NOT_FOUND, "Task not running").into_response();
+    }
 
     if let Some(t) = token {
         t.cancel();
-        return Json(serde_json::json!({ "ok": true })).into_response();
+    }
+    if let Some(handle) = abort_handle {
+        handle.abort();
     }
 
-    (StatusCode::NOT_FOUND, "Task not running").into_response()
+    {
+        let mut store = app.task_store.write().await;
+        store.insert(
+            task_id,
+            TaskStatusPayload::Failed {
+                error: "Cancelled by user".into(),
+            },
+        );
+    }
+    {
+        let mut store = app.cancel_store.write().await;
+        store.remove(&task_id);
+    }
+    {
+        let mut store = app.abort_store.write().await;
+        store.remove(&task_id);
+    }
+
+    Json(serde_json::json!({ "ok": true, "cancelled": true })).into_response()
 }
 
 /// POST /task/:id/reject — resolve a pending high-risk gate (rejected).
@@ -2020,7 +2160,47 @@ async fn reject_task(State(app): State<AppState>, Path(id): Path<String>) -> imp
 /// - The UI uses this to display model names, workspace path, and search configuration.
 async fn get_settings(State(app): State<AppState>) -> impl IntoResponse {
     let cfg = app.config.read().await.clone();
-    (StatusCode::OK, Json(cfg)).into_response()
+    let worker_capabilities = if remote_worker_mode(&cfg) {
+        match WorkerClient::new(cfg.worker_url.clone(), cfg.worker_token.clone()) {
+            Ok(client) => tokio::time::timeout(std::time::Duration::from_secs(3), client.capabilities())
+                .await
+                .ok()
+                .and_then(|result| result.ok()),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let active_workspace_root = worker_capabilities
+        .as_ref()
+        .map(|caps| caps.workspace.clone())
+        .unwrap_or_else(|| active_workspace_root(&cfg));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "workspace_path": cfg.workspace_path,
+            "ollama_url": cfg.ollama_url,
+            "fast_model": cfg.fast_model,
+            "critic_model": cfg.critic_model,
+            "max_steps": cfg.max_steps,
+            "risk_gate_threshold": cfg.risk_gate_threshold,
+            "num_gpu": cfg.num_gpu,
+            "num_ctx": cfg.num_ctx,
+            "num_predict": cfg.num_predict,
+            "num_batch": cfg.num_batch,
+            "num_thread": cfg.num_thread,
+            "search_url": cfg.search_url,
+            "auto_kb_mode": cfg.auto_kb_mode,
+            "auto_kb_min_chars": cfg.auto_kb_min_chars,
+            "execution_mode": cfg.execution_mode,
+            "worker_url": cfg.worker_url,
+            "active_workspace_mode": active_workspace_mode(&cfg),
+            "active_workspace_root": active_workspace_root,
+            "host_workspace_root": cfg.workspace_path,
+            "worker_capabilities": worker_capabilities,
+        })),
+    )
+        .into_response()
 }
 
 /// POST `/settings` - update runtime config and persist it to `config.json`.
@@ -2063,6 +2243,91 @@ fn config_file_path() -> std::path::PathBuf {
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("config.json")))
         .unwrap_or_else(|| std::path::PathBuf::from("config.json"))
+}
+
+fn remote_worker_mode(cfg: &ServerConfig) -> bool {
+    !cfg.worker_url.trim().is_empty()
+        && (cfg.execution_mode.trim().eq_ignore_ascii_case("remote")
+            || cfg.execution_mode.trim().eq_ignore_ascii_case("auto"))
+}
+
+async fn remote_worker_client(app: &AppState) -> Option<WorkerClient> {
+    let cfg = app.config.read().await.clone();
+    if !remote_worker_mode(&cfg) {
+        return None;
+    }
+    WorkerClient::new(cfg.worker_url, cfg.worker_token).ok()
+}
+
+async fn sync_workspace_mirror_to_worker(
+    app: &AppState,
+    host_workspace_root: &str,
+) -> Result<String, String> {
+    let worker = remote_worker_client(app)
+        .await
+        .ok_or_else(|| "remote worker not configured".to_string())?;
+    let files = collect_workspace_files(std::path::Path::new(host_workspace_root))
+        .map_err(|e| format!("failed to collect host workspace files: {e}"))?;
+    let resp = worker
+        .sync_workspace(&WorkspaceSyncRequest {
+            prefix: Some(".".into()),
+            files,
+        })
+        .await
+        .map_err(|e| format!("failed to sync workspace mirror to worker: {e}"))?;
+    Ok(resp.workspace.unwrap_or_else(|| "/workspace".into()))
+}
+
+fn active_workspace_mode(cfg: &ServerConfig) -> &'static str {
+    if remote_worker_mode(cfg) {
+        "vm"
+    } else {
+        "host"
+    }
+}
+
+fn active_workspace_root(cfg: &ServerConfig) -> String {
+    if remote_worker_mode(cfg) {
+        "/workspace".into()
+    } else {
+        cfg.workspace_path.clone()
+    }
+}
+
+fn remote_rel_path(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in path.split(['/', '\\']) {
+        let trimmed = seg.trim();
+        if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+            continue;
+        }
+        parts.push(trimmed);
+    }
+    if parts.is_empty() {
+        ".".into()
+    } else {
+        parts.join("/")
+    }
+}
+
+fn worker_output_or_http_error(result: crate::state::ToolResult) -> Result<serde_json::Value, axum::response::Response> {
+    if result.success {
+        Ok(result.output.unwrap_or_else(|| serde_json::json!({})))
+    } else {
+        let status = if matches!(result.error_type, crate::state::ErrorType::Permission) {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        Err((
+            status,
+            Json(serde_json::json!({
+                "error": result.error_code.unwrap_or_else(|| "worker_error".into()),
+                "detail": result.trace.unwrap_or_else(|| "worker request failed".into()),
+            })),
+        )
+            .into_response())
+    }
 }
 
 // ── /plan — generate pre-run questionnaire ────────────────────────────────────
@@ -2220,6 +2485,29 @@ enum FsNode {
 /// GET /workspace/tree — returns a JSON directory tree up to 4 levels deep,
 /// rooted at the configured workspace_path.
 async fn workspace_tree(State(app): State<AppState>) -> impl IntoResponse {
+    if let Some(worker) = remote_worker_client(&app).await {
+        let result = worker
+            .filesystem_list(&WorkerFilesystemListRequest {
+                path: ".".into(),
+                depth: Some(4),
+            })
+            .await;
+        return match result {
+            Ok(tool) => match worker_output_or_http_error(tool) {
+                Ok(output) => (StatusCode::OK, Json(output)).into_response(),
+                Err(resp) => resp,
+            },
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "worker_filesystem_list_failed",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response(),
+        };
+    }
+
     let root = app.config.read().await.workspace_path.clone();
     let root_path = std::path::PathBuf::from(&root);
 
@@ -2318,12 +2606,63 @@ struct FileQuery {
     path: String,
 }
 
+fn file_kind_and_mime(path: &str, bytes: &[u8]) -> (&'static str, &'static str, bool) {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => ("image", "image/png", false),
+        "jpg" | "jpeg" => ("image", "image/jpeg", false),
+        "gif" => ("image", "image/gif", false),
+        "webp" => ("image", "image/webp", false),
+        "svg" => ("image", "image/svg+xml", true),
+        "bmp" => ("image", "image/bmp", false),
+        "ico" => ("image", "image/x-icon", false),
+        "txt" | "md" | "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "json" | "toml" | "yaml"
+        | "yml" | "html" | "css" | "sql" | "sh" | "ps1" | "log" | "xml" | "csv" => {
+            ("text", "text/plain; charset=utf-8", true)
+        }
+        _ => {
+            let is_text = !bytes.iter().any(|b| *b == 0);
+            if is_text {
+                ("text", "text/plain; charset=utf-8", true)
+            } else {
+                ("binary", "application/octet-stream", false)
+            }
+        }
+    }
+}
+
 /// GET /workspace/file?path=relative/path — returns up to 64 KB of a file's
 /// content. Returns an error if the resolved path escapes the workspace root.
 async fn workspace_file(
     State(app): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<FileQuery>,
 ) -> impl IntoResponse {
+    if let Some(worker) = remote_worker_client(&app).await {
+        let result = worker
+            .filesystem_read(&WorkerFilesystemReadRequest {
+                path: remote_rel_path(&q.path),
+            })
+            .await;
+        return match result {
+            Ok(tool) => match worker_output_or_http_error(tool) {
+                Ok(output) => (StatusCode::OK, Json(output)).into_response(),
+                Err(resp) => resp,
+            },
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "worker_filesystem_read_failed",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response(),
+        };
+    }
+
     let root = app.config.read().await.workspace_path.clone();
     let root_path = std::path::PathBuf::from(&root);
 
@@ -2353,25 +2692,33 @@ async fn workspace_file(
     let size = canonical_full.metadata().map(|m| m.len()).unwrap_or(0);
     let truncated = size > MAX_BYTES;
 
-    let content = match tokio::fs::read(&canonical_full).await {
-        Ok(bytes) => {
-            let slice = if truncated {
-                &bytes[..MAX_BYTES as usize]
-            } else {
-                &bytes
-            };
-            String::from_utf8_lossy(slice).into_owned()
-        }
+    let bytes = match tokio::fs::read(&canonical_full).await {
+        Ok(bytes) => bytes,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-
+    let slice = if truncated {
+        &bytes[..MAX_BYTES as usize]
+    } else {
+        &bytes
+    };
+    let (kind, mime, is_text) = file_kind_and_mime(&q.path, slice);
+    let content = if is_text {
+        String::from_utf8_lossy(slice).into_owned()
+    } else {
+        String::new()
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "path": q.path,
+            "name": canonical_full.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
             "content": content,
+            "contents_b64": base64::engine::general_purpose::STANDARD.encode(slice),
             "size": size,
             "truncated": truncated,
+            "is_text": is_text,
+            "kind": kind,
+            "mime": mime,
         })),
     )
         .into_response()
@@ -2384,6 +2731,28 @@ async fn workspace_delete(
     State(app): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<FileQuery>,
 ) -> impl IntoResponse {
+    if let Some(worker) = remote_worker_client(&app).await {
+        let result = worker
+            .filesystem_delete(&WorkerFilesystemDeleteRequest {
+                path: remote_rel_path(&q.path),
+            })
+            .await;
+        return match result {
+            Ok(tool) => match worker_output_or_http_error(tool) {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(resp) => resp,
+            },
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "worker_filesystem_delete_failed",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response(),
+        };
+    }
+
     let root = app.config.read().await.workspace_path.clone();
     let root_path = std::path::PathBuf::from(&root);
     let clean: std::path::PathBuf = q
@@ -2416,6 +2785,32 @@ async fn workspace_mkdir(
     State(app): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if let Some(worker) = remote_worker_client(&app).await {
+        let rel = match body["path"].as_str() {
+            Some(p) if !p.is_empty() => p,
+            _ => return (StatusCode::BAD_REQUEST, "missing path").into_response(),
+        };
+        let result = worker
+            .filesystem_mkdir(&WorkerFilesystemMkdirRequest {
+                path: remote_rel_path(rel),
+            })
+            .await;
+        return match result {
+            Ok(tool) => match worker_output_or_http_error(tool) {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(resp) => resp,
+            },
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "worker_filesystem_mkdir_failed",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response(),
+        };
+    }
+
     let root = app.config.read().await.workspace_path.clone();
     let root_path = std::path::PathBuf::from(&root);
     let rel = match body["path"].as_str() {
@@ -2438,6 +2833,37 @@ async fn workspace_rename(
     State(app): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if let Some(worker) = remote_worker_client(&app).await {
+        let from_rel = match body["from"].as_str() {
+            Some(p) if !p.is_empty() => p,
+            _ => return (StatusCode::BAD_REQUEST, "missing from").into_response(),
+        };
+        let to_rel = match body["to"].as_str() {
+            Some(p) if !p.is_empty() => p,
+            _ => return (StatusCode::BAD_REQUEST, "missing to").into_response(),
+        };
+        let result = worker
+            .filesystem_rename(&WorkerFilesystemRenameRequest {
+                from: remote_rel_path(from_rel),
+                to: remote_rel_path(to_rel),
+            })
+            .await;
+        return match result {
+            Ok(tool) => match worker_output_or_http_error(tool) {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(resp) => resp,
+            },
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "worker_filesystem_rename_failed",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response(),
+        };
+    }
+
     let root = app.config.read().await.workspace_path.clone();
     let root_path = std::path::PathBuf::from(&root);
     let from_rel = match body["from"].as_str() {
@@ -2473,6 +2899,35 @@ async fn workspace_write_file(
     State(app): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if let Some(worker) = remote_worker_client(&app).await {
+        let rel_path = match body["path"].as_str() {
+            Some(p) if !p.is_empty() => p,
+            _ => return (StatusCode::BAD_REQUEST, "missing path").into_response(),
+        };
+        let content = body["content"].as_str().unwrap_or("");
+        let result = worker
+            .filesystem_write(&WorkerFilesystemWriteRequest {
+                path: remote_rel_path(rel_path),
+                content: Some(content.to_string()),
+                contents_b64: None,
+            })
+            .await;
+        return match result {
+            Ok(tool) => match worker_output_or_http_error(tool) {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(resp) => resp,
+            },
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "worker_filesystem_write_failed",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response(),
+        };
+    }
+
     let root = app.config.read().await.workspace_path.clone();
     let root_path = std::path::PathBuf::from(&root);
 
@@ -2827,6 +3282,38 @@ async fn workspace_search(
 ) -> impl IntoResponse {
     if q.q.trim().is_empty() {
         return (StatusCode::OK, Json(serde_json::json!({ "matches": [] }))).into_response();
+    }
+    if let Some(worker) = remote_worker_client(&app).await {
+        let result = worker
+            .filesystem_grep(&WorkerFilesystemGrepRequest {
+                path: ".".into(),
+                query: q.q.clone(),
+                max_depth: Some(5),
+                max_files: Some(1500),
+                max_results: Some(200),
+                max_bytes_per_file: Some(200_000),
+            })
+            .await;
+        return match result {
+            Ok(tool) => match worker_output_or_http_error(tool) {
+                Ok(output) => {
+                    let matches = output
+                        .get("matches")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([]));
+                    (StatusCode::OK, Json(serde_json::json!({ "matches": matches }))).into_response()
+                }
+                Err(resp) => resp,
+            },
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "worker_filesystem_grep_failed",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response(),
+        };
     }
     let root = app.config.read().await.workspace_path.clone();
     let root_path = std::path::PathBuf::from(&root);
@@ -3215,13 +3702,143 @@ async fn knowledge_export(State(app): State<AppState>) -> impl IntoResponse {
 /// 1) Prefer `artifacts["answer"]` when present.
 /// 2) If failures exist, surface the most recent tool failure trace.
 /// 3) Otherwise, fall back to any tool stdout/body that looks like a useful response.
+fn latest_tool_result(
+    artifacts: &HashMap<String, serde_json::Value>,
+) -> Option<(&String, &serde_json::Value)> {
+    let mut results: Vec<(&String, &serde_json::Value)> = artifacts
+        .iter()
+        .filter(|(k, v)| k.ends_with("_result") && v.is_object())
+        .collect();
+    results.sort_by(|(_, a), (_, b)| {
+        let ta = a
+            .get("timestamp")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default();
+        let tb = b
+            .get("timestamp")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default();
+        ta.cmp(tb)
+    });
+    results.pop()
+}
+
+fn result_is_success(result: &serde_json::Value) -> bool {
+    result.get("success").and_then(|b| b.as_bool()) != Some(false)
+}
+
+fn has_failed_tool_result(artifacts: &HashMap<String, serde_json::Value>) -> bool {
+    artifacts.iter().any(|(k, v)| {
+        k.ends_with("_result") && v.get("success").and_then(|b| b.as_bool()) == Some(false)
+    })
+}
+
+fn extract_success_output(result: &serde_json::Value) -> Option<String> {
+    let output = result.get("output").unwrap_or(result);
+    for key in ["stdout", "body", "text", "content"] {
+        if let Some(s) = output.get(key).and_then(|x| x.as_str()) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn best_success_output(artifacts: &HashMap<String, serde_json::Value>) -> Option<String> {
+    let mut candidates: Vec<(&str, String)> = artifacts
+        .iter()
+        .filter(|(k, v)| k.ends_with("_result") && result_is_success(v))
+        .filter_map(|(k, v)| extract_success_output(v).map(|text| (k.as_str(), text)))
+        .collect();
+
+    candidates.sort_by(|(ka, ta), (kb, tb)| {
+        let rank = |k: &str, text: &str| -> (u8, usize) {
+            let priority = if k.contains("shell") {
+                3
+            } else if k.contains("read") || k.contains("file") {
+                2
+            } else {
+                1
+            };
+            (priority, text.len())
+        };
+        rank(ka, ta).cmp(&rank(kb, tb))
+    });
+
+    candidates.pop().map(|(_, text)| text)
+}
+
+fn derive_run_warning(
+    artifacts: &HashMap<String, serde_json::Value>,
+    success: bool,
+) -> Option<String> {
+    if !success || !has_failed_tool_result(artifacts) {
+        return None;
+    }
+    let (latest_key, latest_result) = latest_tool_result(artifacts)?;
+    if result_is_success(latest_result) {
+        return Some(format!(
+            "Recovered from earlier tool failures; final result came from `{latest_key}`."
+        ));
+    }
+    None
+}
+
+fn derive_run_success(
+    termination_met: bool,
+    artifacts: &HashMap<String, serde_json::Value>,
+) -> bool {
+    if termination_met && !failure_answer_present(artifacts) {
+        return true;
+    }
+
+    let has_answer = artifacts
+        .get("answer")
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            let trimmed = s.trim();
+            !trimmed.is_empty()
+                && !trimmed.starts_with("Task failed:")
+                && !trimmed.starts_with("The task did not finish cleanly.")
+        })
+        .unwrap_or(false);
+
+    if has_answer {
+        return true;
+    }
+
+    if best_success_output(artifacts).is_some() {
+        return true;
+    }
+
+    false
+}
+
+fn failure_answer_present(artifacts: &HashMap<String, serde_json::Value>) -> bool {
+    artifacts
+        .get("answer")
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            let trimmed = s.trim();
+            trimmed.starts_with("Task failed:")
+                || trimmed.starts_with("The task did not finish cleanly.")
+        })
+        .unwrap_or(false)
+}
+
 fn extract_answer(artifacts: &HashMap<String, serde_json::Value>) -> String {
     if let Some(v) = artifacts.get("answer") {
         if let Some(s) = v.as_str() {
-            if s.len() > 10 {
+            if !s.trim().is_empty() && !failure_answer_present(artifacts) {
                 return s.to_string();
             }
         }
+    }
+
+    if let Some(text) = best_success_output(artifacts) {
+        return text;
     }
 
     // If anything failed, surface the most recent tool failure rather than returning
@@ -3245,20 +3862,9 @@ fn extract_answer(artifacts: &HashMap<String, serde_json::Value>) -> String {
         return format!("Task failed: tool error in {k} ({code}): {trace}");
     }
 
-    for (k, v) in artifacts.iter() {
-        if k.ends_with("_result") {
-            if let Some(obj) = v.as_object() {
-                if let Some(stdout) = obj.get("stdout").and_then(|s| s.as_str()) {
-                    if !stdout.trim().is_empty() {
-                        return stdout.trim().to_string();
-                    }
-                }
-                if let Some(body) = obj.get("body").and_then(|s| s.as_str()) {
-                    if !body.trim().is_empty() {
-                        return body.trim().to_string();
-                    }
-                }
-            }
+    for (_, v) in artifacts.iter().filter(|(k, _)| k.ends_with("_result")) {
+        if let Some(text) = extract_success_output(v) {
+            return text;
         }
     }
     "Task completed.".to_string()
@@ -3308,6 +3914,8 @@ async fn workspace_upload(
     State(app): State<AppState>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
+    use base64::Engine as _;
+
     let root = app.config.read().await.workspace_path.clone();
     let root_path = std::path::PathBuf::from(&root);
 
@@ -3344,6 +3952,7 @@ async fn workspace_upload(
     }
 
     let prefix = dir_prefix.unwrap_or_default();
+    let worker = remote_worker_client(&app).await;
 
     let mut uploaded: Vec<String> = Vec::new();
     let mut failed: Vec<serde_json::Value> = Vec::new();
@@ -3373,29 +3982,51 @@ async fn workspace_upload(
         }
 
         let clean: std::path::PathBuf = segs.into_iter().collect();
-        let full = root_path.join(&clean);
+        let rel = clean.to_string_lossy().replace('\\', "/");
 
-        if let Some(parent) = full.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                failed.push(serde_json::json!({
+        if let Some(worker) = &worker {
+            let result = worker
+                .filesystem_write(&WorkerFilesystemWriteRequest {
+                    path: rel.clone(),
+                    content: None,
+                    contents_b64: Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+                })
+                .await;
+            match result {
+                Ok(tool) if tool.success => uploaded.push(rel),
+                Ok(tool) => failed.push(serde_json::json!({
                     "file": filename,
-                    "error": "mkdir_failed",
+                    "error": tool.error_code.unwrap_or_else(|| "worker_write_failed".into()),
+                    "detail": tool.trace.unwrap_or_else(|| "worker write failed".into())
+                })),
+                Err(e) => failed.push(serde_json::json!({
+                    "file": filename,
+                    "error": "worker_write_failed",
                     "detail": e.to_string()
-                }));
-                continue;
+                })),
             }
-        }
+        } else {
+            let full = root_path.join(&clean);
 
-        match tokio::fs::write(&full, &bytes).await {
-            Ok(_) => {
-                let rel = clean.to_string_lossy().replace('\\', "/");
-                uploaded.push(rel);
+            if let Some(parent) = full.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    failed.push(serde_json::json!({
+                        "file": filename,
+                        "error": "mkdir_failed",
+                        "detail": e.to_string()
+                    }));
+                    continue;
+                }
             }
-            Err(e) => failed.push(serde_json::json!({
-                "file": filename,
-                "error": "write_failed",
-                "detail": e.to_string()
-            })),
+
+            match tokio::fs::write(&full, &bytes).await {
+                Ok(_) => uploaded.push(rel),
+                Err(e) => failed.push(serde_json::json!({
+                    "file": filename,
+                    "error": "write_failed",
+                    "detail": e.to_string()
+                })),
+            }
         }
     }
 
@@ -3414,6 +4045,72 @@ async fn workspace_download(
     State(app): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<FileQuery>,
 ) -> impl IntoResponse {
+    use base64::Engine as _;
+
+    if let Some(worker) = remote_worker_client(&app).await {
+        let result = worker
+            .filesystem_read(&WorkerFilesystemReadRequest {
+                path: remote_rel_path(&q.path),
+            })
+            .await;
+        return match result {
+            Ok(tool) => match worker_output_or_http_error(tool) {
+                Ok(output) => {
+                    let contents_b64 = match output.get("contents_b64").and_then(|v| v.as_str()) {
+                        Some(v) => v,
+                        None => {
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                Json(serde_json::json!({
+                                    "error": "worker_download_missing_bytes",
+                                })),
+                            )
+                                .into_response()
+                        }
+                    };
+                    let bytes = match base64::engine::general_purpose::STANDARD.decode(contents_b64) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                Json(serde_json::json!({
+                                    "error": "worker_download_decode_failed",
+                                    "detail": e.to_string(),
+                                })),
+                            )
+                                .into_response()
+                        }
+                    };
+                    let filename = output
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("download")
+                        .replace('"', "");
+                    let disposition = format!("attachment; filename=\"{filename}\"");
+                    let mut resp = axum::response::Response::new(axum::body::Body::from(bytes));
+                    *resp.status_mut() = StatusCode::OK;
+                    resp.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        header::HeaderValue::from_static("application/octet-stream"),
+                    );
+                    if let Ok(v) = header::HeaderValue::from_str(&disposition) {
+                        resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+                    }
+                    resp
+                }
+                Err(resp) => resp,
+            },
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "worker_filesystem_download_failed",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response(),
+        };
+    }
+
     let root = app.config.read().await.workspace_path.clone();
     let root_path = std::path::PathBuf::from(&root);
 

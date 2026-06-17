@@ -32,7 +32,7 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /app/target/release/aihomeserver /app/aihomeserver
 COPY --from=builder /app/target/release/worker /app/worker
 COPY scripts/docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh
+RUN sed -i 's/\r//' /app/docker-entrypoint.sh && chmod +x /app/docker-entrypoint.sh
 
 RUN mkdir -p /repo
 COPY *.md Cargo.toml Cargo.lock /repo/

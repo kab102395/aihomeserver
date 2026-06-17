@@ -12,6 +12,10 @@
 //! - Tool execution is the only place side effects occur, making auditing/safety easier.
 
 use crate::{
+    coder::{
+        browser_classification, deterministic_browser_tool_call, latest_verified_browser_output,
+        summarize_browser_selectors,
+    },
     llm::ollama::{Message, ModelRole, OllamaClient},
     state::{PlannerOutput, StepDefinition, SystemState},
 };
@@ -45,20 +49,21 @@ fn system_prompt_tool(workspace_path: &str, has_remote_worker: bool) -> String {
 - Shell commands run INSIDE the Ubuntu 24.04 Linux VM worker — NOT in the coordinator process or Docker container.
 - Always use POSIX/bash syntax: &&, ||, |, $(), head, tail, grep, sed, awk, curl, python3, etc.
 - Never use PowerShell syntax (Get-ChildItem, Select-Object, $env:VAR, Write-Host).
-- The VM has: bash, python3, curl, wget, git, apt, standard POSIX tools, full internet access.
-- The shell tool is the PRIMARY tool — use it for commands, builds, AND fetching URLs.
+- The VM has: bash, python3, curl, wget, git, apt, standard POSIX tools, and full internet access.
 - Do NOT use `docker exec` — the VM is not a Docker container.
-- Truncate long output: `| head -n 50` or `[:6000]` slice in python3.
+- Truncate long output with `| head -n 50` or slice in python3 `[:6000]`.
 
-WEB FETCH via shell (preferred over http_fetch/browser):
-  Standard page fetch and text strip:
-    curl -sL '<url>' | python3 -c "import sys,re,html; t=sys.stdin.read(); print(re.sub(r'<[^>]+>',' ',html.unescape(t))[:8000])"
-  JSON API:
-    curl -s '<url>' | python3 -m json.tool | head -n 80
-  Reddit (almost never blocks):
-    curl -sL -A 'Mozilla/5.0' 'https://old.reddit.com/r/...' | python3 -c "import sys,re; print(re.sub(r'<[^>]+>','',sys.stdin.read())[:6000])"
-  When the action says to fetch a URL from search results, pick the best URL from the search artifact
-  and put it directly in the curl command."#
+SHELL FETCH PATTERN (when the plan step is shell and action says to fetch a URL):
+  Page → text:  curl -sL '<url>' | python3 -c "import sys,re,html; t=sys.stdin.read(); print(re.sub(r'<[^>]+>',' ',html.unescape(t))[:8000])"
+  JSON API:     curl -s '<url>' | python3 -m json.tool | head -n 80
+  Reddit:       curl -sL -A 'Mozilla/5.0' 'https://old.reddit.com/r/...' | python3 -c "import sys,re; print(re.sub(r'<[^>]+>','',sys.stdin.read())[:6000])"
+  Pick the URL directly from the search_result artifact and embed it in the curl command.
+
+HTTP_FETCH TOOL RULES (when the plan step specifies tool_binding="http_fetch"):
+  Generate: {"tool": "http_fetch", "params": {"url": "<url>"}}
+  If the action says "best URL from search results" and no specific URL is available, use url="".
+  The system will auto-resolve url="" to the best available URL from search artifacts.
+  Do NOT substitute a shell call when the step binding is http_fetch."#
     } else {
         r#"SHELL TOOL RULES:
 - The shell tool runs commands in the coordinator process environment (Linux sh -lc or Windows PowerShell).
@@ -82,12 +87,26 @@ RUNTIME CONTEXT:
 {shell_section}
 
 FILESYSTEM TOOL RULES:
-- The filesystem tool is rooted at `workspace_path`. Paths are relative to that root.
-- Prefer filesystem for repo research instead of fragile shell pipelines:
-  - list directories: {{"action":"list","path":"."}}
-  - find files:       {{"action":"find","path":".","pattern":"planner"}}
-  - search in files:  {{"action":"grep","path":"src","query":"ToolResult"}}
+- In remote mode, the filesystem tool operates on the VM worker workspace and `workspace_path` will normally be `/workspace`.
+- In local mode, the filesystem tool is rooted at `workspace_path` on the coordinator side.
+- Paths are always relative to the active execution workspace.
+- ALWAYS include both "action" and "path" in params. Never emit empty params.
+- Write a file:      {{"tool":"filesystem","params":{{"action":"write","path":"hello.py","content":"print('hi')"}}}}
+- Read a file:       {{"tool":"filesystem","params":{{"action":"read","path":"hello.py"}}}}
+- List directory:    {{"tool":"filesystem","params":{{"action":"list","path":"."}}}}
+- Find files:        {{"tool":"filesystem","params":{{"action":"find","path":".","pattern":"planner"}}}}
+- Search in files:   {{"tool":"filesystem","params":{{"action":"grep","path":"src","query":"ToolResult"}}}}
 - Writes should be precise and scoped (one file per step if possible).
+
+SHELL TOOL SCHEMA (required field: command):
+  {{"tool":"shell","params":{{"command":"<bash command string>","cwd":"."}}}}
+Examples:
+  Run a script:   {{"tool":"shell","params":{{"command":"python3 hello_plan.py","cwd":"."}}}}
+  Check output:   {{"tool":"shell","params":{{"command":"cat hello_plan.py","cwd":"."}}}}
+  Install pkg:    {{"tool":"shell","params":{{"command":"pip3 install requests","cwd":"."}}}}
+  Multi-command:  {{"tool":"shell","params":{{"command":"python3 hello.py && echo done","cwd":"."}}}}
+  Append text:    {{"tool":"shell","params":{{"command":"printf '%s\\n' 'edited by shell' >> hello_vm_2.txt","cwd":"."}}}}
+- The `command` field is REQUIRED. Omitting it will cause a hard failure — always include it.
 "#
     )
 }
@@ -243,6 +262,20 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
         if missing.is_empty() {
             state.log("executor", "All steps complete");
             state.termination_met = true;
+        } else if missing.len() == 1
+            && missing[0] == "answer"
+            && !has_failed_tool_result(&state.artifacts)
+        {
+            let synthesized = synthesize_success_answer(&state, &plan, &state.artifacts);
+            state.artifacts.insert(
+                "answer".to_string(),
+                serde_json::Value::String(synthesized),
+            );
+            state.log(
+                "executor",
+                "All tool steps complete; synthesized final answer artifact",
+            );
+            state.termination_met = true;
         } else {
             state.log_meta(
                 "executor_incomplete",
@@ -304,6 +337,48 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
         ctx_map.insert(k.clone(), v.clone());
     }
     let artifact_context: serde_json::Value = ctx_map.into();
+
+    if let Some(intent) = &state.coding_intent {
+        if let Some(tool_call) =
+            deterministic_browser_tool_call(intent, &state.user_request, &step, &state.artifacts)
+        {
+            let output_key = step
+                .output_key
+                .clone()
+                .unwrap_or_else(|| format!("step_{}", state.current_step));
+            state
+                .artifacts
+                .insert(output_key, serde_json::Value::String(tool_call.to_string()));
+            state.log(
+                "executor",
+                &format!(
+                    "Step {} deterministic browser scaffold/tool call",
+                    step.step_id
+                ),
+            );
+            return Ok(state);
+        }
+    }
+
+    // Fast path: if the planner already filled in complete tool params, use them directly
+    // without an LLM call. This is more reliable than asking the model to re-derive params
+    // from a vague action description.
+    if let Some(tool_name) = &step.tool_binding {
+        let params = &step.input_params;
+        let can_passthrough = match tool_name.as_str() {
+            "shell" => params.get("command").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false),
+            "filesystem" => params.get("action").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false)
+                && (params["action"] != "write" || params.get("content").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false)),
+            _ => false,
+        };
+        if can_passthrough {
+            let tool_call = serde_json::json!({"tool": tool_name, "params": params});
+            let output_key = step.output_key.clone().unwrap_or_else(|| format!("step_{}", state.current_step));
+            state.artifacts.insert(output_key, serde_json::Value::String(tool_call.to_string()));
+            state.log("executor", &format!("Step {} passthrough (planner-provided params)", step.step_id));
+            return Ok(state);
+        }
+    }
 
     let has_tool = step.tool_binding.is_some();
     let wants_json = !has_tool
@@ -408,9 +483,15 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
         String::new()
     };
 
+    let coding_guidance = state
+        .artifacts
+        .get("coding_executor_guidance")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
     let user_prompt = if has_tool {
         format!(
-            "{}User request: {}\n\nRuntime OS: {}\nIn container: {}\nCapabilities: {}\n\nStep ID: {}\nAction: {}\nInput params: {}\nAvailable artifacts: {}",
+            "{}User request: {}\n\nRuntime OS: {}\nIn container: {}\nCapabilities: {}\n\nStep ID: {}\nAction: {}\nInput params: {}\nAvailable artifacts: {}\n\nCoding guidance:\n{}",
             history_block,
             state.user_request,
             std::env::consts::OS,
@@ -420,6 +501,7 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
             step.action,
             step.input_params,
             artifact_context,
+            coding_guidance,
         )
     } else {
         // For LLM-only steps, lead with history + question so the model sees everything.
@@ -431,13 +513,14 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
             ""
         };
         format!(
-            "{}User request: {}\n\nCapabilities: {}\nStep ID: {}\nAction: {}\nAvailable artifacts: {}{}",
+            "{}User request: {}\n\nCapabilities: {}\nStep ID: {}\nAction: {}\nAvailable artifacts: {}\n\nCoding guidance:\n{}{}",
             history_block,
             state.user_request,
             state.capabilities,
             step.step_id,
             step.action,
             artifact_context,
+            coding_guidance,
             grounding_suffix,
         )
     };
@@ -513,14 +596,50 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
                     }
                 }
             } else {
-                state
-                    .artifacts
-                    .insert(output_key, serde_json::Value::String(out));
+                let trimmed = out.trim().to_string();
+                if !has_tool
+                    && output_key == "answer"
+                    && trimmed.is_empty()
+                    && !has_failed_tool_result(&state.artifacts)
+                {
+                    let synthesized = synthesize_success_answer(&state, &plan, &state.artifacts);
+                    state.artifacts.insert(
+                        output_key,
+                        serde_json::Value::String(synthesized),
+                    );
+                    state.log(
+                        "executor",
+                        "LLM returned empty final answer; synthesized answer from successful artifacts",
+                    );
+                } else {
+                    state
+                        .artifacts
+                        .insert(output_key, serde_json::Value::String(out));
+                }
             }
         }
         None => {
-            state.log_meta("executor_error", "LLM call failed", serde_json::json!({}));
-            state.failure_count += 1;
+            let output_key = step
+                .output_key
+                .clone()
+                .unwrap_or_else(|| format!("step_{}", state.current_step));
+            if !has_tool
+                && output_key == "answer"
+                && !has_failed_tool_result(&state.artifacts)
+            {
+                let synthesized = synthesize_success_answer(&state, &plan, &state.artifacts);
+                state.artifacts.insert(
+                    output_key,
+                    serde_json::Value::String(synthesized),
+                );
+                state.log(
+                    "executor",
+                    "LLM final answer step failed; synthesized answer from successful artifacts",
+                );
+            } else {
+                state.log_meta("executor_error", "LLM call failed", serde_json::json!({}));
+                state.failure_count += 1;
+            }
         }
     }
 
@@ -529,6 +648,328 @@ pub async fn run(mut state: SystemState, llm: &OllamaClient) -> Result<SystemSta
     maybe_expand_research_loop(&mut state, &step);
 
     Ok(state)
+}
+
+fn has_failed_tool_result(
+    artifacts: &std::collections::HashMap<String, serde_json::Value>,
+) -> bool {
+    artifacts.iter().any(|(k, v)| {
+        k.ends_with("_result") && v.get("success").and_then(|b| b.as_bool()) == Some(false)
+    })
+}
+
+fn tool_result_is_success(result: &serde_json::Value) -> bool {
+    result.get("success").and_then(|b| b.as_bool()) != Some(false)
+}
+
+fn synthesize_success_answer(
+    state: &crate::state::SystemState,
+    plan: &crate::state::PlannerOutput,
+    artifacts: &std::collections::HashMap<String, serde_json::Value>,
+) -> String {
+    if let Some(ci) = &state.coding_intent {
+        match ci.task_class.as_str() {
+            "script_task" | "workspace_file_task" | "browser_automation_task" => {
+                let file_views = dedupe_blocks(collect_filesystem_views(plan, artifacts));
+                let shell_outputs = dedupe_blocks(collect_shell_outputs(plan, artifacts));
+                let warning = recovered_warning_text(artifacts);
+                let mut sections: Vec<String> = Vec::new();
+
+                if ci.task_class == "browser_automation_task" {
+                    let verified = latest_verified_browser_output(artifacts);
+                    if verified.is_none() {
+                        return summarize_browser_contract_failure(artifacts);
+                    }
+                }
+
+                if let Some(text) = warning {
+                    sections.push(format!("Warning:\n\n{text}"));
+                }
+                if !file_views.is_empty() {
+                    sections.push(format!("File contents:\n\n{}", file_views.join("\n\n")));
+                }
+                if !shell_outputs.is_empty() {
+                    sections.push(format!("Exact command output:\n\n{}", shell_outputs.join("\n\n")));
+                }
+                if ci.task_class == "browser_automation_task" {
+                    if let Some(verified) = latest_verified_browser_output(artifacts) {
+                        if let Some(selectors) = summarize_browser_selectors(&verified) {
+                            sections.push(format!("Selectors used:\n\n{selectors}"));
+                        }
+                    }
+                    if let Some(conclusion) = browser_task_conclusion(artifacts) {
+                        sections.push(format!("Conclusion:\n\n{conclusion}"));
+                    }
+                }
+
+                if !sections.is_empty() {
+                    return sections.join("\n\n");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+
+    for step in &plan.steps {
+        let Some(tool) = &step.tool_binding else {
+            continue;
+        };
+        let Some(output_key) = &step.output_key else {
+            continue;
+        };
+        let artifact_key = format!("{output_key}_result");
+        let Some(v) = artifacts.get(&artifact_key) else {
+            continue;
+        };
+        let out = v.get("output").unwrap_or(v);
+
+        match tool.as_str() {
+            "filesystem" => {
+                if let Some(path) = out.get("path").and_then(|x| x.as_str()) {
+                    if let Some(content) = out.get("content").and_then(|x| x.as_str()) {
+                        lines.push(format!("Created or updated `{path}`:"));
+                        lines.push(content.trim().to_string());
+                    } else if out.get("tree").is_some() {
+                        lines.push(format!("Listed `{path}` successfully."));
+                    } else {
+                        lines.push(format!("Filesystem step completed for `{path}`."));
+                    }
+                }
+            }
+            "shell" => {
+                if let Some(stdout) = out.get("stdout").and_then(|x| x.as_str()) {
+                    let trimmed = stdout.trim();
+                    if !trimmed.is_empty() {
+                        lines.push(trimmed.to_string());
+                    } else {
+                        lines.push("Shell command completed successfully.".to_string());
+                    }
+                }
+            }
+            _ => {
+                if let Some(body) = out.get("body").and_then(|x| x.as_str()) {
+                    let trimmed = body.trim();
+                    if !trimmed.is_empty() {
+                        lines.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        "Task completed successfully.".to_string()
+    } else {
+        lines.join("\n\n")
+    }
+}
+
+fn collect_filesystem_views(
+    plan: &crate::state::PlannerOutput,
+    artifacts: &std::collections::HashMap<String, serde_json::Value>,
+) -> Vec<String> {
+    let mut blocks = Vec::new();
+    for step in &plan.steps {
+        if step.tool_binding.as_deref() != Some("filesystem") {
+            continue;
+        }
+        let Some(output_key) = &step.output_key else {
+            continue;
+        };
+        let artifact_key = format!("{output_key}_result");
+        let Some(result) = artifacts.get(&artifact_key) else {
+            continue;
+        };
+        if result.get("success").and_then(|b| b.as_bool()) == Some(false) {
+            continue;
+        }
+        let output = result.get("output").unwrap_or(result);
+        let Some(path) = output.get("path").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        if output.get("is_text").and_then(|v| v.as_bool()) == Some(false) {
+            continue;
+        }
+        if let Some(content) = output.get("content").and_then(|x| x.as_str()) {
+            blocks.push(format!("`{path}`:\n\n{content}"));
+        }
+    }
+    blocks
+}
+
+fn collect_shell_outputs(
+    plan: &crate::state::PlannerOutput,
+    artifacts: &std::collections::HashMap<String, serde_json::Value>,
+) -> Vec<String> {
+    let mut blocks = Vec::new();
+    for step in &plan.steps {
+        if step.tool_binding.as_deref() != Some("shell") {
+            continue;
+        }
+        let Some(output_key) = &step.output_key else {
+            continue;
+        };
+        let artifact_key = format!("{output_key}_result");
+        let Some(result) = artifacts.get(&artifact_key) else {
+            continue;
+        };
+        if result.get("success").and_then(|b| b.as_bool()) == Some(false) {
+            continue;
+        }
+        let output = result.get("output").unwrap_or(result);
+        let command = output
+            .get("command")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim();
+        let stdout = output
+            .get("stdout")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim();
+        let stderr = output
+            .get("stderr")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim();
+        let mut block = String::new();
+        if !command.is_empty() {
+            block.push_str("$ ");
+            block.push_str(command);
+            block.push('\n');
+        }
+        if !stdout.is_empty() {
+            block.push_str(stdout);
+            if !stdout.ends_with('\n') && !stderr.is_empty() {
+                block.push('\n');
+            }
+        }
+        if !stderr.is_empty() {
+            block.push_str(stderr);
+        }
+        let trimmed = block.trim();
+        if !trimmed.is_empty() {
+            blocks.push(trimmed.to_string());
+        }
+    }
+    blocks
+}
+
+fn dedupe_blocks(blocks: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for block in blocks {
+        let normalized = block.trim().to_string();
+        if normalized.is_empty() {
+            continue;
+        }
+        if seen.insert(normalized.clone()) {
+            out.push(normalized);
+        }
+    }
+    out
+}
+
+fn browser_task_conclusion(
+    artifacts: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<String> {
+    let output = latest_verified_browser_output(artifacts)?;
+    let joined = output.to_lowercase();
+    if joined.trim().is_empty() {
+        return None;
+    }
+    if let Some(line) = output
+        .lines()
+        .find(|line| line.trim_start().starts_with("Conclusion:"))
+    {
+        return Some(line.trim().to_string());
+    }
+    match browser_classification(&output) {
+        Some("access denied") => {
+            return Some(
+                "The page was reached, but the result is an access-denied response. The agent did not claim extraction success beyond that evidence."
+                    .to_string(),
+            )
+        }
+        Some("challenge page") => {
+            return Some(
+                "The target page loaded, but browser automation hit an anti-bot or challenge flow rather than the normal listing content.".to_string(),
+            )
+        }
+        _ => {}
+    }
+    if joined.contains("timed out after") {
+        return Some(
+            "The browser task did not complete before timeout, so the page may be slow, blocked, or waiting on a challenge flow.".to_string(),
+        );
+    }
+    if joined.contains("classification: normal page")
+        || (joined.contains("page title:") && joined.contains("final url:"))
+    {
+        if joined.contains("extracted visible content successfully") {
+            return Some(
+                "The browser task reached a normal page and extracted visible content successfully."
+                    .to_string(),
+            );
+        }
+        return Some(
+            "The browser probe ran successfully and returned page-level diagnostics from the active VM runtime.".to_string(),
+        );
+    }
+    None
+}
+
+fn summarize_browser_contract_failure(
+    artifacts: &std::collections::HashMap<String, serde_json::Value>,
+) -> String {
+    let mut failures: Vec<(&String, &serde_json::Value)> = artifacts
+        .iter()
+        .filter(|(k, v)| {
+            k.ends_with("_result") && v.get("success").and_then(|b| b.as_bool()) == Some(false)
+        })
+        .collect();
+    failures.sort_by_key(|(k, _)| *k);
+
+    if let Some((k, v)) = failures.last() {
+        let code = v
+            .get("error_code")
+            .and_then(|x| x.as_str())
+            .unwrap_or("unknown_error");
+        let trace = v
+            .get("trace")
+            .and_then(|x| x.as_str())
+            .unwrap_or("The browser task did not return additional details.")
+            .trim();
+        return format!(
+            "The browser task did not finish cleanly. The last failing step was `{k}` ({code}). {trace}"
+        );
+    }
+
+    "The browser task did not finish cleanly. It never produced a verified browser execution with exact output markers."
+        .to_string()
+}
+
+fn recovered_warning_text(
+    artifacts: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<String> {
+    if !has_failed_tool_result(artifacts) {
+        return None;
+    }
+    let latest = artifacts
+        .iter()
+        .filter(|(k, v)| k.ends_with("_result") && tool_result_is_success(v))
+        .max_by_key(|(_, v)| {
+            v.get("timestamp")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string()
+        })?;
+    Some(format!(
+        "Completed successfully after recovering from earlier tool failures. Final successful step: `{}`.",
+        latest.0
+    ))
 }
 
 /// Parse an integer from JSON, accepting both `u64` and `i64` representations.

@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::{
     state::{ErrorType, ToolResult},
     worker::{
-        collect_workspace_files, write_workspace_artifacts, WorkerClient, WorkerShellRequest,
-        WorkspaceSyncRequest,
+        write_workspace_artifacts, WorkerClient, WorkerShellRequest,
     },
 };
 
@@ -55,6 +54,32 @@ fn resolve_local_cwd(workspace_root: &Path, requested: Option<&str>) -> PathBuf 
         workspace_root.to_path_buf()
     } else {
         PathBuf::from(".")
+    }
+}
+
+fn resolve_remote_cwd(requested: Option<&str>) -> String {
+    let requested = requested.unwrap_or(".").trim();
+    if requested.is_empty() || requested == "." {
+        return ".".into();
+    }
+
+    let normalized = requested.replace('\\', "/");
+    if normalized == "/workspace" {
+        return ".".into();
+    }
+    if let Some(stripped) = normalized.strip_prefix("/workspace/") {
+        return if stripped.trim().is_empty() {
+            ".".into()
+        } else {
+            stripped.trim_matches('/').to_string()
+        };
+    }
+
+    let rel = Path::new(&normalized);
+    if rel.is_absolute() {
+        ".".into()
+    } else {
+        normalized.trim_start_matches("./").trim_matches('/').to_string()
     }
 }
 
@@ -135,13 +160,6 @@ impl Tool for ShellTool {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(default_cwd()));
         let cwd_requested = params.get("cwd").and_then(|v| v.as_str());
-        let local_cwd = resolve_local_cwd(&workspace_root, cwd_requested);
-        let sync_prefix = local_cwd
-            .strip_prefix(&workspace_root)
-            .ok()
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| ".".into());
 
         let remote_requested = self.execution_mode.trim().eq_ignore_ascii_case("remote")
             || self.execution_mode.trim().eq_ignore_ascii_case("auto");
@@ -160,6 +178,7 @@ impl Tool for ShellTool {
                     };
                     let timeout_secs = params["timeout_secs"].as_u64();
                     let task_id = params["task_id"].as_str().map(|s| s.to_string());
+                    let remote_cwd = resolve_remote_cwd(cwd_requested);
                     let collect_paths = params
                         .get("collect_paths")
                         .and_then(|v| v.as_array())
@@ -172,34 +191,10 @@ impl Tool for ShellTool {
                         })
                         .unwrap_or_default();
 
-                    let files = match collect_workspace_files(&local_cwd) {
-                        Ok(files) => files,
-                        Err(e) => {
-                            return ToolResult::err(
-                                ErrorType::Env,
-                                "worker_sync_failed",
-                                &e.to_string(),
-                            )
-                        }
-                    };
-                    if let Err(e) = worker
-                        .sync_workspace(&WorkspaceSyncRequest {
-                            prefix: Some(sync_prefix.clone()),
-                            files,
-                        })
-                        .await
-                    {
-                        return ToolResult::err(
-                            ErrorType::Env,
-                            "worker_sync_failed",
-                            &e.to_string(),
-                        );
-                    }
-
                     match worker
                         .shell(&WorkerShellRequest {
                             command,
-                            cwd: Some(sync_prefix.clone()),
+                            cwd: Some(remote_cwd),
                             timeout_secs,
                             task_id,
                             collect_paths,

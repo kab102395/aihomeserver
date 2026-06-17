@@ -18,8 +18,12 @@ services:
     environment:
       DATA_DIR: /data
       PORT: "3000"
+      REPO_ROOT: "/workspace"
       WORKSPACE: "/workspace"
       OLLAMA_URL: "http://host.docker.internal:11434"
+      WORKER_URL: "${WORKER_URL:-}"
+      WORKER_TOKEN: "${WORKER_TOKEN:-}"
+      EXECUTION_MODE: "${EXECUTION_MODE:-auto}"
       SEARCH_URL: "http://searxng:8080"
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -32,6 +32,69 @@ pub struct WorkerBrowserRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerFilesystemReadRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerFilesystemWriteRequest {
+    pub path: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub contents_b64: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerFilesystemListRequest {
+    pub path: String,
+    #[serde(default)]
+    pub depth: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerFilesystemFindRequest {
+    pub path: String,
+    pub pattern: String,
+    #[serde(default)]
+    pub max_depth: Option<usize>,
+    #[serde(default)]
+    pub max_files: Option<usize>,
+    #[serde(default)]
+    pub max_results: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerFilesystemGrepRequest {
+    pub path: String,
+    pub query: String,
+    #[serde(default)]
+    pub max_depth: Option<usize>,
+    #[serde(default)]
+    pub max_files: Option<usize>,
+    #[serde(default)]
+    pub max_results: Option<usize>,
+    #[serde(default)]
+    pub max_bytes_per_file: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerFilesystemDeleteRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerFilesystemMkdirRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerFilesystemRenameRequest {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceFilePayload {
     pub path: String,
     pub contents_b64: String,
@@ -66,6 +129,35 @@ pub struct WorkerHealth {
     pub ok: bool,
     #[serde(default)]
     pub workspace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerFilesystemCapabilities {
+    pub read: bool,
+    pub write: bool,
+    pub list: bool,
+    pub find: bool,
+    pub grep: bool,
+    pub delete: bool,
+    pub mkdir: bool,
+    pub rename: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerBrowserAutomationCapabilities {
+    pub installed: bool,
+    pub playwright: bool,
+    pub chromium: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerCapabilities {
+    pub ok: bool,
+    pub workspace: String,
+    pub shell: bool,
+    pub browser_fetch: bool,
+    pub filesystem: WorkerFilesystemCapabilities,
+    pub browser_automation: WorkerBrowserAutomationCapabilities,
 }
 
 #[derive(Clone)]
@@ -123,16 +215,28 @@ impl WorkerClient {
         Ok(resp.json::<R>().await?)
     }
 
-    pub async fn health(&self) -> Result<WorkerHealth> {
+    async fn get_json<R: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<R> {
         if !self.is_enabled() {
             return Err(anyhow!("worker not configured"));
         }
-        let mut req = self.client.get(format!("{}/health", self.base_url));
+        let mut req = self.client.get(format!(
+            "{}/{}",
+            self.base_url,
+            path.trim_start_matches('/')
+        ));
         if let Some(token) = &self.token {
             req = req.header(AUTHORIZATION, format!("Bearer {token}"));
         }
         let resp = req.send().await?.error_for_status()?;
-        Ok(resp.json::<WorkerHealth>().await?)
+        Ok(resp.json::<R>().await?)
+    }
+
+    pub async fn health(&self) -> Result<WorkerHealth> {
+        self.get_json("health").await
+    }
+
+    pub async fn capabilities(&self) -> Result<WorkerCapabilities> {
+        self.get_json("capabilities").await
     }
 
     pub async fn shell(&self, request: &WorkerShellRequest) -> Result<ToolResult> {
@@ -148,6 +252,62 @@ impl WorkerClient {
         request: &WorkspaceSyncRequest,
     ) -> Result<WorkspaceSyncResponse> {
         self.post_json("workspace/sync", request).await
+    }
+
+    pub async fn filesystem_read(
+        &self,
+        request: &WorkerFilesystemReadRequest,
+    ) -> Result<ToolResult> {
+        self.post_json("filesystem/read", request).await
+    }
+
+    pub async fn filesystem_write(
+        &self,
+        request: &WorkerFilesystemWriteRequest,
+    ) -> Result<ToolResult> {
+        self.post_json("filesystem/write", request).await
+    }
+
+    pub async fn filesystem_list(
+        &self,
+        request: &WorkerFilesystemListRequest,
+    ) -> Result<ToolResult> {
+        self.post_json("filesystem/list", request).await
+    }
+
+    pub async fn filesystem_find(
+        &self,
+        request: &WorkerFilesystemFindRequest,
+    ) -> Result<ToolResult> {
+        self.post_json("filesystem/find", request).await
+    }
+
+    pub async fn filesystem_grep(
+        &self,
+        request: &WorkerFilesystemGrepRequest,
+    ) -> Result<ToolResult> {
+        self.post_json("filesystem/grep", request).await
+    }
+
+    pub async fn filesystem_delete(
+        &self,
+        request: &WorkerFilesystemDeleteRequest,
+    ) -> Result<ToolResult> {
+        self.post_json("filesystem/delete", request).await
+    }
+
+    pub async fn filesystem_mkdir(
+        &self,
+        request: &WorkerFilesystemMkdirRequest,
+    ) -> Result<ToolResult> {
+        self.post_json("filesystem/mkdir", request).await
+    }
+
+    pub async fn filesystem_rename(
+        &self,
+        request: &WorkerFilesystemRenameRequest,
+    ) -> Result<ToolResult> {
+        self.post_json("filesystem/rename", request).await
     }
 }
 

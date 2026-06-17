@@ -462,6 +462,104 @@ def collect_paths(root, paths):
         })
     return out
 
+def rel_path(root, target):
+    return target.relative_to(pathlib.Path(root)).as_posix()
+
+def is_skip_name(name):
+    return (
+        not name
+        or name.startswith(".")
+        or name in ("target", "node_modules", "__pycache__", "workspace", "data")
+    )
+
+def hash_bytes(data):
+    import hashlib
+    return hashlib.sha256(data).hexdigest()[:16]
+
+def is_probably_text(data):
+    return b"\x00" not in data
+
+def tool_ok(output, checkpoint=None):
+    return {
+        "success": True,
+        "error_type": "none",
+        "error_code": None,
+        "trace": None,
+        "output": output,
+        "checkpoint": checkpoint,
+        "observed_state_hash": None,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+    }
+
+def tool_err(code, trace, error_type="tool"):
+    return {
+        "success": False,
+        "error_type": error_type,
+        "error_code": code,
+        "trace": str(trace),
+        "output": None,
+        "checkpoint": None,
+        "observed_state_hash": None,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+    }
+
+def build_fs_tree(dir_path, base_path, depth):
+    if depth <= 0:
+        return []
+    nodes = []
+    try:
+        entries = sorted(dir_path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except Exception:
+        return []
+    for entry in entries:
+        name = entry.name
+        if is_skip_name(name):
+            continue
+        try:
+            if entry.is_dir():
+                nodes.append({
+                    "type": "dir",
+                    "name": name,
+                    "path": rel_path(base_path, entry),
+                    "children": build_fs_tree(entry, base_path, depth - 1),
+                })
+            elif entry.is_file():
+                nodes.append({
+                    "type": "file",
+                    "name": name,
+                    "path": rel_path(base_path, entry),
+                    "size": entry.stat().st_size,
+                    "ext": entry.suffix[1:] if entry.suffix.startswith(".") else entry.suffix,
+                })
+        except Exception:
+            continue
+    return nodes
+
+def walk_files(root, max_depth=6, max_files=500):
+    out = []
+    stack = [(root, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > max_depth:
+            continue
+        try:
+            entries = list(current.iterdir())
+        except Exception:
+            continue
+        for entry in entries:
+            if len(out) >= max_files:
+                return out
+            if is_skip_name(entry.name):
+                continue
+            try:
+                if entry.is_dir():
+                    stack.append((entry, depth + 1))
+                elif entry.is_file():
+                    out.append(entry)
+            except Exception:
+                continue
+    return out
+
 def run_shell(command, cwd, timeout_secs):
     proc = subprocess.run(
         ["bash", "-lc", command],
@@ -472,6 +570,53 @@ def run_shell(command, cwd, timeout_secs):
     )
     return proc.returncode, proc.stdout, proc.stderr
 
+def python_module_installed(module_name):
+    try:
+        import importlib.util
+        return importlib.util.find_spec(module_name) is not None
+    except Exception:
+        return False
+
+def chromium_installed():
+    candidates = []
+    shared = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if shared:
+        candidates.append(pathlib.Path(shared))
+    candidates.append(pathlib.Path.home() / ".cache" / "ms-playwright")
+    candidates.append(pathlib.Path("/var/lib/aihomeserver/ms-playwright"))
+    for cache_dir in candidates:
+        if not cache_dir.exists():
+            continue
+        try:
+            if any("chromium" in entry.name.lower() for entry in cache_dir.iterdir()):
+                return True
+        except Exception:
+            continue
+    return False
+
+def file_kind_and_mime(path_str, data):
+    ext = pathlib.Path(path_str or "").suffix.lower()
+    if ext == ".png":
+        return ("image", "image/png", False)
+    if ext in (".jpg", ".jpeg"):
+        return ("image", "image/jpeg", False)
+    if ext == ".gif":
+        return ("image", "image/gif", False)
+    if ext == ".webp":
+        return ("image", "image/webp", False)
+    if ext == ".svg":
+        return ("image", "image/svg+xml", True)
+    if ext == ".bmp":
+        return ("image", "image/bmp", False)
+    if ext == ".ico":
+        return ("image", "image/x-icon", False)
+    if ext in (".txt", ".md", ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".toml", ".yaml", ".yml", ".html", ".css", ".sql", ".sh", ".ps1", ".log", ".xml", ".csv"):
+        return ("text", "text/plain; charset=utf-8", True)
+    text_like = is_probably_text(data)
+    if text_like:
+        return ("text", "text/plain; charset=utf-8", True)
+    return ("binary", "application/octet-stream", False)
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
@@ -479,6 +624,31 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             json_response(self, 200, {"ok": True, "workspace": WORKSPACE})
+            return
+        if self.path == "/capabilities":
+            playwright = python_module_installed("playwright")
+            chromium = chromium_installed()
+            json_response(self, 200, {
+                "ok": True,
+                "workspace": WORKSPACE,
+                "shell": True,
+                "browser_fetch": True,
+                "filesystem": {
+                    "read": True,
+                    "write": True,
+                    "list": True,
+                    "find": True,
+                    "grep": True,
+                    "delete": True,
+                    "mkdir": True,
+                    "rename": True,
+                },
+                "browser_automation": {
+                    "installed": playwright and chromium,
+                    "playwright": playwright,
+                    "chromium": chromium,
+                },
+            })
             return
         self.send_error(404)
 
@@ -560,6 +730,178 @@ class Handler(BaseHTTPRequestHandler):
                 })
             return
 
+        if self.path == "/filesystem/list":
+            try:
+                root = resolve_path(WORKSPACE, payload.get("path"))
+                root.mkdir(parents=True, exist_ok=True)
+                depth = int(payload.get("depth") or 4)
+                if not root.is_dir():
+                    json_response(self, 200, tool_err("not_a_directory", f"{root} is not a directory"))
+                    return
+                tree = {
+                    "type": "dir",
+                    "name": root.name or "workspace",
+                    "path": "",
+                    "children": build_fs_tree(root, root, depth),
+                }
+                json_response(self, 200, tool_ok(tree, {"type": "filesystem_list", "path": str(root), "depth": depth}))
+            except Exception as e:
+                json_response(self, 200, tool_err("filesystem_list_failed", e))
+            return
+
+        if self.path == "/filesystem/read":
+            try:
+                target = resolve_path(WORKSPACE, payload.get("path"))
+                if not target.exists():
+                    json_response(self, 200, tool_err("not_found", f"{target} not found"))
+                    return
+                if not target.is_file():
+                    json_response(self, 200, tool_err("not_a_file", f"{target} is not a file"))
+                    return
+                data = target.read_bytes()
+                truncated = len(data) > 65536
+                slice_data = data[:65536] if truncated else data
+                kind, mime, is_text = file_kind_and_mime(payload.get("path") or ".", slice_data)
+                text = slice_data.decode("utf-8", "replace") if is_text else ""
+                json_response(self, 200, tool_ok({
+                    "path": payload.get("path") or ".",
+                    "content": text,
+                    "contents_b64": base64.b64encode(slice_data).decode("ascii"),
+                    "name": target.name,
+                    "size": len(data),
+                    "truncated": truncated,
+                    "is_text": is_text,
+                    "kind": kind,
+                    "mime": mime,
+                    "sha16": hash_bytes(data),
+                }, {"type": "filesystem_read", "path": str(target)}))
+            except Exception as e:
+                json_response(self, 200, tool_err("filesystem_read_failed", e))
+            return
+
+        if self.path == "/filesystem/write":
+            try:
+                target = resolve_path(WORKSPACE, payload.get("path"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if payload.get("contents_b64"):
+                    data = base64.b64decode(payload.get("contents_b64", ""))
+                else:
+                    data = (payload.get("content") or "").encode("utf-8")
+                target.write_bytes(data)
+                json_response(self, 200, tool_ok({
+                    "path": payload.get("path") or ".",
+                    "size": len(data),
+                    "sha16": hash_bytes(data),
+                }, {"type": "filesystem_write", "path": str(target), "size": len(data)}))
+            except Exception as e:
+                json_response(self, 200, tool_err("filesystem_write_failed", e))
+            return
+
+        if self.path == "/filesystem/delete":
+            try:
+                target = resolve_path(WORKSPACE, payload.get("path"))
+                if not target.exists():
+                    json_response(self, 200, tool_err("not_found", f"{target} not found"))
+                    return
+                if target.is_dir():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+                json_response(self, 200, tool_ok({
+                    "path": payload.get("path") or ".",
+                    "deleted": True,
+                }, {"type": "filesystem_delete", "path": str(target)}))
+            except Exception as e:
+                json_response(self, 200, tool_err("filesystem_delete_failed", e))
+            return
+
+        if self.path == "/filesystem/mkdir":
+            try:
+                target = resolve_path(WORKSPACE, payload.get("path"))
+                target.mkdir(parents=True, exist_ok=True)
+                json_response(self, 200, tool_ok({
+                    "path": payload.get("path") or ".",
+                    "created": True,
+                }, {"type": "filesystem_mkdir", "path": str(target)}))
+            except Exception as e:
+                json_response(self, 200, tool_err("filesystem_mkdir_failed", e))
+            return
+
+        if self.path == "/filesystem/rename":
+            try:
+                source = resolve_path(WORKSPACE, payload.get("from"))
+                dest = resolve_path(WORKSPACE, payload.get("to"))
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                source.rename(dest)
+                json_response(self, 200, tool_ok({
+                    "from": payload.get("from") or ".",
+                    "to": payload.get("to") or ".",
+                    "renamed": True,
+                }, {"type": "filesystem_rename", "from": str(source), "to": str(dest)}))
+            except Exception as e:
+                json_response(self, 200, tool_err("filesystem_rename_failed", e))
+            return
+
+        if self.path == "/filesystem/find":
+            try:
+                root = resolve_path(WORKSPACE, payload.get("path"))
+                pattern = (payload.get("pattern") or "").lower()
+                max_depth = int(payload.get("max_depth") or 6)
+                max_files = int(payload.get("max_files") or 500)
+                max_results = int(payload.get("max_results") or 200)
+                matches = []
+                for entry in walk_files(root, max_depth=max_depth, max_files=max_files):
+                    if pattern in entry.name.lower():
+                        matches.append(rel_path(pathlib.Path(WORKSPACE), entry))
+                        if len(matches) >= max_results:
+                            break
+                json_response(self, 200, tool_ok({
+                    "path": payload.get("path") or ".",
+                    "pattern": payload.get("pattern") or "",
+                    "matches": matches,
+                }, {"type": "filesystem_find", "count": len(matches)}))
+            except Exception as e:
+                json_response(self, 200, tool_err("filesystem_find_failed", e))
+            return
+
+        if self.path == "/filesystem/grep":
+            try:
+                root = resolve_path(WORKSPACE, payload.get("path"))
+                query = payload.get("query") or ""
+                query_lower = query.lower()
+                max_depth = int(payload.get("max_depth") or 6)
+                max_files = int(payload.get("max_files") or 500)
+                max_results = int(payload.get("max_results") or 200)
+                max_bytes_per_file = int(payload.get("max_bytes_per_file") or 131072)
+                matches = []
+                for entry in walk_files(root, max_depth=max_depth, max_files=max_files):
+                    try:
+                        data = entry.read_bytes()
+                    except Exception:
+                        continue
+                    if len(data) > max_bytes_per_file or not is_probably_text(data):
+                        continue
+                    text = data.decode("utf-8", "replace")
+                    for line_no, line in enumerate(text.splitlines(), start=1):
+                        if query_lower in line.lower():
+                            matches.append({
+                                "file": rel_path(pathlib.Path(WORKSPACE), entry),
+                                "line": line_no,
+                                "preview": line[:240],
+                            })
+                            if len(matches) >= max_results:
+                                break
+                    if len(matches) >= max_results:
+                        break
+                json_response(self, 200, tool_ok({
+                    "path": payload.get("path") or ".",
+                    "query": query,
+                    "matches": matches,
+                }, {"type": "filesystem_grep", "count": len(matches)}))
+            except Exception as e:
+                json_response(self, 200, tool_err("filesystem_grep_failed", e))
+            return
+
         if self.path == "/browser/fetch":
             url = payload.get("url", "")
             max_chars = int(payload.get("max_chars") or 12000)
@@ -631,15 +973,110 @@ function Get-WorkerEnvFile {
 WORKER_WORKSPACE=$WorkspacePath
 WORKER_PORT=$WorkerPort
 WORKER_TOKEN=$WorkerToken
+PLAYWRIGHT_BROWSERS_PATH=/var/lib/aihomeserver/ms-playwright
 "@
+}
+
+function Get-WorkerRuntimeBootstrapScript {
+@'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+MARKER="/var/lib/aihomeserver/runtime.ready"
+export PLAYWRIGHT_BROWSERS_PATH="/var/lib/aihomeserver/ms-playwright"
+mkdir -p /var/lib/aihomeserver /workspace "$PLAYWRIGHT_BROWSERS_PATH"
+LOG_FILE="/var/lib/aihomeserver/runtime-bootstrap.log"
+exec >>"$LOG_FILE" 2>&1
+
+if [ -f "$MARKER" ]; then
+  exit 0
+fi
+
+wait_for_network() {
+  for _ in $(seq 1 60); do
+    if curl -fsS --max-time 5 https://deb.debian.org >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
+retry_cmd() {
+  local attempts="$1"
+  shift
+  local n=1
+  while true; do
+    if "$@"; then
+      return 0
+    fi
+    if [ "$n" -ge "$attempts" ]; then
+      return 1
+    fi
+    n=$((n + 1))
+    sleep 10
+  done
+}
+
+wait_for_network
+
+retry_cmd 5 apt-get update
+retry_cmd 5 apt-get install -y \
+  python3 \
+  python3-pip \
+  python3-venv \
+  nodejs \
+  npm \
+  git \
+  curl \
+  jq \
+  ripgrep \
+  ca-certificates
+
+if [ -x /usr/bin/nodejs ] && [ ! -x /usr/bin/node ] && [ ! -x /usr/local/bin/node ]; then
+  ln -sf /usr/bin/nodejs /usr/local/bin/node
+fi
+
+export PIP_ROOT_USER_ACTION=ignore
+export PIP_BREAK_SYSTEM_PACKAGES=1
+
+retry_cmd 3 python3 -m pip install --upgrade pip
+retry_cmd 3 python3 -m pip install playwright
+retry_cmd 3 python3 -m playwright install --with-deps chromium
+retry_cmd 3 python3 -m playwright --version
+test -d "$PLAYWRIGHT_BROWSERS_PATH"
+
+chown -R ubuntu:ubuntu /var/lib/aihomeserver "$PLAYWRIGHT_BROWSERS_PATH"
+date -Is > "$MARKER"
+'@
+}
+
+function Get-WorkerRuntimeBootstrapService {
+@'
+[Unit]
+Description=AI Home Server runtime bootstrap
+After=aihomeserver-static-network.service network-online.target
+Wants=aihomeserver-static-network.service network-online.target
+Before=aihomeserver-worker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aihomeserver-runtime-bootstrap
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+'@
 }
 
 function Get-WorkerServiceUnit {
 @'
 [Unit]
 Description=AI Home Server Worker
-After=aihomeserver-static-network.service network-online.target
-Wants=aihomeserver-static-network.service network-online.target
+After=aihomeserver-static-network.service aihomeserver-runtime-bootstrap.service network-online.target
+Wants=aihomeserver-static-network.service aihomeserver-runtime-bootstrap.service network-online.target
 
 [Service]
 Type=simple
@@ -684,8 +1121,10 @@ function Get-CloudInitUserData {
     $publicKey = Get-WorkerPublicKey
     $networkScript = Indent-MultilineText -Text (Get-WorkerNetworkSetupScript -VmIp $VmIp -VmGateway $VmGateway -VmMac $VmMac) -Spaces 6
     $netplan = Indent-MultilineText -Text (Get-WorkerNetplanConfig -VmIp $VmIp -VmGateway $VmGateway -VmMac $VmMac) -Spaces 6
+    $runtimeScript = Indent-MultilineText -Text (Get-WorkerRuntimeBootstrapScript) -Spaces 6
     $workerScript = Indent-MultilineText -Text (Get-WorkerPythonScript) -Spaces 6
     $networkService = Indent-MultilineText -Text (Get-WorkerNetworkBootstrapService) -Spaces 6
+    $runtimeService = Indent-MultilineText -Text (Get-WorkerRuntimeBootstrapService) -Spaces 6
     $serviceUnit = Indent-MultilineText -Text (Get-WorkerServiceUnit) -Spaces 6
     $sudoersRule = Indent-MultilineText -Text (Get-SudoersRule) -Spaces 6
     $envFile = Indent-MultilineText -Text (Get-WorkerEnvFile -WorkerToken $WorkerToken -WorkspacePath $WorkspacePath -WorkerPort $WorkerPort) -Spaces 6
@@ -705,6 +1144,10 @@ $networkScript
     permissions: '0644'
     content: |
 $netplan
+  - path: /usr/local/bin/aihomeserver-runtime-bootstrap
+    permissions: '0755'
+    content: |
+$runtimeScript
   - path: /usr/local/bin/aihomeserver-worker.py
     permissions: '0755'
     content: |
@@ -713,6 +1156,10 @@ $workerScript
     permissions: '0644'
     content: |
 $networkService
+  - path: /etc/systemd/system/aihomeserver-runtime-bootstrap.service
+    permissions: '0644'
+    content: |
+$runtimeService
   - path: /etc/systemd/system/aihomeserver-worker.service
     permissions: '0644'
     content: |
@@ -732,6 +1179,7 @@ runcmd:
   - [ bash, -lc, "printf '$publicKey\n' > /home/ubuntu/.ssh/authorized_keys && chmod 700 /home/ubuntu/.ssh && chmod 600 /home/ubuntu/.ssh/authorized_keys && chown -R ubuntu:ubuntu /home/ubuntu/.ssh" ]
   - [ bash, -lc, "systemctl daemon-reload && systemctl enable aihomeserver-static-network.service && systemctl start aihomeserver-static-network.service || true" ]
   - [ bash, -lc, "chown -R ubuntu:ubuntu /workspace /opt/aihomeserver /var/lib/aihomeserver" ]
+  - [ bash, -lc, "systemctl daemon-reload && systemctl enable aihomeserver-runtime-bootstrap.service && systemctl start aihomeserver-runtime-bootstrap.service" ]
   - [ bash, -lc, "systemctl daemon-reload && systemctl enable aihomeserver-worker.service && systemctl restart aihomeserver-worker.service" ]
 "@
 }
@@ -1103,7 +1551,10 @@ chmod 700 '$root/home/ubuntu/.ssh'
 
         Write-MountedGuestFile -MountPoint $root -GuestPath '/etc/netplan/99-aihomeserver.yaml' -Content (Get-WorkerNetplanConfig -VmIp $VmIp -VmGateway $VmGateway -VmMac $VmMac) -Mode '0644'
         Write-MountedGuestFile -MountPoint $root -GuestPath '/usr/local/bin/aihomeserver-network-setup' -Content (Get-WorkerNetworkSetupScript -VmIp $VmIp -VmGateway $VmGateway -VmMac $VmMac) -Mode '0755'
+        Write-MountedGuestFile -MountPoint $root -GuestPath '/etc/systemd/system/aihomeserver-static-network.service' -Content (Get-WorkerNetworkBootstrapService) -Mode '0644'
+        Write-MountedGuestFile -MountPoint $root -GuestPath '/usr/local/bin/aihomeserver-runtime-bootstrap' -Content (Get-WorkerRuntimeBootstrapScript) -Mode '0755'
         Write-MountedGuestFile -MountPoint $root -GuestPath '/usr/local/bin/aihomeserver-worker.py' -Content (Get-WorkerPythonScript) -Mode '0755'
+        Write-MountedGuestFile -MountPoint $root -GuestPath '/etc/systemd/system/aihomeserver-runtime-bootstrap.service' -Content (Get-WorkerRuntimeBootstrapService) -Mode '0644'
         Write-MountedGuestFile -MountPoint $root -GuestPath '/etc/systemd/system/aihomeserver-worker.service' -Content (Get-WorkerServiceUnit) -Mode '0644'
         Write-MountedGuestFile -MountPoint $root -GuestPath '/etc/aihomeserver-worker.env' -Content (Get-WorkerEnvFile -WorkerToken $WorkerToken -WorkspacePath $WorkspacePath -WorkerPort $WorkerPort) -Mode '0600'
         Write-MountedGuestFile -MountPoint $root -GuestPath '/etc/sudoers.d/90-aihomeserver-ubuntu' -Content (Get-SudoersRule) -Mode '0440'
@@ -1112,7 +1563,9 @@ chmod 700 '$root/home/ubuntu/.ssh'
         Write-MountedGuestFile -MountPoint $root -GuestPath '/etc/cloud/cloud.cfg.d/99-nocloud.cfg' -Content "datasource_list: [NoCloud, None]`n" -Mode '0644'
 
         Invoke-WslRootCommand -Command @"
+ln -sf ../aihomeserver-static-network.service '$root/etc/systemd/system/multi-user.target.wants/aihomeserver-static-network.service'
 ln -sf ../aihomeserver-worker.service '$root/etc/systemd/system/multi-user.target.wants/aihomeserver-worker.service'
+ln -sf ../aihomeserver-runtime-bootstrap.service '$root/etc/systemd/system/multi-user.target.wants/aihomeserver-runtime-bootstrap.service'
 chmod 600 '$root/home/ubuntu/.ssh/authorized_keys'
 chown -R 1000:1000 '$root/home/ubuntu/.ssh'
 "@ | Out-Null
@@ -1221,25 +1674,65 @@ function Wait-WorkerHealth {
     if (-not $Token) { return $true }
 
     $authDeadline = (Get-Date).AddMinutes(5)
-    while ((Get-Date) -lt $authDeadline) {
+    $shellPassed = $false
+    while (-not $shellPassed -and (Get-Date) -lt $authDeadline) {
         try {
             $headers = @{ Authorization = "Bearer $Token"; 'Content-Type' = 'application/json' }
             $body    = '{"command":"echo auth-ok","cwd":".","timeout_secs":10}'
             $probe   = Invoke-WebRequest -Uri "$baseUrl/shell" -Method Post -Headers $headers -Body $body -TimeoutSec 15 -UseBasicParsing
             if ($probe.StatusCode -eq 200) {
                 Write-Log "Worker auth probe OK"
-                return $true
+                $shellPassed = $true
             }
-            if ($probe.StatusCode -eq 401) {
+            elseif ($probe.StatusCode -eq 401) {
                 Write-Log "Worker auth probe 401 - service may be restarting with new token, retrying..."
             }
         } catch {
             Write-Log "Worker auth probe error: $($_.Exception.Message)"
         }
+        if (-not $shellPassed) { Start-Sleep -Seconds 5 }
+    }
+
+    if (-not $shellPassed) {
+        Write-Log "Worker auth probe timed out after health passed"
+        return $false
+    }
+
+    # Phase 3: require the VM worker capabilities/filesystem API to be live as
+    # well. Without this the launcher can look green while the Files tab still
+    # fails because an older worker script only exposed the legacy routes.
+    $fsDeadline = (Get-Date).AddMinutes(5)
+    while ((Get-Date) -lt $fsDeadline) {
+        try {
+            $headers = @{ Authorization = "Bearer $Token"; 'Content-Type' = 'application/json' }
+            $probe = Invoke-WebRequest -Uri "$baseUrl/capabilities" -Headers $headers -TimeoutSec 15 -UseBasicParsing
+            if ($probe.StatusCode -eq 200) {
+                $caps = $null
+                try {
+                    $caps = $probe.Content | ConvertFrom-Json
+                } catch {}
+                if ($caps -and $caps.filesystem -and $caps.filesystem.write -and $caps.filesystem.list -and $caps.shell -and $caps.browser_fetch) {
+                    $playwrightReady = $false
+                    if ($caps.browser_automation) {
+                        $playwrightReady = [bool]$caps.browser_automation.installed
+                    }
+                    Write-Log "Worker capabilities probe OK (playwright_ready=$playwrightReady)"
+                    return $true
+                }
+                Write-Log "Worker capabilities probe returned incomplete support, retrying..."
+            }
+            if ($probe.StatusCode -eq 401) {
+                Write-Log "Worker capabilities probe 401 - token mismatch, retrying..."
+            } elseif ($probe.StatusCode -eq 404) {
+                Write-Log "Worker capabilities probe 404 - worker API not updated yet, retrying..."
+            }
+        } catch {
+            Write-Log "Worker capabilities probe error: $($_.Exception.Message)"
+        }
         Start-Sleep -Seconds 5
     }
 
-    Write-Log "Worker auth probe timed out after health passed"
+    Write-Log "Worker capabilities probe timed out after auth passed"
     return $false
 }
 
@@ -1337,6 +1830,8 @@ function Export-WorkerLogs {
 
     $journalPath = Join-Path $Paths.LogDir "$prefix-journalctl.log"
     $servicePath = Join-Path $Paths.LogDir "$prefix-service-status.log"
+    $runtimeServicePath = Join-Path $Paths.LogDir "$prefix-runtime-bootstrap-status.log"
+    $runtimeLogPath = Join-Path $Paths.LogDir "$prefix-runtime-bootstrap.log"
     $networkPath = Join-Path $Paths.LogDir "$prefix-network.log"
     $summaryPath = Join-Path $Paths.LogDir "$prefix-summary.txt"
 
@@ -1346,16 +1841,26 @@ sudo journalctl -u aihomeserver-worker --no-pager -n 400
     $serviceCmd = @'
 bash -lc 'sudo systemctl status aihomeserver-worker --no-pager --full || sudo systemctl cat aihomeserver-worker --no-pager'
 '@
+    $runtimeServiceCmd = @'
+bash -lc 'sudo systemctl status aihomeserver-runtime-bootstrap --no-pager --full || sudo systemctl cat aihomeserver-runtime-bootstrap --no-pager'
+'@
+    $runtimeLogCmd = @'
+bash -lc 'sudo test -f /var/lib/aihomeserver/runtime-bootstrap.log && sudo tail -n 400 /var/lib/aihomeserver/runtime-bootstrap.log || echo unavailable'
+'@
     $networkCmd = @'
 bash -lc 'printf "== ip addr ==\n"; ip addr show; printf "\n== ip route ==\n"; ip route show; printf "\n== token fingerprint ==\n"; sudo journalctl -u aihomeserver-worker --no-pager -n 50 | grep -m1 "\[worker\] auth:" || echo unavailable'
 '@
 
     $journal = Invoke-GuestSsh -VmIp $VmIp -Command $journalCmd
     $service = Invoke-GuestSsh -VmIp $VmIp -Command $serviceCmd
+    $runtimeService = Invoke-GuestSsh -VmIp $VmIp -Command $runtimeServiceCmd
+    $runtimeLog = Invoke-GuestSsh -VmIp $VmIp -Command $runtimeLogCmd
     $network = Invoke-GuestSsh -VmIp $VmIp -Command $networkCmd
 
     Set-Content -LiteralPath $journalPath -Value $journal -Encoding UTF8
     Set-Content -LiteralPath $servicePath -Value $service -Encoding UTF8
+    Set-Content -LiteralPath $runtimeServicePath -Value $runtimeService -Encoding UTF8
+    Set-Content -LiteralPath $runtimeLogPath -Value $runtimeLog -Encoding UTF8
     Set-Content -LiteralPath $networkPath -Value $network -Encoding UTF8
 
     $summary = @(
@@ -1365,6 +1870,8 @@ bash -lc 'printf "== ip addr ==\n"; ip addr show; printf "\n== ip route ==\n"; i
         "exported_utc=$([DateTime]::UtcNow.ToString('o'))"
         "journal=$journalPath"
         "service=$servicePath"
+        "runtime_service=$runtimeServicePath"
+        "runtime_log=$runtimeLogPath"
         "network=$networkPath"
     ) -join [Environment]::NewLine
     Set-Content -LiteralPath $summaryPath -Value $summary -Encoding UTF8
@@ -1376,7 +1883,7 @@ bash -lc 'printf "== ip addr ==\n"; ip addr show; printf "\n== ip route ==\n"; i
         worker_url = "http://$VmIp`:$WorkerPort"
         backend = 'hyperv'
         log_dir = $Paths.LogDir
-        exported_files = @($summaryPath, $journalPath, $servicePath, $networkPath)
+        exported_files = @($summaryPath, $journalPath, $servicePath, $runtimeServicePath, $runtimeLogPath, $networkPath)
     }
 }
 

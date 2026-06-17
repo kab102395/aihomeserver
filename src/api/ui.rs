@@ -1762,6 +1762,11 @@ body.admin-active { outline: 2px solid rgba(200,60,60,0.3); }
   display: flex;
   overflow: hidden;
 }
+#editor-body.image-mode {
+  background: #0d0d0d;
+  align-items: center;
+  justify-content: center;
+}
 #editor-textarea {
   flex: 1;
   background: #0d0d0d;
@@ -1778,6 +1783,38 @@ body.admin-active { outline: 2px solid rgba(200,60,60,0.3); }
   overflow-wrap: normal;
   overflow-x: auto;
 }
+#editor-preview {
+  display: none;
+  flex: 1;
+  overflow: auto;
+  padding: 16px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 12px;
+}
+#editor-preview.visible { display: flex; }
+#editor-preview img {
+  max-width: 100%;
+  max-height: calc(100vh - 140px);
+  object-fit: contain;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #0a0a0a;
+}
+#editor-preview-meta {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-family: monospace;
+}
+#editor-binary-note {
+  display: none;
+  padding: 18px;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.6;
+}
+#editor-binary-note.visible { display: block; }
 #editor-statusbar {
   padding: 4px 14px;
   background: #161616;
@@ -1982,14 +2019,14 @@ body.admin-active { outline: 2px solid rgba(200,60,60,0.3); }
   <!-- Files tab -->
   <div id="tab-files">
     <div id="file-tree-toolbar">
-      <span class="tree-root-label" id="tree-root-label">workspace</span>
+      <span class="tree-root-label" id="tree-root-label">VM /workspace</span>
       <button class="tree-refresh-btn" onclick="showNewMenu(event)" title="New file or folder">+</button>
       <button class="tree-refresh-btn" onclick="openUploadPicker()" title="Upload files">⤒</button>
       <button class="tree-refresh-btn" onclick="runSelfCheck()" title="Diagnostics">✓</button>
       <button class="tree-refresh-btn" onclick="loadFileTree()" title="Refresh">↻</button>
     </div>
     <div id="file-tree">
-      <div class="tree-empty">Switch to Files tab to browse your workspace</div>
+      <div class="tree-empty">Switch to Files tab to browse the active VM workspace</div>
     </div>
     <input id="upload-input" type="file" multiple style="display:none" />
   </div>
@@ -2126,6 +2163,11 @@ body.admin-active { outline: 2px solid rgba(200,60,60,0.3); }
   </div>
   <div id="editor-body">
     <textarea id="editor-textarea" spellcheck="false" oninput="markEditorDirty()"></textarea>
+    <div id="editor-preview">
+      <img id="editor-preview-image" alt="Workspace preview" />
+      <div id="editor-preview-meta"></div>
+    </div>
+    <div id="editor-binary-note"></div>
   </div>
   <div id="editor-statusbar">
     <span id="editor-linecount">0 lines</span>
@@ -2147,6 +2189,79 @@ body.admin-active { outline: 2px solid rgba(200,60,60,0.3); }
         <label>Workspace path</label>
         <input type="text" id="cfg-workspace" placeholder="C:\Users\you\workspace" />
         <div class="field-hint">Default directory for shell commands and file operations</div>
+      </div>
+      <div class="settings-field">
+        <label>Active task workspace</label>
+        <input type="text" id="cfg-active-workspace" readonly />
+        <div class="field-hint">This is the live execution workspace the LLM is using right now.</div>
+      </div>
+      <div class="settings-field">
+        <label>Workspace mode</label>
+        <input type="text" id="cfg-workspace-mode" readonly />
+      </div>
+      <div class="settings-field">
+        <label>Worker URL</label>
+        <input type="text" id="cfg-worker-url" readonly />
+      </div>
+      <div class="settings-field">
+        <label>Worker capabilities</label>
+        <input type="text" id="cfg-worker-capabilities" readonly />
+        <div class="field-hint">Live worker contract snapshot from <code>/capabilities</code>.</div>
+      </div>
+      <div class="settings-field">
+        <label>Host repo surface</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="tree-refresh-btn" type="button" onclick="openHostRepoSurface()">Open host repo</button>
+        </div>
+        <div class="field-hint">Host-side repo access is for admin/debug use. Task execution uses the VM workspace in remote mode.</div>
+      </div>
+    </div>
+    <div class="settings-section">
+      <div class="settings-section-label">Desktop VM Worker</div>
+      <div class="settings-field">
+        <label>VM name</label>
+        <input type="text" id="cfg-vm-name" placeholder="AIHomeServerWorker" />
+      </div>
+      <div class="settings-field">
+        <label>Worker VM IP</label>
+        <input type="text" id="cfg-vm-ip" placeholder="192.168.250.10" />
+      </div>
+      <div class="settings-field">
+        <label>Worker VM gateway</label>
+        <input type="text" id="cfg-vm-gateway" placeholder="192.168.250.1" />
+      </div>
+      <div class="settings-field">
+        <label>Hyper-V switch</label>
+        <input type="text" id="cfg-vm-switch" placeholder="AIHomeServerSwitch" />
+      </div>
+      <div class="settings-field">
+        <label>Worker port</label>
+        <input type="number" id="cfg-vm-port" min="1" max="65535" />
+      </div>
+      <div class="settings-field">
+        <label>VM vCPU count</label>
+        <input type="number" id="cfg-vm-cpus" min="1" max="64" />
+      </div>
+      <div class="settings-field">
+        <label>VM memory (MB)</label>
+        <input type="number" id="cfg-vm-memory" min="1024" step="512" />
+      </div>
+      <div class="settings-field">
+        <label>Ubuntu image version</label>
+        <input type="text" id="cfg-vm-image-version" placeholder="24.04" />
+      </div>
+      <div class="settings-field">
+        <label>Worker repo URL</label>
+        <input type="text" id="cfg-vm-repo-url" placeholder="https://github.com/kab102395/aihomeserver.git" />
+      </div>
+      <div class="settings-field">
+        <label>Worker repo branch</label>
+        <input type="text" id="cfg-vm-repo-branch" placeholder="main" />
+      </div>
+      <div class="settings-field">
+        <label>Hyper-V root</label>
+        <input type="text" id="cfg-vm-root" placeholder="C:\ProgramData\AIHomeServer\hyperv" />
+        <div class="field-hint">These desktop VM settings are owned by the Electron launcher. VM CPU, memory, network, and image changes apply on the next VM bootstrap or launcher restart.</div>
       </div>
     </div>
     <div class="settings-section">
@@ -2807,6 +2922,7 @@ async function sendWithAnswers(text, answers) {
             // Disable Stop button after completion.
             const stopBtn = thinkEl.querySelector('.btn-stop-run');
             if (stopBtn) stopBtn.disabled = true;
+            if (data.warning) addReasoningLine('r-warn', '⚠', data.warning);
             if (!answerEl) {
               // Preserve CoT block if present (non-streaming path)
               let savedCoT2 = thinkContent.querySelector('.thinking-details');
@@ -3059,6 +3175,10 @@ async function sendQueuedRequest(fullRequest, answers, queuedEl, sessionId) {
             doneEventReceived = true;
             const stopBtn = thinkEl.querySelector('.btn-stop-run');
             if (stopBtn) stopBtn.disabled = true;
+            if (data.warning) {
+              st.reasoning_lines = st.reasoning_lines || [];
+              st.reasoning_lines.push('⚠ ' + data.warning);
+            }
             const runSessionId = data.session_id;
             if (st) {
               st.session_id = runSessionId || st.session_id;
@@ -3213,6 +3333,7 @@ function addAiTurn(data) {
   div.innerHTML = `
     <div class="ai-label">aihomeserver</div>
     <div class="ai-content">${mainText ? renderMarkdown(mainText) : '<span style="color:var(--text-muted)">Task complete.</span>'}</div>
+    ${data.warning ? `<div class="ai-meta"><span class="meta-chip">⚠ ${esc(data.warning)}</span></div>` : ''}
     <div class="ai-meta">${statusChip}${stepChip}${durChip}${failChip}${repairChip}${toolResults}</div>
     ${logHtml ? `
     <div class="details-toggle" onclick="toggleDetails('${uid}-log')">
@@ -3948,18 +4069,18 @@ async function loadFileTree() {
     fileTreeLoaded = true;
     // Update root label
     const rootLabel = document.getElementById('tree-root-label');
-    rootLabel.textContent = root.name || 'workspace';
+    rootLabel.textContent = root.name || 'VM /workspace';
     rootLabel.title = root.name || '';
     treeEl.innerHTML = '';
     if (!root.children || root.children.length === 0) {
-      treeEl.innerHTML = '<div class="tree-empty">Workspace is empty.<br>Files you create will appear here.</div>';
+      treeEl.innerHTML = '<div class="tree-empty">The active VM workspace is empty.<br>Files created during execution will appear here.</div>';
       return;
     }
     for (const node of root.children) {
       treeEl.appendChild(buildTreeNode(node));
     }
   } catch (e) {
-    treeEl.innerHTML = `<div class="tree-empty">Could not load workspace.<br><span style="font-size:10px;color:var(--text-dim)">${esc(e.message)}</span></div>`;
+    treeEl.innerHTML = `<div class="tree-empty">Could not load the active VM workspace.<br><span style="font-size:10px;color:var(--text-dim)">${esc(e.message)}</span></div>`;
   }
 }
 
@@ -4012,6 +4133,38 @@ function fileIcon(ext) {
   return icons[ext?.toLowerCase()] || '📄';
 }
 
+function isImageFileResponse(data) {
+  return data && data.kind === 'image' && typeof data.contents_b64 === 'string' && data.contents_b64.length > 0;
+}
+
+function setEditorMode(mode, data = null) {
+  const body = document.getElementById('editor-body');
+  const textarea = document.getElementById('editor-textarea');
+  const preview = document.getElementById('editor-preview');
+  const previewImage = document.getElementById('editor-preview-image');
+  const previewMeta = document.getElementById('editor-preview-meta');
+  const binaryNote = document.getElementById('editor-binary-note');
+
+  body.classList.toggle('image-mode', mode === 'image');
+  textarea.style.display = mode === 'text' ? 'block' : 'none';
+  preview.classList.toggle('visible', mode === 'image');
+  binaryNote.classList.toggle('visible', mode === 'binary');
+
+  if (mode === 'image' && data) {
+    previewImage.src = `data:${data.mime || 'application/octet-stream'};base64,${data.contents_b64}`;
+    previewMeta.textContent = `${data.mime || 'image'} · ${data.size || 0} bytes${data.truncated ? ' · truncated preview' : ''}`;
+    binaryNote.textContent = '';
+  } else if (mode === 'binary' && data) {
+    previewImage.removeAttribute('src');
+    previewMeta.textContent = '';
+    binaryNote.textContent = `Binary file preview is not supported in the inline editor. Use Download for ${data.mime || 'application/octet-stream'} (${data.size || 0} bytes).`;
+  } else {
+    previewImage.removeAttribute('src');
+    previewMeta.textContent = '';
+    binaryNote.textContent = '';
+  }
+}
+
 async function toggleAttachFile(path, name, el) {
   if (attachedFiles[path]) {
     // Detach
@@ -4026,7 +4179,10 @@ async function toggleAttachFile(path, name, el) {
     const res = await fetch(`/workspace/file?path=${encodeURIComponent(path)}`);
     if (!res.ok) throw new Error('could not read file');
     const data = await res.json();
-    attachedFiles[path] = { path, name, content: data.content, truncated: data.truncated };
+    const attachContent = data.is_text
+      ? (data.content || '')
+      : `[binary ${data.kind || 'file'} omitted from inline context: ${name}]`;
+    attachedFiles[path] = { path, name, content: attachContent, truncated: data.truncated };
     el.classList.add('attached');
     renderContextBar();
   } catch (e) {
@@ -4086,6 +4242,7 @@ async function openFileEditor(path, name) {
   filename.title = path;
   dirty.classList.remove('visible');
   textarea.value = '';
+  setEditorMode('text');
   updateEditorStatusBar('');
   panel.classList.add('open');
 
@@ -4093,15 +4250,27 @@ async function openFileEditor(path, name) {
     const res = await fetch(`/workspace/file?path=${encodeURIComponent(path)}`);
     if (!res.ok) throw new Error(`${res.status}`);
     const data = await res.json();
-    textarea.value = data.content;
-    updateEditorStatusBar(data.content);
+    if (isImageFileResponse(data)) {
+      setEditorMode('image', data);
+      updateEditorStatusBar('');
+    } else if (data.is_text !== false) {
+      setEditorMode('text', data);
+      textarea.value = data.content || '';
+      updateEditorStatusBar(data.content || '');
+    } else {
+      setEditorMode('binary', data);
+      updateEditorStatusBar('');
+    }
     if (data.truncated) {
       filename.textContent = (name || path) + ' (truncated)';
     }
   } catch (e) {
+    setEditorMode('text');
     textarea.value = `// Could not load file: ${e.message}`;
   }
-  textarea.focus();
+  if (document.getElementById('editor-textarea').style.display !== 'none') {
+    textarea.focus();
+  }
 }
 
 function closeFileEditor() {
@@ -4112,6 +4281,7 @@ function closeFileEditor() {
 }
 
 function markEditorDirty() {
+  if (document.getElementById('editor-textarea').style.display === 'none') return;
   if (!editorDirty) {
     editorDirty = true;
     document.getElementById('editor-dirty').classList.add('visible');
@@ -4132,6 +4302,7 @@ function updateEditorStatusBar(content) {
 
 async function saveEditorFile() {
   if (!editorCurrentPath) return;
+  if (document.getElementById('editor-textarea').style.display === 'none') return;
   const content = document.getElementById('editor-textarea').value;
   try {
     const res = await fetch('/workspace/file', {
@@ -4162,8 +4333,17 @@ async function refreshEditorFile() {
     const data = await res.json();
     // Only refresh if not dirty — don't clobber user edits
     if (!editorDirty) {
-      document.getElementById('editor-textarea').value = data.content;
-      updateEditorStatusBar(data.content);
+      if (isImageFileResponse(data)) {
+        setEditorMode('image', data);
+        updateEditorStatusBar('');
+      } else if (data.is_text !== false) {
+        setEditorMode('text', data);
+        document.getElementById('editor-textarea').value = data.content || '';
+        updateEditorStatusBar(data.content || '');
+      } else {
+        setEditorMode('binary', data);
+        updateEditorStatusBar('');
+      }
       const badge = document.getElementById('editor-refreshed');
       badge.classList.add('show');
       setTimeout(() => badge.classList.remove('show'), 2000);
@@ -4389,13 +4569,47 @@ async function loadSettings() {
     document.getElementById('cfg-search-url').value   = cfg.search_url      || '';
     document.getElementById('cfg-auto-kb-mode').value = cfg.auto_kb_mode    || 'off';
     document.getElementById('cfg-auto-kb-min').value  = cfg.auto_kb_min_chars ?? 1200;
+    document.getElementById('cfg-active-workspace').value = cfg.active_workspace_root || cfg.workspace_path || '';
+    document.getElementById('cfg-workspace-mode').value = cfg.active_workspace_mode || 'host';
+    document.getElementById('cfg-worker-url').value = cfg.worker_url || '';
+    const caps = cfg.worker_capabilities || null;
+    document.getElementById('cfg-worker-capabilities').value = caps
+      ? `fs:${caps.filesystem?.write ? 'rw' : 'partial'} shell:${caps.shell ? 'yes' : 'no'} browser:${caps.browser_fetch ? 'fetch' : 'off'} playwright:${caps.browser_automation?.installed ? 'ready' : 'not-ready'}`
+      : 'unavailable';
     const threshold = cfg.risk_gate_threshold ?? 8;
     document.getElementById('cfg-risk-threshold').value = threshold;
     document.getElementById('cfg-risk-val').textContent  = threshold;
+    if (window.aihomeserverLauncher?.getDesktopSettings) {
+      const desktop = await window.aihomeserverLauncher.getDesktopSettings();
+      const ds = desktop?.settings || {};
+      document.getElementById('cfg-vm-name').value = ds.vmName || '';
+      document.getElementById('cfg-vm-ip').value = ds.vmIp || '';
+      document.getElementById('cfg-vm-gateway').value = ds.vmGateway || '';
+      document.getElementById('cfg-vm-switch').value = ds.vmSwitch || '';
+      document.getElementById('cfg-vm-port').value = ds.vmPort ?? 3031;
+      document.getElementById('cfg-vm-cpus').value = ds.vmCpus ?? 4;
+      document.getElementById('cfg-vm-memory').value = ds.vmMemoryMb ?? 8192;
+      document.getElementById('cfg-vm-image-version').value = ds.vmImageVersion || '24.04';
+      document.getElementById('cfg-vm-repo-url').value = ds.repoUrl || '';
+      document.getElementById('cfg-vm-repo-branch').value = ds.repoBranch || '';
+      document.getElementById('cfg-vm-root').value = ds.hypervRoot || '';
+    }
     // Keep sidebar model tags in sync
     updateModelTags(cfg.fast_model, cfg.critic_model);
   } catch (e) {
     console.warn('Failed to load settings:', e);
+  }
+}
+
+async function openHostRepoSurface() {
+  if (!window.aihomeserverLauncher?.openHostRepoFolder) {
+    alert('Host repo controls are only available in the desktop app.');
+    return;
+  }
+  try {
+    await window.aihomeserverLauncher.openHostRepoFolder();
+  } catch (e) {
+    alert('Could not open host repo: ' + e.message);
   }
 }
 
@@ -4423,10 +4637,34 @@ async function saveSettings() {
       body: JSON.stringify(cfg),
     });
     if (!res.ok) throw new Error(`${res.status}`);
+    let restartRequired = false;
+    if (window.aihomeserverLauncher?.saveDesktopSettings) {
+      const desktopResult = await window.aihomeserverLauncher.saveDesktopSettings({
+        vmName: document.getElementById('cfg-vm-name').value.trim(),
+        vmIp: document.getElementById('cfg-vm-ip').value.trim(),
+        vmGateway: document.getElementById('cfg-vm-gateway').value.trim(),
+        vmSwitch: document.getElementById('cfg-vm-switch').value.trim(),
+        vmPort: parseInt(document.getElementById('cfg-vm-port').value) || 3031,
+        vmCpus: parseInt(document.getElementById('cfg-vm-cpus').value) || 4,
+        vmMemoryMb: parseInt(document.getElementById('cfg-vm-memory').value) || 8192,
+        vmImageVersion: document.getElementById('cfg-vm-image-version').value.trim(),
+        repoUrl: document.getElementById('cfg-vm-repo-url').value.trim(),
+        repoBranch: document.getElementById('cfg-vm-repo-branch').value.trim(),
+        hypervRoot: document.getElementById('cfg-vm-root').value.trim(),
+      });
+      if (!desktopResult?.ok) {
+        throw new Error(desktopResult?.error || 'desktop settings save failed');
+      }
+      restartRequired = !!desktopResult.restartRequired;
+    }
     updateModelTags(cfg.fast_model, cfg.critic_model);
     const msg = document.getElementById('settings-save-msg');
+    msg.textContent = restartRequired ? '✓ Saved · relaunch/bootstrap VM to apply VM changes' : '✓ Saved';
     msg.classList.add('visible');
-    setTimeout(() => msg.classList.remove('visible'), 2500);
+    setTimeout(() => {
+      msg.classList.remove('visible');
+      msg.textContent = '✓ Saved';
+    }, 3200);
   } catch (e) {
     alert('Failed to save settings: ' + e.message);
   }

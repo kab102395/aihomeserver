@@ -7,6 +7,11 @@ use std::time::Instant;
 
 use super::Tool;
 use crate::state::{ErrorType, ToolResult};
+use crate::worker::{
+    WorkerClient, WorkerFilesystemDeleteRequest, WorkerFilesystemFindRequest,
+    WorkerFilesystemGrepRequest, WorkerFilesystemListRequest, WorkerFilesystemMkdirRequest,
+    WorkerFilesystemReadRequest, WorkerFilesystemRenameRequest, WorkerFilesystemWriteRequest,
+};
 
 /// Tool for safe workspace file operations (read/write/list/find/grep/etc.).
 ///
@@ -15,14 +20,24 @@ use crate::state::{ErrorType, ToolResult};
 ///   portable (no shell differences) and can enforce path traversal protections.
 pub struct FilesystemTool {
     base_dir: PathBuf,
+    worker: Option<WorkerClient>,
+    execution_mode: String,
 }
 
 impl FilesystemTool {
     /// Create a filesystem tool rooted at `base_dir` (created if missing).
-    pub fn new(base_dir: impl Into<PathBuf>) -> std::io::Result<Self> {
+    pub fn new(
+        base_dir: impl Into<PathBuf>,
+        worker: Option<WorkerClient>,
+        execution_mode: impl Into<String>,
+    ) -> std::io::Result<Self> {
         let base_dir = base_dir.into();
         std::fs::create_dir_all(&base_dir)?;
-        Ok(Self { base_dir })
+        Ok(Self {
+            base_dir,
+            worker,
+            execution_mode: execution_mode.into(),
+        })
     }
 
     /// Resolve a user-supplied relative path against `base_dir` safely.
@@ -100,6 +115,12 @@ impl FilesystemTool {
 
         out
     }
+
+    fn remote_enabled(&self) -> bool {
+        (self.execution_mode.trim().eq_ignore_ascii_case("remote")
+            || self.execution_mode.trim().eq_ignore_ascii_case("auto"))
+            && self.worker.as_ref().map(|w| w.is_enabled()).unwrap_or(false)
+    }
 }
 
 #[async_trait]
@@ -138,6 +159,159 @@ impl Tool for FilesystemTool {
                     .to_string()
             }
         };
+
+        if self.remote_enabled() {
+            if let Some(worker) = &self.worker {
+                let remote = match action.as_str() {
+                    "write" => {
+                        let content = params["content"].as_str().unwrap_or("").to_string();
+                        worker
+                            .filesystem_write(&WorkerFilesystemWriteRequest {
+                                path: path.clone(),
+                                content: Some(content),
+                                contents_b64: None,
+                            })
+                            .await
+                    }
+                    "read" => {
+                        worker
+                            .filesystem_read(&WorkerFilesystemReadRequest { path: path.clone() })
+                            .await
+                    }
+                    "list" => {
+                        let depth = params
+                            .get("depth")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u8);
+                        worker
+                            .filesystem_list(&WorkerFilesystemListRequest {
+                                path: path.clone(),
+                                depth,
+                            })
+                            .await
+                    }
+                    "find" => {
+                        let pattern = match params.get("pattern").and_then(|v| v.as_str()) {
+                            Some(p) if !p.trim().is_empty() => p.to_string(),
+                            _ => {
+                                return ToolResult::err(
+                                    ErrorType::Tool,
+                                    "missing_param",
+                                    "params.pattern is required",
+                                )
+                            }
+                        };
+                        worker
+                            .filesystem_find(&WorkerFilesystemFindRequest {
+                                path: path.clone(),
+                                pattern,
+                                max_depth: params
+                                    .get("max_depth")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as usize),
+                                max_files: params
+                                    .get("max_files")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as usize),
+                                max_results: params
+                                    .get("max_results")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as usize),
+                            })
+                            .await
+                    }
+                    "grep" => {
+                        let query = match params.get("query").and_then(|v| v.as_str()) {
+                            Some(q) if !q.trim().is_empty() => q.to_string(),
+                            _ => {
+                                return ToolResult::err(
+                                    ErrorType::Tool,
+                                    "missing_param",
+                                    "params.query is required",
+                                )
+                            }
+                        };
+                        worker
+                            .filesystem_grep(&WorkerFilesystemGrepRequest {
+                                path: path.clone(),
+                                query,
+                                max_depth: params
+                                    .get("max_depth")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as usize),
+                                max_files: params
+                                    .get("max_files")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as usize),
+                                max_results: params
+                                    .get("max_results")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as usize),
+                                max_bytes_per_file: params
+                                    .get("max_bytes_per_file")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as usize),
+                            })
+                            .await
+                    }
+                    "delete" => {
+                        worker
+                            .filesystem_delete(&WorkerFilesystemDeleteRequest {
+                                path: path.clone(),
+                            })
+                            .await
+                    }
+                    "mkdir" => {
+                        worker
+                            .filesystem_mkdir(&WorkerFilesystemMkdirRequest {
+                                path: path.clone(),
+                            })
+                            .await
+                    }
+                    "rename" => {
+                        let to = match params.get("to").and_then(|v| v.as_str()) {
+                            Some(to) if !to.trim().is_empty() => to.to_string(),
+                            _ => {
+                                return ToolResult::err(
+                                    ErrorType::Tool,
+                                    "missing_param",
+                                    "params.to is required",
+                                )
+                            }
+                        };
+                        worker
+                            .filesystem_rename(&WorkerFilesystemRenameRequest {
+                                from: path.clone(),
+                                to,
+                            })
+                            .await
+                    }
+                    "zip_dir" | "zip" => {
+                        return ToolResult::err(
+                            ErrorType::Tool,
+                            "unsupported_remote_action",
+                            "zip_dir is not yet supported against the VM workspace",
+                        )
+                    }
+                    _ => {
+                        return ToolResult::err(
+                            ErrorType::Tool,
+                            "unsupported_action",
+                            &action,
+                        )
+                    }
+                };
+
+                return match remote {
+                    Ok(result) => result,
+                    Err(e) => ToolResult::err(
+                        ErrorType::Env,
+                        "worker_filesystem_failed",
+                        &e.to_string(),
+                    ),
+                };
+            }
+        }
 
         match action.as_str() {
             "write" => {
@@ -583,7 +757,7 @@ mod tests {
     #[tokio::test]
     async fn find_finds_files_by_substring() {
         let base = tmp_base();
-        let tool = FilesystemTool::new(&base).expect("tmp dir created");
+        let tool = FilesystemTool::new(&base, None, "local").expect("tmp dir created");
         let _ = tool
             .execute(json!({
                 "action": "write",
@@ -619,7 +793,7 @@ mod tests {
     #[tokio::test]
     async fn grep_finds_text_in_files() {
         let base = tmp_base();
-        let tool = FilesystemTool::new(&base).expect("tmp dir created");
+        let tool = FilesystemTool::new(&base, None, "local").expect("tmp dir created");
         let _ = tool
             .execute(json!({
                 "action": "write",
